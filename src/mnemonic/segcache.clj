@@ -319,11 +319,14 @@
 (defn new-cache
   "A cache with a budget of `mb` megabytes, or nil when `mb` is not positive. Test and
   tuning knobs (system properties, read here): mnemonic.index-cache.stripe-bits (18),
-  .point-cap (512 entries), .chunk-cap (4096), .doorkeeper (true)."
+  .point-cap (512 entries), .chunk-cap (4096), .doorkeeper (true), .budget-kb (tests:
+  overrides `mb`)."
   [mb]
   (let [mb (long (or mb (default-mb)))]
     (when (pos? mb)
-      (let [budget (* mb 1048576)
+      (let [budget (if-let [kb (System/getProperty "mnemonic.index-cache.budget-kb")]
+                     (* 1024 (Long/parseLong kb))
+                     (* mb 1048576))
             sbits (prop-long "mnemonic.index-cache.stripe-bits" 18)
             ;; a granule is admitted when it misses twice within `window` first misses,
             ;; about the number of entity segments the budget holds: under uniform reads

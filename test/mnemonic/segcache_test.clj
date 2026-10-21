@@ -173,7 +173,8 @@
            ["point-cap 1, chunk-cap 2 (big granules)"
             {"mnemonic.index-cache.point-cap" "1" "mnemonic.index-cache.chunk-cap" "2"} on :mem]
            ["3-bit stamps (collisions)" {"mnemonic.index-cache.stripe-bits" "3"} on :mem]
-           ["1 MB budget (eviction)" {"mnemonic.index-cache.doorkeeper" "false"} "?index-cache-mb=1" :mem]
+           ["256 KB budget (eviction)" {"mnemonic.index-cache.doorkeeper" "false"
+                                        "mnemonic.index-cache.budget-kb" "256"} on :mem]
            ["no doorkeeper" {"mnemonic.index-cache.doorkeeper" "false"} on :mem]
            ["file store" {} on :file]]]
     (testing label
@@ -186,9 +187,9 @@
         (is (pos? (:hits stats)) (pr-str stats))
         (is (pos? (:fills stats)) (pr-str stats))
         (is (pos? (:stale stats)) (str "invalidation exercised " (pr-str stats)))
-        (when (= label "1 MB budget (eviction)")
+        (when (= label "256 KB budget (eviction)")
           (is (pos? (:evictions stats)))
-          (is (<= (:bytes stats) (* 2 1048576))))))))
+          (is (<= (:bytes stats) (* 2 262144))))))))
 
 (deftest hit-serves-exact-state-test
   (let [uri (str "mnemonic:mem://segcache-exact-" (System/nanoTime) on)]
