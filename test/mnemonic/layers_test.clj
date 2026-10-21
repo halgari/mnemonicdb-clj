@@ -1,6 +1,7 @@
 (ns mnemonic.layers-test
   (:require [clojure.test :refer [deftest is testing use-fixtures]]
             [mnemonic.api :as m]
+            [mnemonic.codec :as codec]
             [mnemonic.conn :as conn]
             [mnemonic.index :as index]))
 
@@ -232,3 +233,13 @@
       (doall (m/seek-datoms d :aevt))
       (doall (m/datoms d :avet :a/one)))
     (is (= before (.get ^java.util.concurrent.atomic.AtomicLong index/open-cursors)))))
+
+(deftest key-tx-bytes
+  (doseq [idx [:eavt :aevt :avet :vaet]
+          tx [0 1 536870912001 Long/MAX_VALUE]]
+    (let [k (codec/encode-key idx 17 18 19 5)
+          kt #'mnemonic.layers/key-tx
+          kw #'mnemonic.layers/key-with-tx]
+      (is (= 5 (kt k)))
+      (is (= tx (kt (kw k tx))))
+      (is (java.util.Arrays/equals ^bytes (kw k tx) ^bytes (codec/encode-key idx 17 18 19 tx))))))
