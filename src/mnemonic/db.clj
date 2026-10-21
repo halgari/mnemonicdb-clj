@@ -5,46 +5,23 @@
             [mnemonic.index :as index]
             [mnemonic.rocks :as rocks]
             [mnemonic.schema :as schema])
-  (:import (java.util.concurrent.atomic AtomicBoolean)
-           (mnemonic.rocks IRawCursor)
-           (org.rocksdb RocksDB Snapshot)))
+  (:import (mnemonic.datom Datom)
+           (mnemonic.rocks IRawCursor Snap)))
 
 (set! *warn-on-reflection* true)
 
 (def ^:private history-cf
   {:eavt :eavt-h :aevt :aevt-h :avet :avet-h :vaet :vaet-h})
 
-(defn- store-open? [store]
-  (.isOwningHandle ^RocksDB (:db store)))
-
-;; Snapshot release state. Must not reference the Base (it is the Cleaner action).
-(deftype Releaser [store ^Snapshot snap ^AtomicBoolean done]
+;; Snapshot release action. Must not reference the Base (it is the Cleaner action).
+(deftype Releaser [^Snap snap]
   Runnable
-  (run [_]
-    (when (.compareAndSet done false true)
-      ;; close-store does not release snapshots; releasing against a closed db would crash.
-      (when (store-open? store)
-        (rocks/release-snapshot store snap)))))
-
-;; Wraps a raw cursor so that closing after the store was closed is a no-op
-;; (a RocksIterator must not be closed on a closed db).
-(deftype GuardedCursor [store ^IRawCursor raw]
-  IRawCursor
-  (seek [_ k] (.seek raw k))
-  (seekToFirst [_] (.seekToFirst raw))
-  (seekToLast [_] (.seekToLast raw))
-  (seekForPrev [_ k] (.seekForPrev raw k))
-  (isValid [_] (.isValid raw))
-  (next [_] (.next raw))
-  (prev [_] (.prev raw))
-  (key [_] (.key raw))
-  (value [_] (.value raw))
-  (close [_] (when (store-open? store) (.close raw))))
+  (run [_] (.markReleased snap)))
 
 (defn- open-raw ^IRawCursor [store snap cf]
-  (->GuardedCursor store (rocks/raw-cursor store cf snap)))
+  (rocks/raw-cursor store cf snap))
 
-(deftype Base [store ^Snapshot snap basis-t schema meta ^Releaser releaser]
+(deftype Base [store ^Snap snap basis-t schema meta ^Releaser releaser]
   index/IDb
   (-seek-current [_ idx prefix]
     (index/prefix-cursor (open-raw store snap idx) prefix idx false))
@@ -62,13 +39,24 @@
   (-filter-pred [_] nil)
   (-raw [this] this))
 
+(defn history-seek-cursor
+  "Cursor over the history index of `idx` from the first key >= `start` to its end."
+  [^Base b idx start]
+  (index/seek-cursor (open-raw (.-store b) (.-snap b) (history-cf idx)) start idx true))
+
+(defn released?
+  "True once `release-db` was called on `db` (or it was collected)."
+  [^Base db]
+  (rocks/snapshot-released? (.-snap db)))
+
 (defn db-meta
   "The store meta (counters) as of this db's snapshot."
   [^Base db]
   (.-meta db))
 
 (defn release-db
-  "Release the snapshot held by `db` (idempotent)."
+  "Release the snapshot held by `db` (idempotent). Later reads of `db` throw
+  :db.error/db-released; iterations already in progress complete."
   [^Base db]
   (.run ^Runnable (.-releaser db))
   nil)
@@ -95,17 +83,36 @@
           acc))
       (finally (.close cur)))))
 
+(defn ident-history
+  "[eid keyword retract-tx] of every retracted :db/ident datom, read from `cur` (a
+  history cursor over the AEVT prefix of :db/ident); closes `cur`."
+  [^mnemonic.index.ICursor cur]
+  (try
+    (loop [acc []]
+      (if (.valid cur)
+        (let [^Datom d (.datom cur)
+              x [(.-e d) (.-v d) (.retractTx cur)]]
+          (.advance cur)
+          (recur (conj acc x)))
+        acc))
+    (finally (.close cur))))
+
 (defn- load-schema
-  "Only the schema-defining attributes are scanned (AEVT), not all of EAVT."
+  "Only the schema-defining attributes are scanned (AEVT), not all of EAVT; retracted
+  idents (AEVT history of :db/ident) become aliases."
   [store snap]
-  (schema/schema-from-datoms
-   (into [] (mapcat #(scan-attr store snap %)) (sort schema/schema-attr-ids))))
+  (schema/with-ident-aliases
+   (schema/schema-from-datoms
+    (into [] (mapcat #(scan-attr store snap %)) (sort schema/schema-attr-ids)))
+   (ident-history (index/prefix-cursor (rocks/raw-cursor store :aevt-h snap)
+                                       (codec/encode-prefix :aevt [schema/ident-attr-id])
+                                       :aevt true))))
 
 (defn base-db
   "Db value over a fresh snapshot of `store`."
   [store]
   (let [snap (rocks/snapshot store)
-        releaser (->Releaser store snap (AtomicBoolean. false))]
+        releaser (->Releaser snap)]
     (try
       (let [tx (last-log-tx store snap)
             basis (if tx (codec/tx->t tx) 0)

@@ -64,6 +64,25 @@
                          {} props)]
     (->Schema attrs idents ids)))
 
+(defn with-ident-aliases
+  "Adds retracted idents as aliases, as Datomic does: after a rename (or a retraction of
+  `:db/ident`) the old keyword keeps resolving to its entity until it is asserted for
+  another entity. `history` is a seq of [eid keyword retract-tx] for retracted `:db/ident`
+  datoms. When a keyword was retracted from several entities the latest retraction wins;
+  current idents always win. An entity without a current ident reports its latest
+  retracted one from `ids`."
+  [^Schema schema history]
+  (if (empty? history)
+    schema
+    (let [ordered (sort-by #(nth % 2) history)
+          idents (:idents schema)
+          ids (:ids schema)
+          alias-idents (reduce (fn [m [e kw]] (assoc m kw (long e))) {} ordered)
+          alias-ids (reduce (fn [m [e kw]] (assoc m (long e) kw)) {} ordered)]
+      (assoc schema
+             :idents (merge alias-idents idents)
+             :ids (merge alias-ids ids)))))
+
 (defn entid
   "Entity id for a long or ident keyword; nil when unknown."
   [^Schema schema x]

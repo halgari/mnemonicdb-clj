@@ -68,7 +68,7 @@
                  (set (map (comp vec (partial take 3) dv) (strip-inst r1)))))
           (is (= 1 (count (filter #(= 50 (:a %)) (:tx-data r1)))))
           (is (every? #(= (:tx r1) (:tx %)) (:tx-data r1))))
-        (is (= {:format 1 :next-t 1001 :next-db-n 75} (select-keys (:meta r1) [:format :next-t :next-db-n])))
+        (is (= {:format 2 :next-t 1001 :next-db-n 75} (select-keys (:meta r1) [:format :next-t :next-db-n])))
         (is (= 1000 (ix/-basis-t (db/base-db store))))
         (let [r2 (run!* store [{:db/id "x" :person/name "Al"} {:db/id "y" :person/name "Bo"}])]
           (is (= (codec/t->tx 1001) (:tx r2)))
@@ -273,3 +273,40 @@
                                                     :eavt (codec/encode-prefix :eavt [x a]))))]
           (is (= 0 (count (hist 73))) "noHistory attribute keeps no history")
           (is (= 1 (count (hist 74)))))))))
+
+(deftest card-many-adds-do-not-scan-existing-values
+  (with-store
+    (fn [store]
+      (run!* store [{:db/ident :t/tags :db/valueType :db.type/long :db/cardinality :db.cardinality/many}
+                    {:db/ident :t/one :db/valueType :db.type/long :db/cardinality :db.cardinality/one}
+                    {:db/ident :t/k :db/valueType :db.type/long :db/cardinality :db.cardinality/one
+                     :db/unique :db.unique/identity}])
+      (run!* store [{:t/k 1 :t/one 0}])
+      (let [e [:t/k 1]
+            t0 (System/nanoTime)
+            _ (dotimes [i 1000] (run!* store [[:db/add e :t/tags i]]))
+            t1 (System/nanoTime)
+            _ (dotimes [i 1000] (run!* store [[:db/add e :t/tags (+ 1000 i)]]))
+            t2 (System/nanoTime)
+            real tx/datoms-of
+            biggest (atom 0)]
+        (println (format "card-many adds: first 1000 %.0f ms, next 1000 %.0f ms"
+                         (/ (- t1 t0) 1e6) (/ (- t2 t1) 1e6)))
+        (with-redefs [tx/datoms-of (fn [db idx comps]
+                                     (let [r (real db idx comps)]
+                                       (swap! biggest max (count r))
+                                       r))]
+          (run!* store [[:db/add e :t/tags 5000]])
+          (is (<= @biggest 1) "an add reads only the exact [e a v] datom")
+          (reset! biggest 0)
+          (run!* store [[:db/add e :t/tags 5]])
+          (is (<= @biggest 1) "a redundant add too")
+          (reset! biggest 0)
+          (run!* store [[:db/retract e :t/tags 7]])
+          (is (<= @biggest 1) "a retraction too")
+          (reset! biggest 0)
+          (run!* store [[:db/add e :t/one 1]])
+          (is (<= @biggest 1) "card-one replacement scans [e a] (one value)"))
+        (let [d (db/base-db store)
+              eid (:e (first (tx/datoms-of d :avet [(get (:idents (ix/-schema d)) :t/k) 1])))]
+          (is (= 2000 (count (tx/datoms-of d :eavt [eid (get (:idents (ix/-schema d)) :t/tags)])))))))))

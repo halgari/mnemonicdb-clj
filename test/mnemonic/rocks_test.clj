@@ -121,3 +121,72 @@
       (r/register-cleanup! (Object.) #(deliver p true))
       (dotimes [_ 40] (when-not (realized? p) (System/gc) (Thread/sleep 50)))
       (is (realized? p)))))
+
+(deftest iterator-errors-are-not-end-of-data
+  (testing "a corrupt SST block surfaces as a :cognitect.anomalies/fault, not as fewer keys"
+    (let [dir (temp-dir)
+          path (str (.resolve dir "db"))]
+      (try
+        (let [s (r/open-store {:path path})]
+          (r/write! s (for [i (range 20000)]
+                        [:put :eavt (.getBytes (format "key-%08d" i)) (.getBytes (apply str (repeat 50 i)))])
+                    {:sync? true})
+          (with-open [fo (org.rocksdb.FlushOptions.)]
+            (.flush ^org.rocksdb.RocksDB (:db s) fo ^org.rocksdb.ColumnFamilyHandle (get (:cfs s) :eavt)))
+          (r/close-store s))
+        (let [ssts (->> (file-seq (java.io.File. path))
+                        (filter #(.endsWith (.getName ^java.io.File %) ".sst")))]
+          (is (seq ssts))
+          (doseq [^java.io.File f ssts]
+            (with-open [raf (java.io.RandomAccessFile. f "rw")]
+              ;; overwrite bytes in the middle of the data blocks
+              (let [n (quot (.length raf) 3)]
+                (.seek raf n)
+                (.write raf (byte-array 4096 (unchecked-byte 0x5a)))))))
+        (let [s (r/open-store {:path path})]
+          (try
+            (let [e (try (with-open [c (r/raw-cursor s :eavt nil)]
+                           (.seekToFirst c)
+                           (loop [n 0]
+                             (if (.isValid c) (do (.next c) (recur (inc n))) n)))
+                         (catch clojure.lang.ExceptionInfo e e))]
+              (is (instance? clojure.lang.ExceptionInfo e) (str "scanned " e " keys"))
+              (is (= :cognitect.anomalies/fault (:cognitect.anomalies/category (ex-data e))))
+              (is (= :db.error/storage-error (:db/error (ex-data e)))))
+            (finally (r/close-store s))))
+        (finally (delete-tree dir))))))
+
+(deftest closed-store-operations-throw
+  (let [s (r/open-store {:path "mem-closed-ops" :mem? true})
+        _ (r/write! s [[:put :eavt (bs 1) (bs 1)]] {})
+        snap (r/snapshot s)
+        c (r/raw-cursor s :eavt snap)
+        kind (fn [f] (try (f) :ok (catch clojure.lang.ExceptionInfo e (:db/error (ex-data e)))))]
+    (.seekToFirst c)
+    (r/close-store s)
+    (r/close-store s)
+    (is (= :db.error/connection-released (kind #(.isValid c))))
+    (is (= :db.error/connection-released (kind #(.next c))))
+    (is (= :db.error/connection-released (kind #(r/raw-cursor s :eavt nil))))
+    (is (= :db.error/connection-released (kind #(r/get-bytes s :eavt nil (bs 1)))))
+    (is (= :db.error/connection-released (kind #(r/write! s [[:put :eavt (bs 2) (bs 2)]] {}))))
+    (is (= :db.error/connection-released (kind #(r/snapshot s))))
+    (is (= :ok (kind #(.close c))))
+    (is (= :ok (kind #(r/release-snapshot s snap))))))
+
+(deftest released-snapshot-is-ref-counted
+  (let [s (r/open-store {:path "mem-snap-rc" :mem? true})]
+    (try
+      (r/write! s [[:put :eavt (bs 1) (bs 1)] [:put :eavt (bs 2) (bs 2)]] {})
+      (let [snap (r/snapshot s)
+            c (r/raw-cursor s :eavt snap)
+            kind (fn [f] (try (f) :ok (catch clojure.lang.ExceptionInfo e (:db/error (ex-data e)))))]
+        (.seekToFirst c)
+        (r/release-snapshot s snap)
+        (is (= :db.error/db-released (kind #(r/raw-cursor s :eavt snap))))
+        (is (= :db.error/db-released (kind #(r/get-bytes s :eavt snap (bs 1)))))
+        (is (= [[1] [2]] (scan c)) "an open cursor keeps working")
+        (is (= 1 (count (:snaps s))) "not freed while a cursor uses it")
+        (.close c)
+        (is (zero? (count (:snaps s))) "freed when the last cursor closes"))
+      (finally (r/close-store s)))))

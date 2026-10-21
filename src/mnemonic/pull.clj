@@ -11,7 +11,8 @@
     are not expanded; a child that is not expanded (revisit mode, or past the depth
     of its recursive attribute) is rendered as {:db/id n} when the pattern pulls
     :db/id and dropped otherwise"
-  (:require [mnemonic.entity :as entity]
+  (:require [clojure.edn :as edn]
+            [mnemonic.entity :as entity]
             [mnemonic.index :as index]
             [mnemonic.schema :as schema]
             [mnemonic.tx :as tx])
@@ -46,18 +47,61 @@
 
 (def ^:private ^AtomicLong rid-counter (AtomicLong. 0))
 
-(defn- resolve-xform [x]
+;; ------------------------------------------------------------------ xform allowlist
+
+(def builtin-xforms
+  "Symbols usable as :xform without configuration (Datomic's built-ins, probed)."
+  '#{str name namespace keyword symbol clojure.edn/read-string
+     clojure.core/str clojure.core/name clojure.core/namespace clojure.core/keyword
+     clojure.core/symbol})
+
+(def ^:dynamic *xforms*
+  "Extra symbols allowed as :xform within a dynamic extent (a set of symbols)."
+  #{})
+
+(defn- read-extensions
+  "Union of the :xforms of every mnemonic/extensions.edn resource on the classpath
+  (the analogue of Datomic's datomic/extensions.edn)."
+  []
+  (let [urls (enumeration-seq (.getResources (clojure.lang.RT/baseLoader) "mnemonic/extensions.edn"))]
+    (into #{}
+          (mapcat (fn [^java.net.URL u]
+                    (let [m (edn/read-string (slurp u))]
+                      (when-not (or (nil? m) (map? m))
+                        (throw (ex-info (str "Invalid " u ": expected a map")
+                                        {:db/error :db.error/invalid-config
+                                         :cognitect.anomalies/category :cognitect.anomalies/incorrect})))
+                      (map symbol (:xforms m)))))
+          urls)))
+
+(def ^:private extension-xforms (delay (read-extensions)))
+
+(defn- allowed-xform? [sym]
+  (or (contains? builtin-xforms sym)
+      (contains? *xforms* sym)
+      (contains? @extension-xforms sym)))
+
+(defn- resolve-xform
+  "Function objects, vars and keywords from code are used as given. A symbol (pattern
+  data) must be allowed: built in, in *xforms*, or listed under :xforms in
+  mnemonic/extensions.edn; an allowed qualified symbol's namespace is required."
+  [x]
   (cond
     (nil? x) nil
     (fn? x) x
     (var? x) x
     (keyword? x) x
-    (symbol? x) (or (if (namespace x)
-                      (some-> (find-ns (symbol (namespace x)))
-                              (ns-resolve (symbol (name x))))
-                      (ns-resolve 'clojure.core x))
-                    (throw (spec-error :db.error/invalid-attr-spec
-                                       (str "Cannot resolve :xform " x) {:xform x})))
+    (symbol? x)
+    (do (when-not (allowed-xform? x)
+          (throw (ex-info (str "'" x "' needs to be listed under :xforms in mnemonic/extensions.edn")
+                          {:db/error :db.error/xform-not-allowed
+                           :cognitect.anomalies/category :cognitect.anomalies/forbidden
+                           :xform x})))
+        (or (if (namespace x)
+              (try (requiring-resolve x) (catch Exception _ nil))
+              (ns-resolve 'clojure.core x))
+            (throw (spec-error :db.error/invalid-attr-spec
+                               (str "Cannot resolve :xform " x) {:xform x}))))
     :else (throw (spec-error :db.error/invalid-attr-spec
                              (str "Cannot interpret as a :xform function: " (pr-str x))
                              {:xform x}))))
@@ -174,11 +218,13 @@
     pattern
     (if (nil? pattern)
       (->PullPattern false false [] #{})
-      (or (.get parse-cache pattern)
-          (let [ast (parse-seq pattern)]
-            (when (> (.size parse-cache) 1000) (.clear parse-cache))
-            (.put parse-cache pattern ast)
-            ast)))))
+      ;; keyed by *xforms* too: an AST resolved under a binding must not leak out of it
+      (let [k [pattern *xforms*]]
+        (or (.get parse-cache k)
+            (let [ast (parse-seq pattern)]
+              (when (> (.size parse-cache) 1000) (.clear parse-cache))
+              (.put parse-cache k ast)
+              ast))))))
 
 (def ^:private wildcard-ast (parse-seq '[*]))
 

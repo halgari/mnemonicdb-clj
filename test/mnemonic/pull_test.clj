@@ -141,7 +141,7 @@
    [(:p/tags :limit 0 :default 3)] "a" {:p/tags 3}
    [{(:p/friends :limit 1 :as :fr) [:p/name]}] "b" {:fr [{:p/name "Al"}]}
    [(:p/age :xform str :as :s)] "a" {:s "30"}
-   [(:p/name :xform clojure.string/upper-case)] "a" {:p/name "AL"}
+   [(:p/name :xform clojure.edn/read-string)] "a" {:p/name 'Al}
    [(:p/name :bogus 1)] "a" {:p/name "Al"}
    [(:p/name :as :a) (:p/age :as :a)] "a" {:a "Al"}
    [{(:p/boss :default {}) [:p/name]}] "a" {:p/boss {}}
@@ -156,7 +156,7 @@
   (let [{:keys [db ids]} (fixture)]
     (is (= {:p/name "Al!"} (m/pull db [(list :p/name :xform (fn [v] (str v "!")))] (ids "a")))
         "functions are accepted")
-    (is (= {:p/tags 2} (m/pull db '[(:p/tags :xform count)] (ids "a")))
+    (is (= {:p/tags 2} (m/pull db [(list :p/tags :xform count)] (ids "a")))
         "xform sees the whole card-many vector")
     (is (= {:p/missing ""} (m/pull db '[(:p/missing :xform str)] (ids "a")))
         "xform runs on absent values (Datomic parity)")))
@@ -284,9 +284,37 @@
     (is (= before (.get ^java.util.concurrent.atomic.AtomicLong index/open-cursors))
         "pull and entity close every cursor eagerly")))
 
-(deftest xform-no-load-test
-  (let [{:keys [db ids]} (fixture)]
-    (is (= :db.error/invalid-attr-spec
-           (err #(m/pull db '[(:p/name :xform not.loaded.ns/f)] (ids "a")))))
-    (is (nil? (find-ns 'not.loaded.ns)))
-    (is (= {:p/name "AL"} (m/pull db '[(:p/name :xform clojure.string/upper-case)] (ids "a"))))))
+(defn shout [v] (str v "!"))
+
+(deftest xform-allowlist-test
+  (let [{:keys [db ids]} (fixture)
+        forbidden? (fn [pattern]
+                     (try (m/pull db pattern (ids "a")) false
+                          (catch clojure.lang.ExceptionInfo e
+                            (and (= :db.error/xform-not-allowed (:db/error (ex-data e)))
+                                 (= :cognitect.anomalies/forbidden (:cognitect.anomalies/category (ex-data e)))))))]
+    (testing "symbols naming arbitrary loaded vars are refused (as in Datomic)"
+      (doseq [x '[clojure.core/load-string load-string read-string clojure.core/eval
+                  clojure.core/slurp count clojure.string/upper-case not.loaded.ns/f]]
+        (is (forbidden? [(list :p/name :xform x)]) (str x)))
+      (is (forbidden? '[{(:p/boss :xform clojure.core/load-string) [:p/name]}]) "nested")
+      (is (nil? (find-ns 'not.loaded.ns)) "namespaces are never loaded for unlisted symbols"))
+    (testing "Datomic's built-in xforms"
+      (is (= {:p/name "Al"} (m/pull db '[(:p/name :xform str)] (ids "a"))))
+      (is (= {:p/name "Al"} (m/pull db '[(:p/name :xform name)] (ids "a"))))
+      (is (= {:p/name :Al} (m/pull db '[(:p/name :xform keyword)] (ids "a"))))
+      (is (= {:p/name 'Al} (m/pull db '[(:p/name :xform symbol)] (ids "a"))))
+      (is (= {:p/name 'Al} (m/pull db '[(:p/name :xform clojure.edn/read-string)] (ids "a")))))
+    (testing "mnemonic/extensions.edn on the classpath lists more"
+      (is (= {:p/name "Al!"} (m/pull db '[(:p/name :xform mnemonic.pull-test/shout)] (ids "a")))))
+    (testing "*xforms* adds symbols for a dynamic extent; the parse cache respects it"
+      (is (forbidden? '[(:p/name :xform clojure.string/upper-case)]))
+      (binding [pull/*xforms* '#{clojure.string/upper-case}]
+        (is (= {:p/name "AL"} (m/pull db '[(:p/name :xform clojure.string/upper-case)] (ids "a")))))
+      (is (forbidden? '[(:p/name :xform clojure.string/upper-case)])))
+    (testing "function and var objects from code are trusted"
+      (is (= {:p/name "AL"} (m/pull db [(list :p/name :xform clojure.string/upper-case)] (ids "a"))))
+      (is (= {:p/name "AL"} (m/pull db [(list :p/name :xform #'clojure.string/upper-case)] (ids "a")))))
+    (testing "in queries"
+      (is (thrown? Exception (m/q '[:find (pull ?e [(:p/name :xform clojure.core/load-string)]) :in $ ?e]
+                                  db (ids "a")))))))

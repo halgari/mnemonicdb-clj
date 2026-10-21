@@ -39,8 +39,21 @@
   "Releases a connection."
   [connection] (conn/release connection))
 
+(defn shutdown
+  "Releases every connection (closing file stores). With `shutdown-clojure?` true, also
+  shuts down Clojure's agent thread pools."
+  [shutdown-clojure?] (conn/shutdown shutdown-clojure?))
+
+(defn get-database-names
+  "Names of the databases matching `uri`, which has `*` in place of the database name
+  (mnemonic:mem://* or mnemonic:file:///dir/*); nil when there are none."
+  [uri] (conn/get-database-names uri))
+
 (defn release-db
-  "Releases the RocksDB snapshot held by `db` now instead of when it is collected."
+  "Releases the RocksDB snapshot `db` reads from (for views and with-dbs: the snapshot
+  of the underlying db) now instead of when it is collected. Later reads of a released
+  db throw :db.error/db-released; iterations already started complete. Releasing a
+  connection's current db is safe: the connection publishes a fresh db."
   [db*] (dbns/release-db (index/-raw db*)))
 
 (defn db
@@ -254,7 +267,7 @@
   (when-not (contains? index-order index) (bad-index index))
   (if-let [comps (resolve-components db* index components)]
     (index/datoms-iterable (view-db db* (indexed-view index index/-view))
-                           index (codec/encode-prefix index comps))
+                           index (codec/encode-prefix-numeric index comps))
     empty-result))
 
 (defn seek-datoms
@@ -263,7 +276,7 @@
   (when-not (contains? index-order index) (bad-index index))
   (if-let [comps (resolve-components db* index components)]
     (index/datoms-iterable (view-db db* (indexed-view index index/-seek-view))
-                           index (codec/encode-prefix index comps))
+                           index (codec/encode-prefix-numeric index comps))
     empty-result))
 
 (deftype UntilCursor [^ICursor c ^bytes stop]
@@ -287,8 +300,8 @@
                      :else (try (tx/coerce-value attr v) (catch clojure.lang.ExceptionInfo _ v))))
         s (norm start)
         e (norm end)
-        start-key (codec/encode-prefix :avet (if (nil? s) [aid] [aid s]))
-        stop-key (codec/encode-prefix :avet (if (nil? e) [(inc aid)] [aid e]))]
+        start-key (codec/encode-prefix-numeric :avet (if (nil? s) [aid] [aid s]))
+        stop-key (codec/encode-prefix-numeric :avet (if (nil? e) [(inc aid)] [aid e]))]
     (index/datoms-iterable
      (view-db db* (fn [d _ _] (->UntilCursor (index/-seek-view d :avet start-key) stop-key)))
      :avet start-key)))
@@ -301,6 +314,58 @@
 
 (defn pull [db* pattern eid] (pullns/pull db* pattern eid))
 (defn pull-many [db* pattern eids] (pullns/pull-many db* pattern eids))
+
+(defn- invalid-pull [msg data]
+  (throw (tx/error :db.error/invalid-pull msg data)))
+
+(defn index-pull
+  "Walks :avet (pulling each datom's :e) or :aevt (pulling each datom's :v) from the
+  position `start` (a vector in index order; at least the attribute), limited to the
+  datoms of that attribute, and returns a lazy seq of `(pull db selector eid)`. With
+  `:reverse true`, walks backwards from `start` (the datoms are collected first)."
+  [db* {:keys [index selector start reverse]}]
+  (when (or (nil? selector) (nil? index) (nil? (first start)))
+    (throw (tx/error :db.error/nil-input "selector, index, and start attribute must be specified"
+                     {})))
+  (when-not (contains? #{:avet :aevt} index)
+    (invalid-pull (str (if (keyword? index) (name index) (pr-str index))
+                       " is an invalid index, must be :avet or :aevt")
+                  {:index index}))
+  (when (index/-history? db*)
+    (invalid-pull "Can't pull from history" {}))
+  (let [^Attr a (tx/resolve-attr (index/-schema db*) (first start))
+        aid (long (:id a))
+        many? (= :db.cardinality/many (:cardinality a))]
+    (case index
+      :avet (do (when (and (== 1 (count start)) many?)
+                  (invalid-pull (str (:ident a) " is not card-one, as required for :avet when start has only A specified")
+                                {:attribute (:ident a)}))
+                (when-not (schema/indexed? a) (not-indexed a)))
+      :aevt (do (when-not many?
+                  (invalid-pull (str (:ident a) " is not card-many, as required for :aevt")
+                                {:attribute (:ident a)}))
+                (when-not (= :db.type/ref (:value-type a))
+                  (invalid-pull (str (:ident a) " is not a ref, as required for :aevt")
+                                {:attribute (:ident a)}))))
+    (let [comps (or (resolve-components db* index start) [aid])
+          attr-prefix (codec/encode-prefix index [aid])
+          start-key (codec/encode-prefix-numeric index comps)
+          in-attr (fn [^Datom d] (== aid (.-a d)))
+          ds (if reverse
+               (let [stop (codec/prefix-end start-key)]
+                 (->> (seq (index/datoms-iterable (view-db db* index/-view) index attr-prefix))
+                      (take-while (fn [^Datom d]
+                                    (or (nil? stop)
+                                        (neg? (codec/compare-bytes
+                                               (codec/encode-key index (.-e d) (.-a d) (.-v d) (.-tx d))
+                                               stop)))))
+                      vec
+                      rseq))
+               (take-while in-attr
+                           (seq (index/datoms-iterable (view-db db* index/-seek-view) index start-key))))
+          ast (pullns/parse-pattern selector)
+          eid-of (if (= index :avet) (fn [^Datom d] (.-e d)) (fn [^Datom d] (.-v d)))]
+      (map #(pullns/pull-from-ast db* ast (eid-of %)) ds))))
 
 (defn q [query & inputs] (apply query*/q query inputs))
 (defn query [query-map] (query*/query query-map))

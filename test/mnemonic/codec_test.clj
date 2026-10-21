@@ -1,5 +1,5 @@
 (ns mnemonic.codec-test
-  (:require [clojure.test :refer [deftest is]]
+  (:require [clojure.test :refer [deftest is testing]]
             [clojure.test.check.clojure-test :refer [defspec]]
             [clojure.test.check.generators :as gen]
             [clojure.test.check.properties :as prop]
@@ -62,7 +62,8 @@
     ;; bigints decode to clojure.lang.BigInt whatever integer class was written
     (or (instance? BigInteger a) (instance? clojure.lang.BigInt a))
     (and (instance? clojure.lang.BigInt b) (= a b))
-    (decimal? a) (and (decimal? b) (zero? (.compareTo ^BigDecimal a ^BigDecimal b)))
+    ;; exact: value and scale (1.0M and 1.00M are different values, as in Datomic)
+    (decimal? a) (and (decimal? b) (.equals ^BigDecimal a b))
     :else (and (= a b) (= (class a) (class b)))))
 
 (defn- order-prop [g cmp]
@@ -124,7 +125,13 @@
 (defspec order-keyword 2000 (order-prop gen-kw compare))
 (defspec order-symbol 2000 (order-prop gen-sym compare))
 (defspec order-bigint 2000 (order-prop gen-bigint compare))
-(defspec order-bigdec 2000 (order-prop gen-bigdec compare))
+(defn- bigdec-compare
+  "Numeric order; numerically equal values by scale."
+  [^BigDecimal a ^BigDecimal b]
+  (let [c (.compareTo a b)]
+    (if (zero? c) (compare (.scale a) (.scale b)) c)))
+
+(defspec order-bigdec 2000 (order-prop gen-bigdec bigdec-compare))
 (defspec order-instant 2000 (order-prop gen-date compare))
 (defspec order-uuid 2000 (order-prop gen-uuid compare))
 (defspec order-boolean 100 (order-prop gen/boolean compare))
@@ -139,7 +146,22 @@
   (let [vs [-100M -1.5M -1.25M -0.001M 0M 0.001M 1M 1.25M 1.5M 1E+10M]
         bs (map c/value->bytes vs)]
     (is (every? neg? (map c/compare-bytes bs (rest bs))))
-    (is (zero? (c/compare-bytes (c/value->bytes 1.0M) (c/value->bytes 1M))))))
+    (testing "numerically equal values differ, ordered by scale"
+      (is (neg? (c/compare-bytes (c/value->bytes 1M) (c/value->bytes 1.0M))))
+      (is (neg? (c/compare-bytes (c/value->bytes 1.0M) (c/value->bytes 1.00M))))
+      (is (neg? (c/compare-bytes (c/value->bytes 1E+2M) (c/value->bytes 100M))))
+      (is (neg? (c/compare-bytes (c/value->bytes 0M) (c/value->bytes 0.00M))))
+      (is (neg? (c/compare-bytes (c/value->bytes 1.00M) (c/value->bytes 1.001M)))))
+    (testing "the numeric part is a prefix shared by every scale"
+      (let [p (c/bigdec-numeric-prefix 1M)]
+        (doseq [v [1M 1.0M 1.00M 1E+0M]]
+          (is (java.util.Arrays/equals p 0 (alength p) (c/value->bytes v) 0 (alength p))))
+        (is (not (java.util.Arrays/equals p 0 (alength p) (c/value->bytes 10M) 0 (alength p))))))))
+
+(deftest bigdec-round-trips-exactly
+  (doseq [v [1.0M 1.00M 1M 10.50M 10.5M 100M 1E+2M 0M 0.0M 0.00M 0E+3M -1.0M -0.50M 1E-30M 123456789.123456789000M]]
+    (is (.equals ^BigDecimal v (rt v)) (str v))
+    (is (= (.scale ^BigDecimal v) (.scale ^BigDecimal (rt v))) (str v))))
 
 ;; ---------------------------------------------------------------- edges
 
@@ -154,7 +176,7 @@
   (is (neg? (c/compare-bytes (c/value->bytes Double/POSITIVE_INFINITY) (c/value->bytes Double/NaN))))
   (doseq [x [Long/MIN_VALUE Long/MAX_VALUE]] (is (= x (rt x))))
   (doseq [k [:a :a/b :a.b/c]] (is (= k (rt k))))
-  (doseq [x [1.0M 1M -0.001M 1E+10M 0M 0.0M]] (is (same? x (rt x))))
+  (doseq [x [1.0M 1M -0.001M 1E+10M 0M 0.0M]] (is (same? x (rt x)) (str x)))
   (is (nil? (rt nil)))
   (is (= [] (rt [])))
   (is (= [nil [1 nil]] (rt [nil [1 nil]])))

@@ -205,6 +205,30 @@ when the db value becomes unreachable (`java.lang.ref.Cleaner`) or explicitly vi
 `mnemonic.api/release-db`. Known cost: long-lived db values keep tombstones from
 being compacted.
 
+Native safety (no public path may touch a closed or freed RocksDB object):
+
+- Every store-level native call (new iterator, get, write batch build + write,
+  snapshot create/free) runs under the read side of a per-store
+  `ReentrantReadWriteLock` after checking a `closed` flag. `close-store` sets `closed`
+  under the write side (waiting for in-flight calls), then force-closes every
+  registered cursor, frees every registered snapshot, and only then closes column
+  family handles, the db and options. Later calls throw
+  `:db.error/connection-released`.
+- A cursor serializes its own native calls on its monitor and checks its state
+  first (one monitor enter per datom: `nextKey` advances and reads the key in one
+  call); force-close takes the same monitor.
+- Snapshots are reference counted (one reference per open cursor). `release-db`
+  marks a snapshot released (new cursors throw `:db.error/db-released`) and the
+  native snapshot is freed when the last cursor closes. Lock order: cursor monitor
+  -> store read lock; snapshot state is a CAS word, never held across a lock.
+- An iterator that becomes invalid has its `status()` checked, so I/O errors and
+  corruption surface as `:db.error/storage-error` faults.
+- Connections: file paths are canonicalized for the registry; connect / create /
+  delete of a database wait for a pending close of the same store. A released
+  current db is rebuilt (on the writer thread, inline when already on it).
+- The on-disk format version (meta `:format`, currently 2) and the counters
+  (`next-t` > last log t) are checked on connect.
+
 ## 7. Transactor pipeline
 
 Runs on the writer thread against a `With` overlay over the latest db.

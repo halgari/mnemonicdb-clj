@@ -23,13 +23,12 @@
 
 (def ^:private tx-instant-attr 50)
 
-(defn- norm-value [v]
+(defn norm-value [v]
   (cond
     (bytes? v) (vec v)
     (and (instance? Double v) (Double/isNaN v)) :NaN
     (and (instance? Float v) (Float/isNaN v)) :NaN
     (instance? Float v) (double v)
-    (instance? BigDecimal v) (.stripTrailingZeros ^BigDecimal v)
     (instance? Integer v) (long v)
     (instance? Short v) (long v)
     (vector? v) (mapv norm-value v)

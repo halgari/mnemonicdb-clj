@@ -66,8 +66,32 @@ through `org.rocksdb/rocksdbjni`. On recent JDKs add
 
 The API mirrors `datomic.api`: `create-database`, `connect`, `db`, `transact`,
 `with`, `as-of`, `since`, `history`, `filter`, `datoms`, `seek-datoms`, `index-range`,
-`entity`, `touch`, `pull`, `pull-many`, `q`, `query`, `qseq`, `log`, `tx-range`,
-`tx-report-queue`, `tempid`, `entid`, `ident`, `squuid`, `function`, `invoke`.
+`entity`, `touch`, `pull`, `pull-many`, `index-pull`, `q`, `query`, `qseq`, `log`,
+`tx-range`, `tx-report-queue`, `tempid`, `entid`, `ident`, `squuid`, `function`,
+`invoke`, `release`, `shutdown`, `get-database-names`, plus `release-db` (frees a db's
+RocksDB snapshot early).
+
+### Lifecycle
+
+- `release` stops a connection's transactor and, for file databases, closes the store.
+  Afterwards every read through that connection's dbs, lazy seqs, entities and log
+  throws `:db.error/connection-released` (never a native crash). `delete-database`
+  does the same and then deletes the data.
+- `release-db` releases the snapshot a db reads from. Reads already in progress
+  complete; later reads of that db throw `:db.error/db-released`. Releasing a
+  connection's current db is safe: the connection publishes a fresh one.
+- `shutdown` releases every connection; call it from a JVM shutdown hook so file
+  stores are closed cleanly.
+- The on-disk format is versioned (currently 2). Connecting to a store written in
+  another format fails with `:db.error/incompatible-format`.
+
+### Pull `:xform`
+
+As in Datomic, a symbol used as `:xform` in a pull pattern must be allowed: the
+built-ins (`str`, `name`, `namespace`, `keyword`, `symbol`, `clojure.edn/read-string`),
+symbols listed under `:xforms` in a `mnemonic/extensions.edn` resource on the classpath
+(`{:xforms [my.ns/my-fn]}`), or symbols bound in `mnemonic.pull/*xforms*`. Function
+and var objects passed from code are used as given.
 
 ## Tests
 

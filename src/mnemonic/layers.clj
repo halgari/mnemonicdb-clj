@@ -6,7 +6,6 @@
             [mnemonic.datom :as datom]
             [mnemonic.db :as db]
             [mnemonic.index :as index]
-            [mnemonic.rocks :as rocks]
             [mnemonic.schema :as schema]
             [mnemonic.tx :as tx])
   (:import (java.util Arrays Comparator Date Iterator Map$Entry NavigableMap TreeMap)
@@ -38,10 +37,7 @@
       (and (not hist?) prefix) (index/-view b idx prefix)
       (not hist?) (index/-seek-view b idx start)
       prefix (index/-seek-history b idx prefix)
-      :else (let [store (.-store b)]
-              (index/seek-cursor
-               (db/->GuardedCursor store (rocks/raw-cursor store (history-cf idx) (.-snap b)))
-               start idx true)))))
+      :else (db/history-seek-cursor b idx start))))
 
 ;; ------------------------------------------------------------------ overlay (With)
 
@@ -50,17 +46,6 @@
     (compare [_ a b] (Arrays/compareUnsigned ^bytes a ^bytes b))))
 
 (def ^:private deleted ::deleted)
-
-(defn- prefix-end
-  "Smallest key greater than every key starting with `p`, or nil when unbounded."
-  [^bytes p]
-  (loop [i (dec (alength p))]
-    (cond
-      (neg? i) nil
-      (== 255 (bit-and (aget p i) 0xff)) (recur (dec i))
-      :else (let [r (Arrays/copyOf p (int (inc i)))]
-              (aset r i (unchecked-byte (inc (bit-and (aget r i) 0xff))))
-              r))))
 
 (defn- next-entry [^Iterator it]
   (when (.hasNext it) (.next it)))
@@ -127,7 +112,7 @@
 (defn- overlay-cursor
   [^ICursor inner ^TreeMap tm idx hist? ^bytes start ^bytes prefix]
   (let [from (or start prefix)
-        end (when prefix (prefix-end prefix))
+        end (when prefix (codec/prefix-end prefix))
         ^NavigableMap slice (if end
                               (.subMap tm from true end false)
                               (.tailMap tm from true))
@@ -177,9 +162,11 @@
 (defn- load-schema
   "Schema of `w`, scanned through its own (overlaid) AEVT."
   [w]
-  (schema/schema-from-datoms
-   (into [] (mapcat #(index/datoms-iterable w :aevt (codec/encode-prefix :aevt [%])))
-         (sort schema/schema-attr-ids))))
+  (schema/with-ident-aliases
+   (schema/schema-from-datoms
+    (into [] (mapcat #(index/datoms-iterable w :aevt (codec/encode-prefix :aevt [%])))
+          (sort schema/schema-attr-ids)))
+   (db/ident-history (index/-seek-history w :aevt (codec/encode-prefix :aevt [schema/ident-attr-id])))))
 
 (defn with
   "Applies `tx-data` speculatively to `db*`; returns {:db-before :db-after :tx-data :tempids}.
@@ -343,9 +330,18 @@
       (history-cursor src idx lo hi)
       (visible-cursor src lo hi))))
 
+;; A time-restricted view. Reads go through -view / -seek-view, which apply the as-of /
+;; since / history bounds.
+;;
+;; WARNING: -seek-current and -seek-history are raw pass-throughs to the inner db and
+;; BYPASS the time bounds (they expose the inner db's current and history entries as
+;; stored). They exist for code that needs the underlying entries (e.g. time-cursor
+;; building on -open); never use them to answer a query against a TimeView.
 (deftype TimeView [inner as-of since history?]
   index/IDb
+  ;; bypasses as-of / since (see the warning above)
   (-seek-current [_ idx prefix] (index/-seek-current inner idx prefix))
+  ;; bypasses as-of / since (see the warning above)
   (-seek-history [_ idx prefix] (index/-seek-history inner idx prefix))
   (-view [_ idx prefix] (time-cursor inner idx nil prefix as-of since history?))
   (-seek-view [_ idx start] (time-cursor inner idx start nil as-of since history?))
@@ -359,15 +355,26 @@
 
 (def ^:private t-base (codec/t->tx 0))
 
+(defn- first-tx-at-or-after
+  "The first :db/txInstant datom of `db*` whose instant is >= `date` (AVET seek; ties in
+  tx order), or nil."
+  ^Datom [db* ^Date date]
+  (let [^ICursor c (index/-seek-view db* :avet (codec/encode-prefix :avet [50 date]))]
+    (try
+      (when (.valid c)
+        (let [^Datom d (.datom c)]
+          (when (== 50 (.-a d)) (index/copy-datom d))))
+      (finally (.close c)))))
+
 (defn- date->t
-  "Latest t whose :db/txInstant is not after `date` (0 when none)."
+  "Datomic's conversion of a Date to a t: T is the first transaction whose
+  :db/txInstant is >= `date`; the t is T's when its instant equals `date`, else T's t
+  minus one; when there is no such transaction, the db's next t."
   [db* ^Date date]
-  (reduce (fn [^long acc ^Datom d]
-            (if (and (.-added d) (not (.after ^Date (.-v d) date)))
-              (max acc (codec/tx->t (.-e d)))
-              acc))
-          0
-          (index/datoms-iterable db* :aevt (codec/encode-prefix :aevt [50]))))
+  (if-let [^Datom d (first-tx-at-or-after db* date)]
+    (let [t (codec/tx->t (.-e d))]
+      (if (== (.getTime ^Date (.-v d)) (.getTime date)) t (dec t)))
+    (long (:next-t (db/db-meta (index/-raw db*))))))
 
 (defn- ->t
   "t from a t, a tx id or a Date."
