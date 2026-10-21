@@ -9,4 +9,8 @@
                       org.slf4j/slf4j-nop {:mvn/version "2.0.17"}}
          :jvm-opts ["--enable-native-access=ALL-UNNAMED"]
          :main-opts ["-m" "cognitect.test-runner"]}
-  :bench {:extra-deps {criterium/criterium {:mvn/version "0.4.6"}}}}}
+  :bench {:extra-paths ["bench"]
+          :extra-deps {criterium/criterium {:mvn/version "0.4.6"}
+                       com.datomic/peer {:mvn/version "1.0.7745"}
+                       org.slf4j/slf4j-nop {:mvn/version "2.0.17"}}
+          :jvm-opts ["--enable-native-access=ALL-UNNAMED" "-Xms2g" "-Xmx10g"]}}}
