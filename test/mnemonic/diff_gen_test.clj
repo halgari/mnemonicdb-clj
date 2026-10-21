@@ -333,7 +333,8 @@
              (prop/for-all [c gen-case]
                (let [r (run-case c)]
                  (when r (println "DIFF:" (pr-str r)))
-                 (nil? r))))]
+                 (nil? r)))
+             :seed (some-> (System/getenv "MNEMONIC_DIFF_SEED") parse-long))]
     (when-not (:pass? res)
       (println "Failing (shrunk):" (pr-str (-> res :shrunk :smallest)))
       (println "Result seed:" (:seed res)))

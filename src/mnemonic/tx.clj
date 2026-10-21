@@ -473,7 +473,10 @@
           join! (fn [r p]              ; tempid root `r` joins `p` (a tempid root or an entity id)
                   (vswap! ptr assoc r p)
                   (when (tmp? p) (.put sizes p (+ (group-size p) (group-size r)))))
-          pending (java.util.HashMap.)]
+          pending (java.util.HashMap.)
+          ;; assert/retract clashes between two still-unbound tempids; Datomic only reports
+          ;; them if neither tempid is bound to an existing entity by the end
+          deferred (java.util.ArrayList.)]
       (doseq [[kind e ^Attr attr v] identity-ops]
         (let [r (find-root @ptr e)
               ;; a tempid used as the (ref) identity value matches only the same tempid
@@ -493,10 +496,15 @@
               (cond
                 (nil? p) (.put pending k [r kind])
                 (and (= p r) (= pkind kind)) nil
-                (not= pkind kind) (conflict! r attr v p)
+                (not= pkind kind) (if (and (tmp? r) (tmp? p))
+                                    (.add deferred [r attr v p])
+                                    (conflict! r attr v p))
                 (and (tmp? r) (== 1 (group-size r))) (join! r p)
                 (and (tmp? p) (not (tmp? r)) (== 1 (group-size p))) (join! p r)
                 :else (conflict! r attr v p))))))
+      (doseq [[r attr v p] deferred
+              :when (and (tmp? (find-root @ptr r)) (tmp? (find-root @ptr p)))]
+        (conflict! r attr v p))
       nil)
     ;; allocation
     (let [members (let [m (LinkedHashMap.)]
