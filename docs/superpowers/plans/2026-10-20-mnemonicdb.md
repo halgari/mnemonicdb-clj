@@ -23,7 +23,7 @@
 
 ## Pinned facts (probed from Datomic 1.0.7745)
 
-- Bootstrap: 272 datoms, 64 idents, eids 0–72, basis-t `72`, `next-t` `1000`. Exact datoms in `resources/mnemonic/bootstrap.edn` as `[e a v tx]`, `v` of `(inst <ms>)` = `java.util.Date`.
+- Bootstrap: 272 datoms, 66 `:db/ident` datoms, eids 0–72, basis-t `72`, `next-t` `1000`. Exact datoms in `resources/mnemonic/bootstrap.edn` as `[e a v tx]`, `v` of `(inst <ms>)` = `java.util.Date`.
 - System attr ids: `:db/ident 10`, `:db.install/partition 11`, `:db.install/valueType 12`, `:db.install/attribute 13`, `:db/valueType 40`, `:db/cardinality 41`, `:db/unique 42`, `:db/isComponent 43`, `:db/index 44`, `:db/noHistory 45`, `:db/txInstant 50`, `:db/fulltext 51`, `:db/fn 52`, `:db/doc 62`, `:db/tupleType 65`, `:db/tupleTypes 66`, `:db/tupleAttrs 67`, `:db/ensure 68`, `:db.attr/preds 71`. Partitions: `:db.part/db 0`, `:db.part/tx 3`, `:db.part/user 4`.
 - Ids: `eid = (part << 42) | n`; `tx = (3 << 42) | t`.
 - Counters: `:db.part/db` has its own counter (next n = `73` after bootstrap). Tx `t` and all other partitions share one counter (starts at `1000`). A tx takes `t` first, then its new non-db entities take subsequent n. Example: schema tx (2 attrs) → t=1000, attrs eids 73, 74; next tx with 2 new user entities → t=1001, eids `(4<<42)|1002`, `(4<<42)|1003`.
