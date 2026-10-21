@@ -357,11 +357,6 @@
 
 (def ^:private ^:const n-mask (dec (bit-shift-left 1 42)))
 
-(defn- stamp! [^AtomicLongArray st ^long i ^long t]
-  (loop []
-    (let [cur (.get st (unchecked-int i))]
-      (when (and (< cur t) (not (.compareAndSet st (unchecked-int i) cur t)))
-        (recur)))))
 
 (defn before-write!
   "Called by rocks/write! before a batch of `ops` ([:put cf k v] / [:delete cf k]) is
@@ -381,7 +376,12 @@
                 (when (pos? (cf-code cf)) (aset idx 0 true)))))
         t (aget tl 0)]
     (when (aget idx 0)
-      (let [^AtomicLong mt (.-max-t c)]
+      ;; Regular batches stamp one at a time (the lock) with a t above every stamp so
+      ;; far, so a plain ordered store (lazySet: no locked instruction, no load of the
+      ;; cold slot) is the max. The full fence after the stamps orders them before the
+      ;; RocksDB write, so any snapshot that contains the batch sees them.
+      (locking c
+       (let [^AtomicLong mt (.-max-t c)]
         (if (or (neg? t) (== t Long/MAX_VALUE) (<= t (.get mt)))
           (do (.incrementAndGet ^AtomicLong (.-epoch* c)) true)
           (let [^AtomicLongArray st (.-stripes c)
@@ -401,8 +401,9 @@
                               j (bit-and h 255)]
                           (when-not (and (== h (aget seen j)) (not (zero? h)))
                             (aset seen j h)
-                            (stamp! st (bit-and mask h) t)))))))))
-            false))))))
+                            (.lazySet st (unchecked-int (bit-and mask h)) t)))))))))
+            (java.lang.invoke.VarHandle/fullFence)
+            false)))))))
 
 (defn after-write!
   "Ends an irregular batch (see `before-write!`)."
@@ -423,6 +424,12 @@
   "Current epoch (even: no irregular write in progress)."
   ^long [^Cache c]
   (.get ^AtomicLong (.-epoch* c)))
+
+(defn snapshot-taken!
+  "Called right after a db's snapshot was taken: a full fence, so this thread's later
+  stamp reads cannot be ordered before the (native) snapshot reads."
+  []
+  (java.lang.invoke.VarHandle/fullFence))
 
 (defn stamp
   "Current stamp of the slot of hash `h`."

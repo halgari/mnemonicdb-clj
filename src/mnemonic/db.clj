@@ -365,6 +365,7 @@
   "Epoch of a db whose snapshot was taken between reading `e0` and now: -1 (never uses
   the cache) when an irregular write was in progress or happened meanwhile."
   ^long [store ^long e0]
+  (sc/snapshot-taken!)
   (if (and (>= e0 0) (even? e0) (== e0 (cache-epoch store))) e0 -1))
 
 (defn base-db
