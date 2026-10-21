@@ -208,19 +208,35 @@ being compacted.
 Native safety (no public path may touch a closed or freed RocksDB object):
 
 - Every store-level native call (new iterator, get, write batch build + write,
-  snapshot create/free) runs under the read side of a per-store
-  `ReentrantReadWriteLock` after checking a `closed` flag. `close-store` sets `closed`
-  under the write side (waiting for in-flight calls), then force-closes every
-  registered cursor, frees every registered snapshot, and only then closes column
+  snapshot create/free) runs inside the store guard: a striped in-flight counter
+  (one atomic add on a per-thread stripe) plus a `closed` flag that is re-checked
+  after the increment. `close-store` sets `closed` first, then waits until every
+  stripe is zero (sequential consistency: a caller either sees `closed` and backs
+  out, or the closer sees its increment and waits), then force-closes every
+  registered iterator, frees every registered snapshot, and only then closes column
   family handles, the db and options. Later calls throw
-  `:db.error/connection-released`.
-- A cursor serializes its own native calls on its monitor and checks its state
-  first (one monitor enter per datom: `nextKey` advances and reads the key in one
-  call); force-close takes the same monitor.
-- Snapshots are reference counted (one reference per open cursor). `release-db`
-  marks a snapshot released (new cursors throw `:db.error/db-released`) and the
-  native snapshot is freed when the last cursor closes. Lock order: cursor monitor
-  -> store read lock; snapshot state is a CAS word, never held across a lock.
+  `:db.error/connection-released`. (This replaced a `ReentrantReadWriteLock`, whose
+  shared read-lock word serialized concurrent readers.)
+- Iterators live in slots. A slot serializes its native calls on its monitor and
+  checks its state first (one monitor enter per datom: `nextKey` advances and reads
+  the key in one call); force-close and destroy take the same monitor and set the
+  state before closing the native iterator, exactly once. A caller holds a lease
+  (`RawCursor`) on a slot; a closed lease never touches the slot again.
+- Snapshots are reference counted (one reference per live slot, leased or idle).
+  Closing a cursor returns its slot to a bounded per-snapshot pool (stacks per
+  column family, mode and thread stripe, all sharing the snapshot's `ReadOptions`)
+  instead of closing the iterator. `release-db` marks a snapshot released (new
+  cursors throw `:db.error/db-released`), destroys the idle slots (a returning slot
+  re-checks the flag after pushing, so a release racing a return cannot strand a
+  slot) and the native snapshot is freed when the last slot is destroyed. Lock
+  order: slot monitor -> store guard (non-blocking counter); snapshot state is a CAS
+  word, never held across a lock.
+- Prefix bloom filters: the index column families use a fixed-length prefix
+  extractor (16 bytes for EAVT/AEVT/VAET, `avet-prefix-len` for AVET) and a
+  prefix-only filter. Prefix cursors whose prefix spans at least one extractor
+  prefix run in RocksDB's default (prefix) mode; every other cursor (seek-datoms,
+  index-range, short prefixes, history seeks) uses total_order_seek. SST files record
+  the extractor they were built with, so the extractor is not a format change.
 - An iterator that becomes invalid has its `status()` checked, so I/O errors and
   corruption surface as `:db.error/storage-error` faults.
 - Connections: file paths are canonicalized for the registry; connect / create /

@@ -18,19 +18,22 @@
   Runnable
   (run [_] (.markReleased snap)))
 
-(defn- open-raw ^IRawCursor [store snap cf]
-  (rocks/raw-cursor store cf snap))
+(defn- open-raw
+  "A raw cursor over `cf`. `prefix` non-nil: the caller reads only keys starting with it
+  (a prefix cursor), which lets RocksDB use the prefix bloom filter; nil: total order."
+  ^IRawCursor [store snap cf prefix]
+  (rocks/raw-cursor store cf snap prefix))
 
 (deftype Base [store ^Snap snap basis-t schema meta ^Releaser releaser]
   index/IDb
   (-seek-current [_ idx prefix]
-    (index/prefix-cursor (open-raw store snap idx) prefix idx false))
+    (index/prefix-cursor (open-raw store snap idx prefix) prefix idx false))
   (-seek-history [_ idx prefix]
-    (index/prefix-cursor (open-raw store snap (history-cf idx)) prefix idx true))
+    (index/prefix-cursor (open-raw store snap (history-cf idx) prefix) prefix idx true))
   (-view [_ idx prefix]
-    (index/prefix-cursor (open-raw store snap idx) prefix idx false))
+    (index/prefix-cursor (open-raw store snap idx prefix) prefix idx false))
   (-seek-view [_ idx start]
-    (index/seek-cursor (open-raw store snap idx) start idx false))
+    (index/seek-cursor (open-raw store snap idx nil) start idx false))
   (-basis-t [_] basis-t)
   (-schema [_] schema)
   (-as-of-t [_] nil)
@@ -42,7 +45,7 @@
 (defn history-seek-cursor
   "Cursor over the history index of `idx` from the first key >= `start` to its end."
   [^Base b idx start]
-  (index/seek-cursor (open-raw (.-store b) (.-snap b) (history-cf idx)) start idx true))
+  (index/seek-cursor (open-raw (.-store b) (.-snap b) (history-cf idx) nil) start idx true))
 
 (defn released?
   "True once `release-db` was called on `db` (or it was collected)."
