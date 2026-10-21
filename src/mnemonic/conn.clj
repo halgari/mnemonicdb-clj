@@ -314,6 +314,33 @@
 (defn- on-writer? [^Connection conn]
   (identical? conn (.get writer-of)))
 
+;; While a group runs: {:db volatile :meta volatile} of the group's chain (the db built
+;; from the group's latest written tx, not yet published because not yet fsynced). Only
+;; the writer thread reads it, so `d/db` called from a transaction function sees the
+;; preceding tx of the group, exactly like Datomic, without ever publishing unsynced data.
+(def ^:private ^ThreadLocal writer-chain (ThreadLocal.))
+
+(defn- connection-failed-error ^Throwable [^Throwable cause]
+  (ex-info (str "The connection is failed: a write-ahead log sync did not succeed, so the commit "
+                "status of recent transactions is unknown. Release the connection and reconnect "
+                "to rebuild its state from storage")
+           {:db/error :db.error/connection-failed
+            :cognitect.anomalies/category :cognitect.anomalies/fault}
+           cause))
+
+(defn- chain-view
+  "The db `d/db` returns on the writer thread inside a group, or nil when the group has
+  written nothing yet (then the published db is current). Never published."
+  [^Connection conn]
+  (when-let [g (.get writer-chain)]
+    (when @(:meta g)
+      (let [cdb @(:db g)]
+        (if (and cdb (not (db/released? cdb)))
+          cdb
+          (let [nb (db/base-db (:store conn))]
+            (vreset! (:db g) nb)
+            nb))))))
+
 (defn- rebuild-db!
   "Rebuilds the published db from the store (writer thread only)."
   [^Connection conn]
@@ -329,10 +356,13 @@
   published db was released (d/release-db), it is rebuilt on the writer thread first
   (directly when called on the writer thread, e.g. from a transaction function)."
   [^Connection conn]
-  (let [s @(:state conn)]
+  (let [s @(:state conn)
+        chain (when (on-writer? conn) (chain-view conn))]
     (when (:released? s) (throw (released-ex)))
     (cond
+      chain chain
       (not (needs-rebuild? s)) (:db s)
+      (:failed s) (throw (connection-failed-error (:failed s)))
       (on-writer? conn) (rebuild-db! conn)
       :else
       (let [f (CompletableFuture.)]
@@ -341,9 +371,10 @@
                     ^Runnable (fn []
                                 (.set writer-of conn)
                                 (try (.complete f (let [s @(:state conn)]
-                                                    (if (needs-rebuild? s)
-                                                      (rebuild-db! conn)
-                                                      (:db s))))
+                                                    (cond
+                                                      (not (needs-rebuild? s)) (:db s)
+                                                      (:failed s) (throw (connection-failed-error (:failed s)))
+                                                      :else (rebuild-db! conn))))
                                      (catch Throwable t (.completeExceptionally f t))
                                      (finally (.remove writer-of)))))
           (catch RejectedExecutionException _ (throw (released-ex))))
@@ -435,17 +466,22 @@
 (defn- flush-group!
   "Group commit point: fsyncs the WAL when anything was written (sync on), publishes the
   newest db (or marks the state stale when no db could be built), then completes the
-  group's futures in submission order. Nothing completes before the fsync returns."
+  group's futures in submission order. Nothing completes before the fsync returns.
+  If the fsync fails nothing is published: the connection is marked failed (further
+  transactions fail fast until it is released and reconnected, which rebuilds the state from
+  storage), the group's written txs fail with :db.error/commit-status-unknown and no
+  tx-report-queue entry is made for them."
   [^Connection conn ^java.util.ArrayList pend chain-db]
   (when-not (.isEmpty pend)
     (let [written? (boolean (some (fn [e] (nth e 3)) pend))
           sync-err (when (and written? (:sync? conn))
                      (try (rocks-sync/sync-wal! (:store conn)) nil
                           (catch Throwable t t)))]
-      (when written?
-        (if chain-db
-          (swap! (:state conn) assoc :db chain-db :stale? false)
-          (swap! (:state conn) assoc :stale? true)))
+      (cond
+        sync-err (swap! (:state conn) assoc :failed sync-err)
+        written? (if chain-db
+                   (swap! (:state conn) assoc :db chain-db :stale? false)
+                   (swap! (:state conn) assoc :stale? true)))
       (complete-entries! conn pend sync-err)
       (.clear pend))))
 
@@ -456,19 +492,22 @@
   fsync. One fsync then covers the whole group before ANY of its futures completes
   (with sync off every tx completes right after its write). A tx rejected in prepare
   fails alone; the others are unaffected. If the fsync fails the written txs fail with
-  :db.error/commit-status-unknown. Once a batch is written the new meta is recorded
-  immediately, so a failure while building the new db cannot make the next tx reuse ids;
-  the db is then built incrementally from the prepare result, else rebuilt, else the
-  state is marked stale and rebuilt lazily."
-  [^Connection conn entries]
+  :db.error/commit-status-unknown and the connection is marked failed. Once a batch is
+  written the new meta is recorded immediately, so a failure while building the new db
+  cannot make the next tx reuse ids; the db is then built incrementally from the prepare
+  result, else rebuilt, else the state is marked stale and rebuilt lazily. `pend` collects
+  [future outcome txid written?] per entry (the caller needs it if this throws)."
+  [^Connection conn entries ^java.util.ArrayList pend]
   (let [store (:store conn)
         sync? (:sync? conn)
-        pend (java.util.ArrayList.)
         chain-db (volatile! nil)
         chain-meta (volatile! nil)]
+    (.set writer-chain {:db chain-db :meta chain-meta})
     (doseq [[tx-data ^CompletableFuture f] entries]
       (let [outcome
             (try
+              (when-let [cause (:failed @(:state conn))]
+                (throw (connection-failed-error cause)))
               (let [[db r] (if-let [m @chain-meta]
                              (prepare-chain conn @chain-db m tx-data)
                              (prepare-tx conn tx-data))]
@@ -498,6 +537,19 @@
 
 (def ^:private ^:const max-group 256)
 
+(defn- fail-unfinished!
+  "Last-resort completion after `run-group!` threw `t`: every future of `entries` that is
+  not done yet fails. One whose tx was already written (its outcome is in `pend`) gets
+  :db.error/commit-status-unknown, never a raw error, because it may be durable."
+  [entries ^java.util.ArrayList pend ^Throwable t]
+  (doseq [[_ ^CompletableFuture f] entries
+          :when (not (.isDone f))]
+    (let [[_ outcome txid written?] (first (filter (fn [e] (identical? f (nth e 0))) pend))]
+      (.completeExceptionally
+       f (cond written? (unknown-status-error txid t)
+               (instance? Throwable outcome) outcome
+               :else t)))))
+
 (defn- drain!
   "Executor task: takes up to `max-group` queued txs and runs them as one group."
   [^Connection conn]
@@ -508,32 +560,39 @@
                     (persistent! acc)))]
     (when (seq entries)
       (.set writer-of conn)
-      (try (run-group! conn entries)
-           (catch Throwable t
-             ;; defensive: never leave a caller hanging; the state is rebuilt lazily
-             (swap! (:state conn) assoc :stale? true)
-             (doseq [[_ ^CompletableFuture f] entries]
-               (.completeExceptionally f t)))
-           (finally (.remove writer-of))))))
+      (let [pend (java.util.ArrayList.)]
+        (try (run-group! conn entries pend)
+             (catch Throwable t
+               ;; defensive: never leave a caller hanging; the state is rebuilt lazily
+               (swap! (:state conn) assoc :stale? true)
+               (fail-unfinished! entries pend t))
+             (finally (.remove writer-of)
+                      (.remove writer-chain)))))))
 
 (defn transact-async
   "Enqueues `tx-data`; returns a future of the tx report {:db-before :db-after :tx-data
   :tempids}. Failures complete the future exceptionally, so deref throws an
   ExecutionException wrapping the ex-info. For file databases with sync on (default) the
   future completes only after the transaction is fsynced; transactions queued
-  together share one fsync (group commit)."
+  together share one fsync (group commit). On a failed connection (see flush-group!) the
+  future fails at once."
   [^Connection conn tx-data]
   (let [f (CompletableFuture.)
         entry [tx-data f]
-        ^ConcurrentLinkedQueue q (:pending conn)]
+        ^ConcurrentLinkedQueue q (:pending conn)
+        ;; If submission fails after the entry is queued, a drain task may already own it
+        ;; (it then completes the future with the real outcome); only an entry we can
+        ;; still take back out of the queue is ours to fail.
+        abandon! (fn [^Throwable t] (when (.remove q entry) (.completeExceptionally f t)))]
     (try
-      (when (:released? @(:state conn)) (throw (released-ex)))
-      (.add q entry)
-      (.execute ^ExecutorService (:executor conn) ^Runnable (fn [] (drain! conn)))
-      (catch RejectedExecutionException _
-        (.remove q entry)
-        (.completeExceptionally f (released-ex)))
-      (catch Throwable t
-        (.remove q entry)
-        (.completeExceptionally f t)))
+      (let [s @(:state conn)]
+        (when (:released? s) (throw (released-ex)))
+        (when-let [cause (:failed s)] (throw (connection-failed-error cause))))
+      (catch Throwable t (.completeExceptionally f t)))
+    (when-not (.isDone f)
+      (try
+        (.add q entry)
+        (.execute ^ExecutorService (:executor conn) ^Runnable (fn [] (drain! conn)))
+        (catch RejectedExecutionException _ (abandon! (released-ex)))
+        (catch Throwable t (abandon! t))))
     f))

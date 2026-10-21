@@ -296,17 +296,15 @@
       (fail :db.error/not-an-entity (str "Unable to resolve entity: " (pr-str x)) {:entity x})))
 
 (defn- check-eid
-  "Rejects ids Datomic rejects: negative ids, user-partition ids not yet allocated, and
-  :db.part/db / :db.part/tx ids beyond Datomic's allocation window (probed: tx ids above
-  max(999, current tx n); db ids above last allocated + 927)."
+  "Rejects ids Datomic rejects: negative ids and ids at or beyond the allocation limit.
+  Probed against Datomic Pro 1.0.7745 (many db states, all of :db.part/db, :db.part/tx and
+  user partitions): one rule for every partition, accepted iff n < max(next-t, next-db-n),
+  where t is the t of the transaction being processed (so the current tx's own id is
+  rejected). `prepare` already lifts t to at least next-db-n, like Datomic does."
   [ctx ^long eid]
-  (let [part (codec/part-of eid)
-        n (bit-and eid (dec (bit-shift-left 1 42)))
-        meta (:meta ctx)]
+  (let [n (bit-and eid (dec (bit-shift-left 1 42)))]
     (when (or (neg? eid)
-              (cond (== part part-db) (>= n (+ (long (:next-db-n meta)) 927))
-                    (== part part-tx) (and (> n (long (:next-t meta))) (>= n 1000))
-                    :else (>= n (long (:next-t meta)))))
+              (>= n (max (long (:t ctx)) (long (:next-db-n (:meta ctx))))))
       (fail :db.error/invalid-entity-id (str "Invalid entity id: " eid) {:entity eid}))
     eid))
 
@@ -1229,7 +1227,8 @@
   Throws ex-info (with :db/error) on invalid tx-data; never writes."
   [db-before meta tx-data]
   (let [schema (index/-schema db-before)
-        t (long (:next-t meta))
+        ;; like Datomic, t is lifted past every allocated :db.part/db id
+        t (max (long (:next-t meta)) (long (:next-db-n meta)))
         tx (codec/t->tx t)
         ctx {:db db-before :schema schema :meta meta :t t :tx tx :part-cache (atom {})
              :lookup-cache (java.util.HashMap.)}

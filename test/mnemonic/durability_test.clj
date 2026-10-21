@@ -124,19 +124,134 @@
 (deftest fsync-failure-fails-the-group-test
   (let [[dir uri c] (setup "")]
     (try
-      (with-redefs [rocks-sync/sync-wal! (fn [_] (throw (ex-info "disk on fire" {})))]
-        (let [fs (vec (for [i (range 5)] (m/transact c (if (= i 2)
-                                                          [[:db/add 17592186045418 :no/such-attr 1]]
-                                                          [{:t/n i}]))))
+      (let [q (m/tx-report-queue c)
+            before (m/db c)
+            before-t (m/basis-t before)]
+        (with-redefs [rocks-sync/sync-wal! (fn [_] (throw (ex-info "disk on fire" {})))]
+          (let [fs (vec (for [i (range 5)] (m/transact c (if (= i 2)
+                                                            [[:db/add 17592186045418 :no/such-attr 1]]
+                                                            [{:t/n i}]))))
+                errs (mapv #(try @% :ok (catch ExecutionException e (cause-error e))) fs)]
+            (is (= [:db.error/commit-status-unknown :db.error/commit-status-unknown
+                    :db.error/not-an-entity
+                    :db.error/commit-status-unknown :db.error/commit-status-unknown]
+                   errs)
+                "written txs fail as unknown; the rejected tx keeps its own error")))
+        (testing "nothing was published and the report queue is silent"
+          (is (= before-t (m/basis-t (m/db c))))
+          (is (= #{} (ns-of (m/db c))))
+          (is (nil? (.poll ^java.util.Queue q))))
+        (testing "the connection is failed: later txs fail fast, even with a healthy disk"
+          (let [e (try @(m/transact c [{:t/n 100}]) :ok
+                       (catch ExecutionException e (cause-error e)))]
+            (is (= :db.error/connection-failed e)))
+          (is (= before-t (m/basis-t (m/db c))) "reads keep serving the last durable db")
+          (is (nil? (.poll ^java.util.Queue q))))
+        (testing "release + reconnect rebuilds from storage and works again"
+          (m/release c)
+          (let [c2 (m/connect uri)]
+            (is (some? @(m/transact c2 [{:t/n 200}])))
+            (is (contains? (ns-of (m/db c2)) 200)))))
+      (finally (conn/reset-registry!) (delete-tree dir)))))
+
+;; ------------------------------------------------------------------ d/db on the writer
+
+(def ^:private seen (atom []))
+(def ^:private the-conn (atom nil))
+
+(defn probe
+  "Transaction function that closes over the connection (through a global), as some codebases do."
+  [db]
+  (swap! seen conj {:arg (m/basis-t db)
+                    :conn (m/basis-t (m/db @the-conn))
+                    :conn-ns (ns-of (m/db @the-conn))
+                    :arg-ns (ns-of db)})
+  [])
+
+(deftest writer-db-inside-group-is-the-chain-db-test
+  (let [[dir uri c] (setup "")]
+    (try
+      (reset! seen [])
+      (reset! the-conn c)
+      (let [syncs (AtomicLong.)
+            entered (CountDownLatch. 1)
+            release (CountDownLatch. 1)
+            orig rocks-sync/sync-wal!]
+        (with-redefs [rocks-sync/sync-wal! (fn [store]
+                                             ;; hold the group's own fsync (2nd call)
+                                             (when (= 2 (.incrementAndGet syncs))
+                                               (.countDown entered)
+                                               (.await release 10 TimeUnit/SECONDS))
+                                             (orig store))]
+          (let [f0 (m/transact c [{:t/n 0}])
+                _ @f0
+                ;; the published db is released by the application: a naive on-writer
+                ;; rebuild would publish the store's unsynced state mid-group
+                _ (m/release-db (m/db c))
+                fs [(m/transact c [{:t/n 1}])
+                    (m/transact c [['mnemonic.durability-test/probe]])
+                    (m/transact c [{:t/n 2}])
+                    (m/transact c [['mnemonic.durability-test/probe]])]]
+            (is (.await entered 10 TimeUnit/SECONDS))
+            (testing "readers see no unsynced data while the group's fsync is pending"
+              (is (= #{0} (ns-of (m/db c)))))
+            (.countDown release)
+            (doseq [f fs] (is (some? (deref f 10000 nil))))
+            (is (= 2 (count @seen)))
+            (doseq [{:keys [arg conn conn-ns arg-ns]} @seen]
+              (is (= arg conn) "d/db on the writer is the preceding tx's db, as in Datomic")
+              (is (= arg-ns conn-ns)))
+            (is (= [#{0 1} #{0 1 2}] (mapv :conn-ns @seen)))
+            (is (= #{0 1 2} (ns-of (m/db c)))))))
+      (finally (reset! the-conn nil) (conn/reset-registry!) (delete-tree dir)))))
+
+;; ------------------------------------------------------------------ minors
+
+(defn- rejecting-executor
+  "An executor whose execute runs `on-execute`, then rejects like a shut-down executor."
+  [on-execute]
+  (proxy [java.util.concurrent.AbstractExecutorService] []
+    (execute [r] (on-execute r) (throw (java.util.concurrent.RejectedExecutionException. "shut down")))))
+
+(deftest rejected-execute-does-not-fail-a-taken-entry-test
+  (let [[dir uri c] (setup "")]
+    (try
+      (let [entered (CountDownLatch. 1)
+            release (CountDownLatch. 1)
+            orig rocks-sync/sync-wal!
+            real-ex (:executor c)]
+        (with-redefs [rocks-sync/sync-wal! (fn [store]
+                                             (.countDown entered)
+                                             (.await release 10 TimeUnit/SECONDS)
+                                             (orig store))]
+          ;; the drain runs on the real executor and takes the entry; then this
+          ;; submission's execute is reported as rejected
+          (let [fake (rejecting-executor
+                      (fn [r] (.execute ^java.util.concurrent.Executor real-ex r)
+                        (.await entered 10 TimeUnit/SECONDS)))
+                f (conn/transact-async (assoc c :executor fake) [{:t/n 7}])]
+            (Thread/sleep 100)
+            (is (not (.isDone ^CompletableFuture f)) "the tx is in flight, not reported released")
+            (.countDown release)
+            (is (some? (deref f 10000 nil)) "and it commits")
+            (is (contains? (ns-of (m/db c)) 7)))))
+      (testing "an entry nobody took is failed as released"
+        (let [f (conn/transact-async (assoc c :executor (rejecting-executor (fn [_]))) [{:t/n 8}])]
+          (is (= :db.error/connection-released
+                 (try @f (catch ExecutionException e (cause-error e)))))
+          (is (not (contains? (ns-of (m/db c)) 8)))
+          (is (.isEmpty ^java.util.Queue (:pending c)))))
+      (finally (conn/reset-registry!) (delete-tree dir)))))
+
+(deftest drain-catch-all-reports-unknown-status-for-written-txs-test
+  (let [[dir uri c] (setup "")]
+    (try
+      (with-redefs [conn/complete-entries! (fn [& _] (throw (Error. "boom")))]
+        (let [fs [(m/transact c [{:t/n 1}])
+                  (m/transact c [[:db/add 17592186045418 :no/such-attr 1]])]
               errs (mapv #(try @% :ok (catch ExecutionException e (cause-error e))) fs)]
-          (is (= [:db.error/commit-status-unknown :db.error/commit-status-unknown
-                  :db.error/not-an-entity
-                  :db.error/commit-status-unknown :db.error/commit-status-unknown]
-                 errs)
-              "written txs fail as unknown; the rejected tx keeps its own error")))
-      (testing "the connection keeps working afterwards"
-        (is (some? @(m/transact c [{:t/n 100}])))
-        (is (contains? (ns-of (m/db c)) 100)))
+          (is (= :db.error/commit-status-unknown (first errs)) "written: never a raw Error")
+          (is (= :db.error/not-an-entity (second errs)) "rejected before writing: its own error")))
       (finally (conn/reset-registry!) (delete-tree dir)))))
 
 (deftest sync-option-test

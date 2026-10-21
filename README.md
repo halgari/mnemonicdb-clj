@@ -98,11 +98,17 @@ Results, ordering and per-transaction errors are the same as one-at-a-time trans
 a transaction rejected while being prepared fails alone. A serial caller that waits for
 each future still pays one fsync per transaction (several ms on typical disks), so
 submit concurrently or without waiting to benefit. A new db value is published to
-readers only once its transaction is durable.
+readers only once its transaction is durable. (A transaction function that calls `d/db`
+on its own connection sees the preceding transaction of the group, as in Datomic; that
+value is visible only on the transactor thread until the group is durable.)
 
-If the fsync itself fails, the futures of the transactions in that group that were
-already written fail with `:db.error/commit-status-unknown` (category fault): they may
-or may not survive a restart.
+If the fsync itself fails, the group's db is not published and the futures of the
+transactions in that group that were already written fail with
+`:db.error/commit-status-unknown` (category fault): they may or may not survive a restart.
+No tx-report-queue entries are made for them. The connection is then marked failed: further
+transactions fail at once with `:db.error/connection-failed` (reads keep serving the last
+durable db) until you `m/release` it and `m/connect` again, which rebuilds the state from
+storage.
 
 `?sync=false` on the file URI turns the fsync off: writes still reach the OS before
 the future completes, so data survives a process crash but not an OS crash or power
