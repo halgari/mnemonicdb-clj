@@ -20,6 +20,17 @@
     (instance? java.math.BigDecimal v) (.hashCode ^java.math.BigDecimal v)
     :else (hash v)))
 
+(defmacro ^:private datom-hash
+  "Same value as `(hash [e a (value-hash v) tx added])` without building the vector
+  (a macro because fns cannot take five primitive args)."
+  [e a v tx added]
+  `(let [h# (unchecked-add-int (unchecked-multiply-int 31 1) (clojure.lang.Murmur3/hashLong ~e))
+         h# (unchecked-add-int (unchecked-multiply-int 31 h#) (clojure.lang.Murmur3/hashLong ~a))
+         h# (unchecked-add-int (unchecked-multiply-int 31 h#) (clojure.lang.Murmur3/hashLong (value-hash ~v)))
+         h# (unchecked-add-int (unchecked-multiply-int 31 h#) (clojure.lang.Murmur3/hashLong ~tx))
+         h# (unchecked-add-int (unchecked-multiply-int 31 h#) (if ~added 1231 1237))]
+     (clojure.lang.Murmur3/mixCollHash h# 5)))
+
 (deftype Datom [^long e ^long a v ^long tx ^boolean added]
   clojure.lang.ILookup
   (valAt [this k] (.valAt this k nil))
@@ -52,10 +63,10 @@
   (seq [_] (list e a v tx added))
 
   clojure.lang.IHashEq
-  (hasheq [_] (hash [e a (value-hash v) tx added]))
+  (hasheq [_] (datom-hash e a v tx added))
 
   Object
-  (hashCode [_] (hash [e a (value-hash v) tx added]))
+  (hashCode [_] (datom-hash e a v tx added))
   (equals [_ o]
     (and (instance? Datom o)
          (let [^Datom o o]

@@ -54,7 +54,7 @@
 (defn- bb ^ByteBuffer [^bytes b] (ByteBuffer/wrap b))
 (defn- rt [v] (c/decode-value (bb (c/value->bytes v))))
 
-(defn- same? [a b]
+(defn same? [a b]
   (cond
     (bytes? a) (and (bytes? b) (Arrays/equals ^bytes a ^bytes b))
     (and (float? a) (Double/isNaN (double a))) (and (float? b) (Double/isNaN (double b)))
@@ -101,9 +101,9 @@
   (prop/for-all [vs (gen/vector (gen/one-of [gen-long gen-str gen-kw gen-bigdec gen-bigint
                                              gen-bytes gen-tuple-mixed gen-double])
                                 1 6)]
-    (let [out (java.io.ByteArrayOutputStream.)]
+    (let [out (c/new-key-buf)]
       (doseq [v vs] (c/encode-value out v))
-      (let [buf (bb (.toByteArray out))
+      (let [buf (bb (c/key-buf-bytes out))
             back (vec (repeatedly (count vs) #(c/decode-value buf)))]
         (and (same? (vec vs) back) (zero? (.remaining buf)))))))
 
