@@ -228,7 +228,7 @@
 (defspec long-bytes-round-trip 1000
   (prop/for-all [x gen-long]
     (and (= x (c/bytes->long (c/long->bytes x)))
-         (= 8 (alength (c/long->bytes x))))))
+         (= 8 (alength ^bytes (c/long->bytes x))))))
 
 (deftest long-bytes-order
   (is (neg? (c/compare-bytes (c/long->bytes 1) (c/long->bytes 256))))
