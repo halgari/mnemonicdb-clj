@@ -123,11 +123,16 @@
 (defn- parse-pattern [form]
   (let [[src terms] (if (src-sym? (first form))
                       [(first form) (rest form)]
-                      ['$ form])]
+                      [nil form])
+        terms (mapv parse-term terms)]
+    (when (some #(= :src (:type %)) terms)
+      (fail (str "Source variable is not allowed in a data pattern term position: "
+                 (pr-str form))
+            {:form form}))
     (when-not (<= 1 (count terms) 5)
       (fail (str "Data pattern must have between 1 and 5 elements: " (pr-str form))
             {:form form}))
-    {:clause :data-pattern :src src :terms (mapv parse-term terms)}))
+    {:clause :data-pattern :src src :terms terms}))
 
 (defn- parse-join-vars
   "Parses the var vector of not-join/or-join. Returns [required all]."
@@ -178,7 +183,7 @@
 
 (defn- parse-list-clause [form]
   (let [has-src (src-sym? (first form))
-        src (if has-src (first form) '$)
+        src (when has-src (first form))
         [op & args] (if has-src (rest form) form)]
     (when-not (plain-sym? op)
       (fail (str "Invalid clause " (pr-str form)) {:form form}))
@@ -191,6 +196,23 @@
                 (when (empty? args) (fail "Empty 'and' clause" {:form form}))
                 {:clause :and :clauses (parse-clauses args "and")})
       {:clause :rule :src src :name op :args (mapv parse-term args)})))
+
+(defn- resolve-src
+  "Fills in the source of clauses written without one: the enclosing clause's
+  source (recursively into not/or bodies), else `default`."
+  [c default]
+  (let [s (or (:src c) default)]
+    (case (:clause c)
+      (:data-pattern :rule) (assoc c :src s)
+      (:pred :fn) c
+      (:not :not-join) (assoc c :src s :body (mapv #(resolve-src % s) (:body c)))
+      (:or :or-join) (assoc c :src s
+                            :branches (mapv (fn [b] (mapv #(resolve-src % s) b))
+                                            (:branches c)))
+      :and (assoc c :clauses (mapv #(resolve-src % default) (:clauses c))))))
+
+(defn- parse-top-clauses [forms where]
+  (mapv #(resolve-src % '$) (parse-clauses forms where)))
 
 (defn- parse-clause [form]
   (cond
@@ -327,8 +349,8 @@
                {:spec :find-scalar :elements [(elem f0)]}
 
                :else {:spec :find-rel :elements (mapv elem forms)})
-        syms (map #(if (= :var (:type %)) (:sym %) %) (:elements find))]
-    (when-not (apply distinct? syms)
+        syms (keep #(when (= :var (:type %)) (:sym %)) (:elements find))]
+    (when-not (apply distinct? ::none syms)
       (fail "Duplicate elements in :find" {:find forms}))
     find))
 
@@ -404,7 +426,7 @@
                :in (if (contains? secs :in)
                      (mapv parse-in-binding (:in secs))
                      [{:bind :src :sym '$}])
-               :where (parse-clauses (get secs :where []) ":where")}]
+               :where (parse-top-clauses (get secs :where []) ":where")}]
       (check-query ast)
       ast)))
 
@@ -427,7 +449,7 @@
         (fail (str "Rule " name " has an empty body") {:form form}))
       [name {:head (vec (concat required others))
              :required (vec required)
-             :body (parse-clauses (vec body-forms) (str "rule " name))}])))
+             :body (parse-top-clauses (vec body-forms) (str "rule " name))}])))
 
 (defn- parse-rules* [rules]
   (when-not (and (sequential? rules) (not (map? rules)))

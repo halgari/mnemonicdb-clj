@@ -21,6 +21,7 @@
   `(is (= :db.error/invalid-query (err-kind (fn [] ~form))) (pr-str '~form)))
 
 (defn- where [q] (:where (p/parse-query q)))
+(defn- last-clause [q] [(last (where q))])
 
 ;; ---------------------------------------------------------------- shapes
 
@@ -320,3 +321,40 @@
   (testing "errors are not cached and are rethrown"
     (is (some? (err #(p/parse-query '[:find ?x]))))
     (is (some? (err #(p/parse-query '[:find ?x]))))))
+
+;; ------------------------------------------------------- src propagation
+
+(deftest source-propagation
+  (let [pat (fn [src e a val] {:clause :data-pattern :src src :terms [(v e) (c a) (c val)]})]
+    (is (= [{:clause :not :src '$2 :vars '[?e] :body [(pat '$2 '?e :b 1)]}]
+           (last-clause '[:find ?e :in $ $2 :where [?e :z _] ($2 not [?e :b 1])])))
+    (is (= [{:clause :not-join :src '$2 :vars '[?e]
+             :body [(pat '$2 '?e :b 1) (pat '$ '?e :c 1)]}]
+           (last-clause '[:find ?e :in $ $2 :where [?e :z _] ($2 not-join [?e] [?e :b 1] [$ ?e :c 1])])))
+    (is (= [{:clause :or :src '$2 :vars '[?e]
+             :branches [[(pat '$2 '?e :a 2)] [(pat '$2 '?e :b 2)]]}]
+           (where '[:find ?e :in $ $2 :where ($2 or [?e :a 2] [?e :b 2])])))
+    (is (= [{:clause :or-join :src '$2 :vars '[?e] :required []
+             :branches [[(pat '$2 '?e :a 2)]
+                        [(pat '$ '?e :b 2)]]}]
+           (where '[:find ?e :in $ $2 :where ($2 or-join [?e] [?e :a 2] [$ ?e :b 2])])))
+    (testing "nested not inside or inherits through the chain"
+      (let [[o] (where '[:find ?e :in $ $2
+                         :where ($2 or [?e :a 2]
+                                       (and [?e :b 1] (not [?e :c 3])))])]
+        (is (= '$2 (-> o :branches second second :src)))
+        (is (= '$2 (-> o :branches second second :body first :src)))
+        (is (= '$2 (-> o :branches second first :src)))))
+    (testing "rule expressions inherit too"
+      (is (= '$2 (-> (last-clause '[:find ?e :in $ $2 % :where [?e :z _] ($2 not (r ?e))])
+                     first :body first :src))))
+    (testing "rule bodies default to $"
+      (is (= '$ (-> (p/parse-rules '[[(r ?e) [?e :a _]]]) (get 'r) first :body first :src))))))
+
+(deftest src-term-in-pattern-rejected
+  (invalid (p/parse-query '[:find ?e :in $ $x :where [?e :a $x]])))
+
+(deftest duplicate-find-elements
+  (is (= 2 (count (-> (p/parse-query '[:find (count ?e) (count ?e) :where [?e :a _]])
+                      :find :elements))))
+  (invalid (p/parse-query '[:find ?e ?e :where [?e :a _]])))

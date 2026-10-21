@@ -97,13 +97,16 @@ Find elements:
 - `:pattern` of a pull is `{:type :const :val <raw pattern>}` (the raw vector
   or map, unparsed -- Task 7 owns the pull grammar) or `{:type :var :sym ?pat}`
   when the pattern comes from an input.
-- The same element cannot appear twice in `:find`.
+- The same plain variable cannot appear twice in `:find`; duplicate
+  aggregate/pull elements are allowed (`[:find (count ?e) (count ?e)]`).
 
 ### `:return-map`
 
 From `:keys`, `:syms` or `:strs`. `:names` are the names exactly as written.
 Only allowed with `:find-rel` or `:find-tuple`, and `(count :names)` must equal
-the number of find elements. `nil` when absent.
+the number of find elements. `nil` when absent. Result-map keys derived from
+`:names`: `:keys a` -> `:a`, `:strs a` -> `"a"`, `:syms a` -> `'a` (the engine
+performs this conversion).
 
 ### `:in`
 
@@ -121,6 +124,7 @@ the source; the parser does **not** reorder.
 ```clojure
 {:clause :data-pattern :src $ :terms [<term> ...]}
 ```
+Source terms (`$x`) are rejected in term positions (`:db.error/invalid-query`).
 `:terms` holds 1 to 5 terms in positional order e, a, v, tx, added. Missing
 trailing positions are absent from the vector (they are wildcards). Terms are
 `:var`, `:blank` or `:const` (an attribute such as `:person/name`, an entity
@@ -152,6 +156,11 @@ has `:args [{:type :src :sym $} ...]`, and `[(missing? $ ?e :a)]` is a `:pred`).
 ```
 `:args` are any terms (`:var`, `:blank`, `:const`, `:src`).
 
+**Engine obligations** (the parser lacks rule definitions and the call's
+arguments): raise `:db.error/insufficient-binding` when a rule's `:required`
+vars are unbound at the call site, and check that every src-var used in a
+clause (`:src`, `:src` terms, pull `:src`) is declared in `:in`.
+
 #### `not` / `not-join`
 
 ```clojure
@@ -162,10 +171,11 @@ has `:args [{:type :src :sym $} ...]`, and `[(missing? $ ?e :a)]` is a `:pred`).
 variable used anywhere in the body, in order of first appearance (so `not` ==
 `not-join` over all its variables). Join variables must be bound by the
 enclosing scope. The leading source applies to the body (`($2 not ...)`).
-Body data patterns carry their own `:src` (defaulting to `$`; the engine
-should treat the clause `:src` as the default for body patterns without an
-explicit one if that distinction matters to it -- the parser does not rewrite
-body `:src`).
+The parser resolves sources: a body pattern or rule expression written without
+an explicit source gets the enclosing clause's source (recursively through
+nested `not`/`or`/`and`), so after parsing every `:src` is explicit and
+`($2 not [?e :b 1])` yields a body pattern with `:src $2`. An explicit source
+in the body (`[$ ?e ...]`) is kept. The same applies to `or`/`or-join`.
 
 #### `or` / `or-join`
 
