@@ -114,19 +114,21 @@
   "Partition id of entity id `eid`."
   [eid] (codec/part-of eid))
 
+(defn- entid* [db* sch x]
+  (cond
+    (nil? x) nil
+    (integer? x) (long x)
+    (keyword? x) (get (:idents sch) x)
+    (vector? x) (tx/lookup-ref-eid {:db db* :schema sch} x)
+    (string? x) (throw (tx/error :db.error/not-a-keyword
+                                 (str "Cannot interpret as a keyword: " x ", no leading :")
+                                 {:value x}))
+    :else nil))
+
 (defn entid
   "Entity id for an id, ident, or lookup ref; nil when it does not resolve."
   [db* x]
-  (let [sch (index/-schema db*)]
-    (cond
-      (nil? x) nil
-      (integer? x) (long x)
-      (keyword? x) (get (:idents sch) x)
-      (vector? x) (tx/lookup-ref-eid {:db db* :schema sch} x)
-      (string? x) (throw (tx/error :db.error/not-a-keyword
-                                   (str "Cannot interpret as a keyword: " x ", no leading :")
-                                   {:value x}))
-      :else nil)))
+  (entid* db* (index/-schema db*) x))
 
 (defn ident
   "The ident keyword of entity id `x`, or nil. Non-ids are returned as given."
@@ -207,42 +209,46 @@
 (defn- resolve-attr-component
   "Attr for a datoms attr component: keyword -> Attr or ::none when unknown;
   integer ids must be attributes."
-  [db* x]
-  (let [sch (index/-schema db*)]
-    (cond
-      (keyword? x) (if-let [id (get (:idents sch) x)]
-                     (or (get (:attrs sch) id) (tx/resolve-attr sch x))
-                     ::none)
-      (integer? x) (tx/resolve-attr sch x)
-      :else (tx/resolve-attr sch x))))
+  [sch x]
+  (if (keyword? x)
+    (if-let [id (get (:idents sch) x)]
+      (or (get (:attrs sch) id) (tx/resolve-attr sch x))
+      ::none)
+    (tx/resolve-attr sch x)))
+
+(def ^:private attr-slot
+  "Position of the attribute component in each index's component order."
+  {:eavt 1 :aevt 0 :avet 0 :vaet 1})
 
 (defn- resolve-components
   "Index components -> vector of storage values in index order, or nil when some
   component cannot match anything."
   [db* idx components]
-  (let [order (get index-order idx)
-        slots (map vector order components)
-        attr (some (fn [[slot x]] (when (= slot :a) (resolve-attr-component db* x))) slots)]
+  (let [sch (index/-schema db*)
+        order (get index-order idx)
+        n (min 4 (count components))
+        apos (long (attr-slot idx))
+        attr (when (< apos n) (resolve-attr-component sch (nth components apos)))]
     (when-not (= attr ::none)
       (when (and (= idx :avet) attr (not (schema/indexed? attr)))
         (not-indexed attr))
-      (let [res (reduce
-                 (fn [acc [slot x]]
-                   (let [r (case slot
-                             :e (entid db* x)
-                             :a (:id (resolve-attr-component db* x))
-                             :tx (when (some? x) (long x))
-                             :v (cond
-                                  (= idx :vaet) (entid db* x)
-                                  (and attr (= :db.type/ref (:value-type attr))) (entid db* x)
-                                  attr (try (tx/coerce-value attr x)
-                                            (catch clojure.lang.ExceptionInfo _ ::none))
-                                  :else x))]
-                     (if (or (nil? r) (= r ::none))
-                       (reduced ::none)
-                       (conj acc r))))
-                 [] slots)]
-        (when-not (= res ::none) res)))))
+      (loop [i 0 acc []]
+        (if (< i n)
+          (let [x (nth components i)
+                r (case (nth order i)
+                    :e (entid* db* sch x)
+                    :a (:id (resolve-attr-component sch x))
+                    :tx (when (some? x) (long x))
+                    :v (cond
+                         (= idx :vaet) (entid* db* sch x)
+                         (and attr (= :db.type/ref (:value-type attr))) (entid* db* sch x)
+                         attr (try (tx/coerce-value attr x)
+                                   (catch clojure.lang.ExceptionInfo _ ::none))
+                         :else x))]
+            (if (or (nil? r) (= r ::none))
+              nil
+              (recur (inc i) (conj acc r))))
+          acc)))))
 
 (defn- indexed-attr-pred [db*]
   (let [attrs (:attrs (index/-schema db*))]
@@ -266,7 +272,9 @@
   [db* index & components]
   (when-not (contains? index-order index) (bad-index index))
   (if-let [comps (resolve-components db* index components)]
-    (index/datoms-iterable (view-db db* (indexed-view index index/-view))
+    (index/datoms-iterable (if (= index :avet)
+                             (view-db db* (indexed-view index index/-view))
+                             db*)
                            index (codec/encode-prefix-numeric index comps))
     empty-result))
 
