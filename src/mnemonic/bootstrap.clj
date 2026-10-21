@@ -47,10 +47,19 @@
 (defn log-op [tx datoms]
   [:put :log (codec/long->bytes tx) (codec/encode-log-entry datoms)])
 
+(defn- meta-edn
+  "EDN text of `meta`. The usual three-counter map is formatted directly (same text as
+  `pr-str`); any other shape falls back to `pr-str`."
+  ^String [meta]
+  (let [f (:format meta) t (:next-t meta) n (:next-db-n meta)]
+    (if (and (== 3 (count meta)) (integer? f) (integer? t) (integer? n))
+      (str "{:format " f ", :next-t " t ", :next-db-n " n "}")
+      (pr-str meta))))
+
 (defn meta-op
-  "Op that stores `meta` (EDN) in :default."
+  "Op that stores `meta` (EDN, read back with `read-meta`) in :default."
   [meta]
-  [:put :default meta-key (.getBytes ^String (pr-str meta) StandardCharsets/UTF_8)])
+  [:put :default meta-key (.getBytes (meta-edn meta) StandardCharsets/UTF_8)])
 
 (defn read-meta
   "Stored meta map, or nil. With `snap`, reads as of that snapshot."

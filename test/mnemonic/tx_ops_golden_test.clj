@@ -1,7 +1,8 @@
 (ns mnemonic.tx-ops-golden-test
   "The transactor builds index keys and the log entry from one encoding of each value; these
   must stay byte-identical to the codec's own key and log-entry encoders."
-  (:require [clojure.test :refer [deftest is testing]]
+  (:require [clojure.edn]
+            [clojure.test :refer [deftest is testing]]
             [mnemonic.bootstrap :as bootstrap]
             [mnemonic.codec :as codec]
             [mnemonic.datom :as datom]
@@ -42,3 +43,22 @@
       (is (= [op1 cf1] [op2 cf2]))
       (is (Arrays/equals ^bytes k1 ^bytes k2))
       (is (Arrays/equals ^bytes b1 ^bytes b2)))))
+
+(deftest codec-vb-fns-match-encode-key
+  (doseq [v values, e ids, a [0 10 73], tx [(codec/t->tx 3)]]
+    (let [vb (codec/value->bytes v)]
+      (doseq [idx [:eavt :aevt :avet]]
+        (is (Arrays/equals ^bytes (codec/encode-key idx e a v tx) ^bytes (codec/encode-key-vb idx e a vb tx))))
+      (is (Arrays/equals ^bytes (codec/encode-prefix :eavt [e a v]) ^bytes (codec/encode-prefix-eav-vb e a vb)))
+      (is (Arrays/equals ^bytes (codec/encode-prefix :avet [a v]) ^bytes (codec/encode-prefix-av-vb a vb)))))
+  (doseq [v ids, e ids, a [10 73]]
+    (is (Arrays/equals ^bytes (codec/encode-key :vaet e a v 9) ^bytes (codec/encode-vaet-key v a e 9)))))
+
+(deftest meta-op-text
+  (doseq [m [{:format 2 :next-t 1000 :next-db-n 73}
+             {:format 2 :next-t 123456789012 :next-db-n 4096}
+             {:format 2 :next-t 5 :next-db-n 6 :extra "x"}
+             {:next-t 5}]]
+    (let [[_ _ _ ^bytes b] (bootstrap/meta-op m)]
+      (is (= m (clojure.edn/read-string (String. b "UTF-8"))))
+      (is (= (pr-str m) (String. b "UTF-8"))))))

@@ -131,58 +131,25 @@
   (K3. x y b (unchecked-int (+ (* 31 (+ (* 31 (Long/hashCode x)) (Long/hashCode y)))
                                (Arrays/hashCode b)))))
 
-(defn- put-long!
-  "Writes `x` at `off` of `arr` as the codec does (big-endian, sign bit flipped); returns the next offset."
-  ^long [^ByteBuffer bb ^long off ^long x]
-  (.putLong bb (int off) (bit-xor x Long/MIN_VALUE))
-  (+ off 8))
-
 (defn- ekey
-  "Key of datom `d` in :eavt, :aevt or :avet given the value's encoding `vb`;
-  byte-identical to `codec/encode-key`, without re-encoding the value."
+  "Key of datom `d` in :eavt, :aevt or :avet given the value's encoding `vb`."
   ^bytes [idx ^Datom d ^bytes vb]
-  (let [n (alength vb)
-        arr (byte-array (+ 24 n))
-        bb (ByteBuffer/wrap arr)]
-    (case idx
-      :eavt (do (put-long! bb 0 (.-e d)) (put-long! bb 8 (.-a d))
-                (System/arraycopy vb 0 arr 16 n)
-                (put-long! bb (+ 16 n) (.-tx d)))
-      :aevt (do (put-long! bb 0 (.-a d)) (put-long! bb 8 (.-e d))
-                (System/arraycopy vb 0 arr 16 n)
-                (put-long! bb (+ 16 n) (.-tx d)))
-      :avet (do (put-long! bb 0 (.-a d))
-                (System/arraycopy vb 0 arr 8 n)
-                (put-long! bb (+ 8 n) (.-e d))
-                (put-long! bb (+ 16 n) (.-tx d))))
-    arr))
+  (codec/encode-key-vb idx (.-e d) (.-a d) vb (.-tx d)))
 
 (defn- vaet-key
   "VAET key of ref datom `d` (the value is an entity id, stored as a plain long)."
   ^bytes [^Datom d]
-  (let [arr (byte-array 32)
-        bb (ByteBuffer/wrap arr)]
-    (put-long! bb 0 (long (.-v d))) (put-long! bb 8 (.-a d))
-    (put-long! bb 16 (.-e d)) (put-long! bb 24 (.-tx d))
-    arr))
+  (codec/encode-vaet-key (long (.-v d)) (.-a d) (.-e d) (.-tx d)))
 
 (defn- prefix-ea+v
   "EAVT key prefix [e a v]; `vb` is the value encoding."
   ^bytes [^long e ^long a ^bytes vb]
-  (let [arr (byte-array (+ 16 (alength vb)))
-        bb (ByteBuffer/wrap arr)]
-    (put-long! bb 0 e) (put-long! bb 8 a)
-    (System/arraycopy vb 0 arr 16 (alength vb))
-    arr))
+  (codec/encode-prefix-eav-vb e a vb))
 
 (defn- prefix-av
   "AVET key prefix [a v]."
   ^bytes [^long a ^bytes vb]
-  (let [arr (byte-array (+ 8 (alength vb)))
-        bb (ByteBuffer/wrap arr)]
-    (put-long! bb 0 a)
-    (System/arraycopy vb 0 arr 8 (alength vb))
-    arr))
+  (codec/encode-prefix-av-vb a vb))
 
 (defn- datoms-of-prefix [db idx ^bytes prefix]
   (into [] (index/datoms-iterable db idx prefix)))
@@ -716,22 +683,8 @@
 (defn- log-op
   "The :log put for `tx`; byte-identical to `bootstrap/log-op`, reusing the encoded values."
   [tx datoms ^java.util.IdentityHashMap dinfo]
-  (let [vbs (mapv (fn [^Datom d] (dinfo-vb dinfo d)) datoms)
-        size (reduce (fn [^long n ^bytes vb] (+ n 17 (alength vb))) 4 vbs)
-        arr (byte-array size)
-        bb (ByteBuffer/wrap arr)]
-    (.putInt bb 0 (int (count datoms)))
-    (loop [ds (seq datoms) vs (seq vbs) off 4]
-      (when ds
-        (let [^Datom d (first ds) ^bytes vb (first vs)
-              off (long off)
-              off (put-long! bb off (.-e d))
-              off (put-long! bb off (.-a d))
-              n (alength vb)]
-          (System/arraycopy vb 0 arr (int off) n)
-          (aset arr (+ (int off) n) (byte (if (.-added d) 1 0)))
-          (recur (next ds) (next vs) (+ off n 1)))))
-    [:put :log (codec/long->bytes tx) arr]))
+  [:put :log (codec/long->bytes tx)
+   (codec/encode-log-entry-vb datoms (mapv (fn [^Datom d] (dinfo-vb dinfo d)) datoms))])
 
 (defn- fresh-entity?
   "True when `e` cannot have datoms in db-before: its id lies beyond the ids allocated so far."
@@ -1055,9 +1008,31 @@
 (def ^:private alter-watched #{40 41 42 43 44 45 51 65 66 67 71})
 (def ^:private alter-triggers #{41 42 43 44 45 51 71})
 
+(declare check-alterations!*)
+
+(defn- alterations-possible?
+  "Cheap pre-check for `check-alterations!`: true when some assert or retract touches a watched
+  attribute of an existing attribute entity, or an explicit retraction targets one. False for
+  every data-only transaction."
+  [attrs ops res]
+  (or (boolean (some (fn [^Datom d] (and (contains? alter-watched (.-a d)) (contains? attrs (.-e d))))
+                     (:asserts res)))
+      (boolean (some (fn [[_ ^Datom old]] (and (contains? alter-watched (.-a old)) (contains? attrs (.-e old))))
+                     (:retracts res)))
+      (boolean (some (fn [[kind e ^Attr attr]]
+                       (and (or (identical? kind :retract) (identical? kind :retract-attr))
+                            (integer? e) (contains? attrs e) (contains? alter-triggers (:id attr))))
+                     ops))))
+
 (defn- check-alterations!
   "Applies Datomic's schema alteration rules to changes of existing attributes. Returns the
   ids of the attributes that need a :db.alter/attribute datom."
+  [ctx ops res]
+  (if-not (alterations-possible? (:attrs (:schema ctx)) ops res)
+    []
+    (check-alterations!* ctx ops res)))
+
+(defn- check-alterations!*
   [ctx ops res]
   (let [{:keys [db schema]} ctx
         attrs (:attrs schema)
@@ -1306,10 +1281,11 @@
         _ (doseq [[_ ^Datom old] retracts]
             (retract-ops out schema dinfo old tx (no-history? (.-a old))))
         _ (.add out (log-op tx tx-data dinfo))
-        _ (.add out (bootstrap/meta-op (assoc meta :next-t n-shared :next-db-n n-db)))
+        meta' (assoc meta :next-t n-shared :next-db-n n-db)
+        _ (.add out (bootstrap/meta-op meta'))
         ops (vec out)]
     {:tx-data tx-data
      :tempids tempids
      :ops ops
-     :meta (assoc meta :next-t n-shared :next-db-n n-db)
+     :meta meta'
      :tx tx}))
