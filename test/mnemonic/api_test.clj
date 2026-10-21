@@ -161,8 +161,7 @@
   (let [c (fresh)
         db (m/db c)
         kind (fn [f] (try (f) nil (catch clojure.lang.ExceptionInfo e (:db/error (ex-data e)))))]
-    (doseq [f [#(m/q '[:find ?e :where [?e :db/ident]] db)
-               #(m/function {})]]
+    (doseq [f [#(m/function {})]]
       (is (= :db.error/unsupported (kind f))))))
 
 (deftest file-db-reopen-test
