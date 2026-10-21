@@ -1,5 +1,5 @@
 (ns mnemonic.datom-test
-  (:require [clojure.test :refer [deftest is]]
+  (:require [clojure.test :refer [deftest is testing]]
             [mnemonic.datom :as d]))
 
 (deftest lookup
@@ -42,3 +42,17 @@
 (deftest printing
   (is (= "#datom[1 2 \"v\" 3 true]" (pr-str (d/datom 1 2 "v" 3 true))))
   (is (= "#datom[1 2 :a/b 3 false]" (pr-str (d/datom 1 2 :a/b 3 false)))))
+
+(deftest value-equality-matches-storage
+  (testing "byte arrays compare by content (the documented deviation)"
+    (let [x (d/datom 1 2 (byte-array [1 2 3]) 3 true)
+          y (d/datom 1 2 (byte-array [1 2 3]) 3 true)]
+      (is (= x y))
+      (is (= (hash x) (hash y)))
+      (is (= (.hashCode ^Object x) (.hashCode ^Object y)))
+      (is (= 1 (count (set [x y]))))
+      (is (not= x (d/datom 1 2 (byte-array [1 2 4]) 3 true)))))
+  (testing "BigDecimals compare exactly (scale is part of the value)"
+    (is (= (d/datom 1 2 1.0M 3 true) (d/datom 1 2 1.0M 3 true)))
+    (is (not= (d/datom 1 2 1.0M 3 true) (d/datom 1 2 1.00M 3 true)))
+    (is (= 2 (count (set [(d/datom 1 2 1.0M 3 true) (d/datom 1 2 1.00M 3 true)]))))))

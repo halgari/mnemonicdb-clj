@@ -330,9 +330,18 @@
       (history-cursor src idx lo hi)
       (visible-cursor src lo hi))))
 
+;; A time-restricted view. Reads go through -view / -seek-view, which apply the as-of /
+;; since / history bounds.
+;;
+;; WARNING: -seek-current and -seek-history are raw pass-throughs to the inner db and
+;; BYPASS the time bounds (they expose the inner db's current and history entries as
+;; stored). They exist for code that needs the underlying entries (e.g. time-cursor
+;; building on -open); never use them to answer a query against a TimeView.
 (deftype TimeView [inner as-of since history?]
   index/IDb
+  ;; bypasses as-of / since (see the warning above)
   (-seek-current [_ idx prefix] (index/-seek-current inner idx prefix))
+  ;; bypasses as-of / since (see the warning above)
   (-seek-history [_ idx prefix] (index/-seek-history inner idx prefix))
   (-view [_ idx prefix] (time-cursor inner idx nil prefix as-of since history?))
   (-seek-view [_ idx start] (time-cursor inner idx start nil as-of since history?))

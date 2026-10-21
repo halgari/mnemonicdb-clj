@@ -21,8 +21,12 @@
   (close []))
 
 (defprotocol IDb
-  (-seek-current [db index prefix-bytes])
-  (-seek-history [db index prefix-bytes])
+  (-seek-current [db index prefix-bytes]
+    "Raw current entries of `db`'s base (layers such as TimeView pass this through
+    without applying their bounds; use -view for reads).")
+  (-seek-history [db index prefix-bytes]
+    "Raw history entries (retractTx = retracting tx) of `db`'s base; like
+    -seek-current, time views pass it through unbounded.")
   (-view [db index prefix-bytes])
   (-seek-view [db index start-bytes])
   (-basis-t [db])
