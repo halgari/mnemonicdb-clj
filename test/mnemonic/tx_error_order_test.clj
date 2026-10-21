@@ -99,3 +99,25 @@
           ;; Datomic binds the tempid to the holder of the asserted value
           (is (= ey (get-in r2 [:tempids "t"]))))
         (finally (m/release conn) (m/delete-database uri))))))
+
+(deftest assert-retract-clash-between-tempids-dropped-when-one-binds
+  ;; Datomic probe: a retract of a new unique value for one tempid vs an assert of it for
+  ;; another is a datoms-conflict only if neither tempid is (or later becomes) bound to an
+  ;; existing entity; a clash seen once one side is already bound is immediate.
+  (with-conn
+    (fn [conn]
+      @(m/transact conn [{:db/ident :g/a2 :db/valueType :db.type/string
+                          :db/cardinality :db.cardinality/one :db/unique :db.unique/identity}])
+      @(m/transact conn [{:g/a0 "c" :g/a2 "k"}])
+      (let [r [:db/retract "t0" :g/a0 "a"]
+            mp {:g/a0 "a" :g/a2 "n"}
+            bind [:db/add "t0" :g/a2 "k"]]
+        (is (= :ok (kind-of conn [r mp bind])) "retract, map, then t0 binds")
+        (is (= :ok (kind-of conn [r {:g/a0 "a"} bind])))
+        (is (= :ok (kind-of conn [{:g/a0 "a"} r bind])))
+        (is (= :db.error/datoms-conflict (kind-of conn [r {:g/a0 "a"}])) "both unbound")
+        (is (= :db.error/datoms-conflict (kind-of conn [{:g/a0 "a"} bind r])) "t0 already bound")
+        (is (= :db.error/datoms-conflict (kind-of conn [bind r {:g/a0 "a"}])))
+        (is (= :db.error/datoms-conflict (kind-of conn [r bind r {:g/a0 "a"}])))
+        (is (= :ok (kind-of conn [r [:db/add "t1" :g/a0 "a"] [:db/add "t1" :g/a2 "k"]]))
+            "the asserting tempid binds later")))))

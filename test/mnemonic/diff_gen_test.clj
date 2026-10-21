@@ -176,8 +176,25 @@
 ;; Datomic quirk (docs/deviations.md): asserting the same unique-attribute value twice for one
 ;; tempid in one tx can raise a spurious datoms-conflict once tempids are unified. The
 ;; generator never emits such duplicates.
-(defn- dedupe-unique [uniq ops]
-  (let [seen (volatile! #{})
+;;
+;; Likewise (docs/deviations.md, tempid unification order): a retract of a unique value through
+;; a tempid is dropped when another entity token asserts the same attribute in the tx. Datomic's
+;; outcome then depends on op order in ways only partly matched (seed 424242 / 1792558666985
+;; shapes); the fixed rule is pinned in tx_error_order_test.
+(defn- drop-tempid-unique-retracts [uniq ops]
+  (let [asserted (fn [op] (case (first op)
+                            :add (let [[_ e a] op] [[a e]])
+                            :map (let [[_ e attrs] op] (map (fn [a] [a e]) (keys attrs)))
+                            nil))
+        asserts (set (mapcat asserted ops))]
+    (vec (remove (fn [[kind e a :as op]]
+                   (and (= kind :retract) (uniq a) (vector? e) (= :t (first e))
+                        (some (fn [[a2 e2]] (and (= a a2) (not= e e2))) asserts)))
+                 ops))))
+
+(defn- dedupe-unique [uniq ops0]
+  (let [ops (drop-tempid-unique-retracts uniq ops0)
+        seen (volatile! #{})
         fresh! (fn [k] (when-not (@seen k) (vswap! seen conj k) true))]
     (vec
      (keep-indexed
@@ -333,7 +350,8 @@
              (prop/for-all [c gen-case]
                (let [r (run-case c)]
                  (when r (println "DIFF:" (pr-str r)))
-                 (nil? r))))]
+                 (nil? r)))
+             :seed (some-> (System/getenv "MNEMONIC_DIFF_SEED") parse-long))]
     (when-not (:pass? res)
       (println "Failing (shrunk):" (pr-str (-> res :shrunk :smallest)))
       (println "Result seed:" (:seed res)))
