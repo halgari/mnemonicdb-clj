@@ -161,9 +161,8 @@
   (let [c (fresh)
         db (m/db c)
         kind (fn [f] (try (f) nil (catch clojure.lang.ExceptionInfo e (:db/error (ex-data e)))))]
-    (doseq [f [#(m/as-of db 1) #(m/since db 1) #(m/history db) #(m/filter db identity)
-               #(m/with db []) #(m/entity db 1) #(m/pull db [:db/ident] 1)
-               #(m/q '[:find ?e :where [?e :db/ident]] db) #(m/log c) #(m/tx-report-queue c)
+    (doseq [f [#(m/entity db 1) #(m/pull db [:db/ident] 1)
+               #(m/q '[:find ?e :where [?e :db/ident]] db)
                #(m/function {})]]
       (is (= :db.error/unsupported (kind f))))))
 

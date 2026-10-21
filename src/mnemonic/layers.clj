@@ -1,20 +1,422 @@
 (ns mnemonic.layers
-  "Db layers (as-of, since, history, filter, with). Stubs until the layers task."
-  (:refer-clojure :exclude [filter]))
+  "Composable db layers over the base db: TimeView (as-of / since / history), Filter and
+  With (speculative overlay)."
+  (:refer-clojure :exclude [filter])
+  (:require [mnemonic.codec :as codec]
+            [mnemonic.datom :as datom]
+            [mnemonic.db :as db]
+            [mnemonic.index :as index]
+            [mnemonic.rocks :as rocks]
+            [mnemonic.schema :as schema]
+            [mnemonic.tx :as tx])
+  (:import (java.util Arrays Comparator Date Iterator Map$Entry NavigableMap TreeMap)
+           (mnemonic.datom Datom)
+           (mnemonic.db Base)
+           (mnemonic.index ICursor)))
 
 (set! *warn-on-reflection* true)
 
-(defn- unsupported [what]
-  (throw (ex-info (str what " is not implemented yet")
-                  {:db/error :db.error/unsupported
-                   :cognitect.anomalies/category :cognitect.anomalies/unsupported
-                   :feature what})))
+(defn- unsupported [msg data]
+  (throw (ex-info msg (merge {:db/error :db.error/unsupported
+                              :cognitect.anomalies/category :cognitect.anomalies/unsupported}
+                             data))))
 
-(defn as-of [db t] (unsupported "as-of"))
-(defn since [db t] (unsupported "since"))
-(defn history [db] (unsupported "history"))
-(defn filter [db pred] (unsupported "filter"))
-(defn with [db tx-data] (unsupported "with"))
-(defn as-of-t [db] (unsupported "as-of-t"))
-(defn since-t [db] (unsupported "since-t"))
-(defn history? [db] (unsupported "is-history"))
+(def ^:private history-cf {:eavt :eavt-h :aevt :aevt-h :avet :avet-h :vaet :vaet-h})
+
+;; ------------------------------------------------------------------ sources
+
+(defprotocol ISource
+  "Raw access to the current / history entries of a base-like db (Base or With).
+  Exactly one of `start` (seek: first key >= start, to the end of the index) and
+  `prefix` is non-nil. History entries report their retracting tx via retractTx."
+  (-open [db idx hist? start prefix]))
+
+(extend-type Base
+  ISource
+  (-open [b idx hist? start prefix]
+    (cond
+      (and (not hist?) prefix) (index/-view b idx prefix)
+      (not hist?) (index/-seek-view b idx start)
+      prefix (index/-seek-history b idx prefix)
+      :else (let [store (.-store b)]
+              (index/seek-cursor
+               (db/->GuardedCursor store (rocks/raw-cursor store (history-cf idx) (.-snap b)))
+               start idx true)))))
+
+;; ------------------------------------------------------------------ overlay (With)
+
+(def ^:private ^Comparator byte-cmp
+  (reify Comparator
+    (compare [_ a b] (Arrays/compareUnsigned ^bytes a ^bytes b))))
+
+(def ^:private deleted ::deleted)
+
+(defn- prefix-end
+  "Smallest key greater than every key starting with `p`, or nil when unbounded."
+  [^bytes p]
+  (loop [i (dec (alength p))]
+    (cond
+      (neg? i) nil
+      (== 255 (bit-and (aget p i) 0xff)) (recur (dec i))
+      :else (let [r (Arrays/copyOf p (int (inc i)))]
+              (aset r i (unchecked-byte (inc (bit-and (aget r i) 0xff))))
+              r))))
+
+(defn- next-entry [^Iterator it]
+  (when (.hasNext it) (.next it)))
+
+(defn- settle!
+  "Positions the merge of `inner` and the overlay iterator on its next entry. Returns
+  1 (inner is current), 2 (the overlay entry in box[0]) or 0 (exhausted). The overlay wins
+  on equal keys; overlay deletes hide inner entries."
+  ^long [^ICursor inner ^Iterator it ^objects box]
+  (loop []
+    (let [^Map$Entry oe (aget box 0)
+          iv (.valid inner)]
+      (cond
+        (and (nil? oe) (not iv)) 0
+        (nil? oe) 1
+        (not iv) (if (identical? deleted (.getValue oe))
+                   (do (aset box 0 (next-entry it)) (recur))
+                   2)
+        :else
+        (let [c (codec/compare-bytes (.key inner) (.getKey oe))]
+          (cond
+            (neg? c) 1
+            (zero? c) (do (.advance inner) (recur))
+            (identical? deleted (.getValue oe)) (do (aset box 0 (next-entry it)) (recur))
+            :else 2))))))
+
+(deftype OverlayCursor [^ICursor inner ^Iterator it ^objects box idx hist?
+                        ^:unsynchronized-mutable ^long src
+                        ^:unsynchronized-mutable ^boolean closed?]
+  ICursor
+  (valid [_] (pos? src))
+  (advance [_]
+    (case src
+      1 (.advance inner)
+      2 (aset box 0 (next-entry it))
+      nil)
+    (when (pos? src)
+      (set! src (settle! inner it box)))
+    nil)
+  (key [_]
+    (case src
+      1 (.key inner)
+      2 (.getKey ^Map$Entry (aget box 0))
+      nil))
+  (datom [this]
+    (case src
+      1 (.datom inner)
+      2 (codec/decode-key idx (.key this))
+      nil))
+  (retractTx [_]
+    (case src
+      1 (.retractTx inner)
+      2 (if hist?
+          (codec/bytes->long (.getValue ^Map$Entry (aget box 0)))
+          -1)
+      -1))
+  (close [_]
+    (when-not closed?
+      (set! closed? (boolean true))
+      (set! src 0)
+      (.close inner))
+    nil))
+
+(defn- overlay-cursor
+  [^ICursor inner ^TreeMap tm idx hist? ^bytes start ^bytes prefix]
+  (let [from (or start prefix)
+        end (when prefix (prefix-end prefix))
+        ^NavigableMap slice (if end
+                              (.subMap tm from true end false)
+                              (.tailMap tm from true))
+        it (.iterator (.entrySet slice))
+        box (object-array 1)]
+    (try
+      (aset box 0 (next-entry it))
+      (->OverlayCursor inner it box idx hist? (settle! inner it box) false)
+      (catch Throwable t
+        (.close inner)
+        (throw t)))))
+
+;; overlay: {cf TreeMap<byte[] -> byte[] | ::deleted>}
+(deftype With [inner overlay basis-t schema meta]
+  ISource
+  (-open [_ idx hist? start prefix]
+    (let [^TreeMap tm (get overlay (if hist? (history-cf idx) idx))
+          cur (-open inner idx hist? start prefix)]
+      (if (or (nil? tm) (.isEmpty tm))
+        cur
+        (overlay-cursor cur tm idx hist? start prefix))))
+  index/IDb
+  (-seek-current [this idx prefix] (-open this idx false nil prefix))
+  (-seek-history [this idx prefix] (-open this idx true nil prefix))
+  (-view [this idx prefix] (-open this idx false nil prefix))
+  (-seek-view [this idx start] (-open this idx false start nil))
+  (-basis-t [_] basis-t)
+  (-schema [_] schema)
+  (-as-of-t [_] nil)
+  (-since-t [_] nil)
+  (-history? [_] false)
+  (-filter-pred [_] nil)
+  (-raw [_] (index/-raw inner)))
+
+(defn- new-overlay []
+  (into {} (map (fn [cf] [cf (TreeMap. byte-cmp)]))
+        (concat [:eavt :aevt :avet :vaet] (vals history-cf))))
+
+(defn- apply-ops! [overlay ops]
+  (doseq [op ops]
+    (let [cf (nth op 1)]
+      (when-let [^TreeMap tm (get overlay cf)]
+        (case (nth op 0)
+          :put (.put tm (nth op 2) (nth op 3))
+          :delete (.put tm (nth op 2) deleted))))))
+
+(defn- load-schema
+  "Schema of `w`, scanned through its own (overlaid) AEVT."
+  [w]
+  (schema/schema-from-datoms
+   (into [] (mapcat #(index/datoms-iterable w :aevt (codec/encode-prefix :aevt [%])))
+         (sort schema/schema-attr-ids))))
+
+(defn with
+  "Applies `tx-data` speculatively to `db*`; returns {:db-before :db-after :tx-data :tempids}.
+  Nothing is written."
+  [db* tx-data]
+  (when-not (or (instance? Base db*) (instance? With db*))
+    (unsupported "with is only supported on a current (not as-of, since, history or filtered) db"
+                 {:feature "with"}))
+  (let [meta (if (instance? With db*) (.-meta ^With db*) (db/db-meta db*))
+        r (tx/prepare db* meta tx-data)
+        overlay (new-overlay)
+        _ (apply-ops! overlay (:ops r))
+        basis (codec/tx->t (long (:tx r)))
+        w0 (->With db* overlay basis (index/-schema db*) (:meta r))
+        w (->With db* overlay basis (load-schema w0) (:meta r))]
+    {:db-before db* :db-after w :tx-data (:tx-data r) :tempids (:tempids r)}))
+
+;; ------------------------------------------------------------------ filter
+
+(deftype Filter [inner pred]
+  index/IDb
+  (-seek-current [_ idx prefix]
+    (index/filter-cursor (index/-seek-current inner idx prefix) #(pred inner %)))
+  (-seek-history [_ idx prefix]
+    (index/filter-cursor (index/-seek-history inner idx prefix) #(pred inner %)))
+  (-view [_ idx prefix]
+    (index/filter-cursor (index/-view inner idx prefix) #(pred inner %)))
+  (-seek-view [_ idx start]
+    (index/filter-cursor (index/-seek-view inner idx start) #(pred inner %)))
+  (-basis-t [_] (index/-basis-t inner))
+  (-schema [_] (index/-schema inner))
+  (-as-of-t [_] (index/-as-of-t inner))
+  (-since-t [_] (index/-since-t inner))
+  (-history? [_] (index/-history? inner))
+  (-filter-pred [_] pred)
+  (-raw [_] (index/-raw inner)))
+
+;; ------------------------------------------------------------------ time views
+
+(deftype VisibleCursor [^ICursor c ^long lo ^long hi
+                        ^:unsynchronized-mutable ^boolean closed?]
+  ICursor
+  (valid [_] (and (not closed?) (.valid c)))
+  (advance [_]
+    (when-not closed?
+      (.advance c)
+      (loop []
+        (when (and (.valid c)
+                   (not (let [tx (.-tx ^Datom (.datom c))
+                              rtx (.retractTx c)]
+                          (and (> tx lo) (<= tx hi) (or (neg? rtx) (< hi rtx))))))
+          (.advance c)
+          (recur))))
+    nil)
+  (key [_] (when-not closed? (.key c)))
+  (datom [_] (when-not closed? (.datom c)))
+  (retractTx [_] (if closed? -1 (.retractTx c)))
+  (close [_]
+    (when-not closed?
+      (set! closed? (boolean true))
+      (.close c))
+    nil))
+
+(defn- visible-cursor
+  "Entries visible in a non-history view with since < tx <= as-of: current entries by
+  their tx, history entries when they were asserted by as-of and retracted after it."
+  [^ICursor c lo hi]
+  (let [lo (long lo) hi (long hi)
+        visible? (fn [] (let [tx (.-tx ^Datom (.datom c))
+                              rtx (.retractTx c)]
+                          (and (> tx lo) (<= tx hi) (or (neg? rtx) (< hi rtx)))))]
+    (try
+      (loop []
+        (when (and (.valid c) (not (visible?)))
+          (.advance c)
+          (recur)))
+      (catch Throwable t
+        (.close c)
+        (throw t)))
+    (->VisibleCursor c lo hi false)))
+
+(deftype Event [^bytes key ^Datom d ^long tx ^boolean added])
+
+(defn- same-group?
+  "Keys equal except for the trailing 8-byte tx."
+  [^bytes a ^bytes b]
+  (let [n (alength a)]
+    (and (== n (alength b))
+         (Arrays/equals a 0 (- n 8) b 0 (- n 8)))))
+
+(defn- read-group
+  "Consumes the next group of source entries sharing (index key minus tx) and returns its
+  events with since < tx <= as-of, newest first (an assert before a retract on equal tx)."
+  ^objects [^ICursor src idx ^long lo ^long hi]
+  (loop [evs []]
+    (if-not (.valid src)
+      (object-array evs)
+      (let [k0 (.key src)
+            evs (loop [evs evs]
+                  (if (and (.valid src) (same-group? k0 (.key src)))
+                    (let [^Datom d (.datom src)
+                          rtx (.retractTx src)
+                          tx (.-tx d)
+                          evs (if (and (> tx lo) (<= tx hi))
+                                (conj evs (->Event (.key src) d tx true))
+                                evs)
+                          evs (if (and (>= rtx 0) (> rtx lo) (<= rtx hi))
+                                (conj evs (->Event (codec/encode-key idx (.-e d) (.-a d) (.-v d) rtx)
+                                                   (datom/datom (.-e d) (.-a d) (.-v d) rtx false)
+                                                   rtx false))
+                                evs)]
+                      (.advance src)
+                      (recur evs))
+                    evs))]
+        (if (empty? evs)
+          (recur [])
+          (object-array (sort-by (fn [^Event e] [(- (.tx e)) (if (.added e) 0 1)]) evs)))))))
+
+(deftype HistoryCursor [^ICursor src idx ^long lo ^long hi
+                        ^:unsynchronized-mutable ^objects buf
+                        ^:unsynchronized-mutable ^long pos
+                        ^:unsynchronized-mutable ^boolean closed?]
+  ICursor
+  (valid [_] (< pos (alength buf)))
+  (advance [_]
+    (when (< pos (alength buf))
+      (set! pos (inc pos))
+      (when (>= pos (alength buf))
+        (set! buf (read-group src idx lo hi))
+        (set! pos 0)))
+    nil)
+  (key [_] (when (< pos (alength buf)) (.key ^Event (aget buf pos))))
+  (datom [_] (when (< pos (alength buf)) (.d ^Event (aget buf pos))))
+  (retractTx [_] -1)
+  (close [_]
+    (when-not closed?
+      (set! closed? (boolean true))
+      (set! buf (object-array 0))
+      (.close src))
+    nil))
+
+(defn- history-cursor [^ICursor src idx lo hi]
+  (let [lo (long lo) hi (long hi)]
+    (try
+      (->HistoryCursor src idx lo hi (read-group src idx lo hi) 0 false)
+      (catch Throwable t
+        (.close src)
+        (throw t)))))
+
+(declare ->TimeView)
+
+(defn- time-cursor [inner idx start prefix as-of since history?]
+  (let [lo (if since (codec/t->tx (long since)) Long/MIN_VALUE)
+        hi (if as-of (codec/t->tx (long as-of)) Long/MAX_VALUE)
+        cur (-open inner idx false start prefix)
+        src (if (or history? as-of)
+              (try (index/merge-cursors [cur (-open inner idx true start prefix)])
+                   (catch Throwable t (.close ^ICursor cur) (throw t)))
+              cur)]
+    (if history?
+      (history-cursor src idx lo hi)
+      (visible-cursor src lo hi))))
+
+(deftype TimeView [inner as-of since history?]
+  index/IDb
+  (-seek-current [_ idx prefix] (index/-seek-current inner idx prefix))
+  (-seek-history [_ idx prefix] (index/-seek-history inner idx prefix))
+  (-view [_ idx prefix] (time-cursor inner idx nil prefix as-of since history?))
+  (-seek-view [_ idx start] (time-cursor inner idx start nil as-of since history?))
+  (-basis-t [_] (index/-basis-t inner))
+  (-schema [_] (index/-schema inner))
+  (-as-of-t [_] as-of)
+  (-since-t [_] since)
+  (-history? [_] history?)
+  (-filter-pred [_] nil)
+  (-raw [_] (index/-raw inner)))
+
+(def ^:private t-base (codec/t->tx 0))
+
+(defn- date->t
+  "Latest t whose :db/txInstant is not after `date` (0 when none)."
+  [db* ^Date date]
+  (reduce (fn [^long acc ^Datom d]
+            (if (and (.-added d) (not (.after ^Date (.-v d) date)))
+              (max acc (codec/tx->t (.-e d)))
+              acc))
+          0
+          (index/datoms-iterable db* :aevt (codec/encode-prefix :aevt [50]))))
+
+(defn- ->t
+  "t from a t, a tx id or a Date."
+  [db* x]
+  (cond
+    (instance? Date x) (date->t db* x)
+    (integer? x) (let [x (long x)] (if (>= x t-base) (codec/tx->t x) x))
+    :else (throw (ex-info (str "Invalid t " (pr-str x))
+                          {:db/error :db.error/invalid-t
+                           :cognitect.anomalies/category :cognitect.anomalies/incorrect}))))
+
+(defn- retime
+  "Applies `f` (inner as-of since history?) -> new view. A Filter keeps its predicate on top
+  of the re-timed inner db."
+  [db* f]
+  (cond
+    (instance? Filter db*) (->Filter (retime (.-inner ^Filter db*) f) (.-pred ^Filter db*))
+    (instance? TimeView db*) (let [^TimeView tv db*]
+                               (f (.-inner tv) (.-as-of tv) (.-since tv) (.-history? tv)))
+    :else (f db* nil nil false)))
+
+;; ------------------------------------------------------------------ public API
+
+(defn as-of
+  "`db*` as of `t` (a t, tx id or Date). The outer call wins over an earlier as-of."
+  [db* t]
+  (let [t (->t db* t)]
+    (retime db* (fn [inner _ since h?] (->TimeView inner t since h?)))))
+
+(defn since
+  "Datoms asserted after `t` (a t, tx id or Date)."
+  [db* t]
+  (let [t (->t db* t)]
+    (retime db* (fn [inner as-of _ h?] (->TimeView inner as-of t h?)))))
+
+(defn history
+  "All assertions and retractions ever made."
+  [db*]
+  (retime db* (fn [inner as-of since _] (->TimeView inner as-of since true))))
+
+(defn filter
+  "`db*` with datoms failing `(pred db datom)` hidden. Filters compose."
+  [db* pred]
+  (if (instance? Filter db*)
+    (let [^Filter f db*
+          p1 (.-pred f)]
+      (->Filter (.-inner f) (fn [d datom] (and (p1 d datom) (pred d datom)))))
+    (->Filter db* pred)))
+
+(defn as-of-t [db*] (index/-as-of-t db*))
+(defn since-t [db*] (index/-since-t db*))
+(defn history? [db*] (boolean (index/-history? db*)))
