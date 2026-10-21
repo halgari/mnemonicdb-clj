@@ -3,3 +3,4 @@
 target/
 *.db/
 .nrepl-port
+.claude/worktrees/
