@@ -15,8 +15,10 @@
             [mnemonic.query.aggregates :as aggregates]
             [mnemonic.query.fns :as fns]
             [mnemonic.query.parser :as parser])
-  (:import (java.util ArrayList Arrays Collection Date HashMap HashSet LinkedHashMap LinkedHashSet List UUID)
-           (java.util.concurrent TimeoutException)
+  (:import (clojure.lang LazilyPersistentVector)
+           (java.nio ByteBuffer)
+           (java.util ArrayList Arrays Collection Date HashMap HashSet LinkedHashMap List RandomAccess UUID WeakHashMap)
+           (java.util.concurrent ConcurrentHashMap TimeoutException)
            (mnemonic.datom Datom)
            (mnemonic.schema Attr)))
 
@@ -151,24 +153,38 @@
     (throw (bad-binding (str "Unsupported binding " (pr-str b)) v))))
 
 (defn extend-rel
-  "Joins `rel` with the rows produced by `(rows-fn tuple)` for every tuple. `bsyms`
-  names the row columns; columns whose variable is already bound must be equal."
+  "Joins `rel` with the rows produced by `(rows-fn tuple)` (nil, or a vector / ArrayList /
+  seq of Object[]) for every tuple. `bsyms` names the row columns; columns whose variable is
+  already bound must be equal."
   [ctx rel bsyms rows-fn]
   (let [vars (:vars rel)
         vidx (var-index rel)
         existing (vec (keep-indexed (fn [i s] (when-let [j (get vidx s)] [i j])) bsyms))
+        ne (count existing)
+        ex-i (int-array (map first existing))
+        ex-j (int-array (map second existing))
         new-cols (vec (keep-indexed (fn [i s] (when-not (contains? vidx s) i)) bsyms))
+        nn (count new-cols)
+        nc (int-array new-cols)
         new-syms (mapv #(nth bsyms %) new-cols)
         out (ArrayList.)]
     (each-tuple [t (:tuples rel) ctx]
-      (doseq [^objects r (rows-fn t)]
-        (when (every? (fn [[i j]] (= (aget r (long i)) (aget t (long j)))) existing)
-          (.add out (if (empty? new-cols)
-                      t
-                      (extend-tuple t (let [e (object-array (count new-cols))]
-                                        (dotimes [k (count new-cols)]
-                                          (aset e k (aget r (long (nth new-cols k)))))
-                                        e)))))))
+      (when-let [rows (rows-fn t)]
+        (let [^List rows (if (instance? RandomAccess rows) rows (vec rows))
+              m (.size rows)]
+          (dotimes [ri m]
+            (let [^objects r (.get rows ri)]
+              (when (loop [k 0]
+                      (or (== k ne)
+                          (and (= (aget r (aget ex-i k)) (aget t (aget ex-j k)))
+                               (recur (inc k)))))
+                (.add out (if (zero? nn)
+                            t
+                            (let [n (alength t)
+                                  e (object-array (+ n nn))]
+                              (System/arraycopy t 0 e 0 n)
+                              (dotimes [k nn] (aset e (+ n k) (aget r (aget nc k))))
+                              e)))))))))
     {:vars (into vars new-syms) :tuples out}))
 
 ;; ------------------------------------------------------------------ data patterns
@@ -283,25 +299,52 @@
                  (every? (fn [[p q]] (= (datom-comp d p) (datom-comp d q))) same))))))))
 
 (defn- scan!
-  "Calls `(f datom)` for every datom of `db` in the index range that passes `pass?`,
-  checking the query deadline every 4096 datoms."
-  [ctx db [idx prefix] pass? f]
-  (let [cnt (long-array 1)]
+  "Calls `(f datom)` for every datom of `db` in the index range that passes `pass?`
+  (nil = all), checking the query deadline every 4096 datoms counted across scans in
+  `cnt` (a long[1] shared by the scans of one clause)."
+  [ctx ^longs cnt db idx prefix pass? f]
+  (let [dl? (some? (:deadline ctx))]
     (reduce (fn [_ d]
-              (let [c (aget cnt 0)]
-                (aset cnt 0 (inc c))
-                (when (zero? (bit-and c 4095)) (check-deadline! ctx)))
-              (when (pass? d) (f d))
+              (when dl?
+                (let [c (aget cnt 0)]
+                  (aset cnt 0 (inc c))
+                  (when (zero? (bit-and c 4095)) (check-deadline! ctx))))
+              (when (or (nil? pass?) (pass? d)) (f d))
               nil)
             nil
             (index/datoms-iterable db idx prefix))))
 
+(defn- scan-budget!
+  "Like `scan!` but gives up once more than `limit` datoms of the range were visited.
+  Returns the number of datoms of the range when it was exhausted, else -(limit + 1)
+  (a lower bound of the range size, negated)."
+  [ctx ^longs cnt db idx prefix pass? f limit]
+  (let [dl? (some? (:deadline ctx))
+        limit (long limit)
+        seen (long-array 1)]
+    (if (reduce (fn [_ d]
+                  (when dl?
+                    (let [c (aget cnt 0)]
+                      (aset cnt 0 (inc c))
+                      (when (zero? (bit-and c 4095)) (check-deadline! ctx))))
+                  (let [s (inc (aget seen 0))]
+                    (aset seen 0 s)
+                    (if (> s limit)
+                      (reduced false)
+                      (do (when (or (nil? pass?) (pass? d)) (f d))
+                          true))))
+                true
+                (index/datoms-iterable db idx prefix))
+      (aget seen 0)
+      (- (inc limit)))))
+
 (defn- new-values
   "Object[] of the free-variable values taken from datom `d`."
-  ^objects [^Datom d new-pos]
-  (let [r (object-array (count new-pos))]
-    (dotimes [i (count new-pos)]
-      (aset r i (datom-comp d (long (nth new-pos i)))))
+  ^objects [^Datom d ^ints new-pos]
+  (let [n (alength new-pos)
+        r (object-array n)]
+    (dotimes [i n]
+      (aset r i (datom-comp d (aget new-pos i))))
     r))
 
 ;; ---- AVET range pushdown
@@ -347,10 +390,16 @@
       (if (seq hs) (assoc c ::range-hints hs) c))
     c))
 
-(defn- range-vt-ok? [vt b]
+(defn- range-vt-ok?
+  "True when bound `b` has exactly the class of the values of value type `vt`, so that
+  the comparison of the post-filter agrees with the order of the index. NaN is refused
+  (it compares equal to every number); Timestamps are refused (they order below Dates)."
+  [vt b]
   (case vt
-    :db.type/long (instance? Long b)
-    :db.type/instant (instance? Date b)
+    (:db.type/long :db.type/ref) (instance? Long b)
+    :db.type/instant (identical? Date (class b))
+    :db.type/string (instance? String b)
+    :db.type/double (and (instance? Double b) (not (Double/isNaN (double b))))
     false))
 
 (defn- range-bounds
@@ -413,26 +462,215 @@
   (close [_] (.close c)))
 
 (defn- range-db
-  "A db view whose reads are the AVET entries of `db` from `start` up to (excluding) `stop`."
+  "A db view whose reads are the AVET entries of `db` from `start` up to (excluding)
+  `stop`; everything else is delegated to `db`."
   [db ^bytes start ^bytes stop]
   (reify index/IDb
-    (-view [_ _ _] (->StopCursor (index/-seek-view db :avet start) stop))))
+    (-view [_ _ _] (->StopCursor (index/-seek-view db :avet start) stop))
+    (-seek-view [_ index s] (index/-seek-view db index s))
+    (-seek-current [_ index p] (index/-seek-current db index p))
+    (-seek-history [_ index p] (index/-seek-history db index p))
+    (-basis-t [_] (index/-basis-t db))
+    (-schema [_] (index/-schema db))
+    (-as-of-t [_] (index/-as-of-t db))
+    (-since-t [_] (index/-since-t db))
+    (-history? [_] (index/-history? db))
+    (-filter-pred [_] (index/-filter-pred db))
+    (-raw [_] (index/-raw db))))
+
+(defn- double-edge
+  "Encoded-order edge for a Double bound: -0.0 and 0.0 compare equal but encode apart,
+  so a lower bound of zero starts at -0.0 and an upper bound of zero ends at 0.0."
+  [^double x lower?]
+  (if (== x 0.0) (if lower? -0.0 0.0) x))
 
 (defn- range-plan
-  "[range-db] for a bounded AVET scan of the pattern, or nil when not applicable. The
-  predicates stay as post-filters, so the bounds only have to cover every passing value."
-  [db rel specs hints [e a v _ _]]
-  (when (and hints (free? e) (free? v) (not (free? a))
-             (contains? #{:free :blank} (:kind (nth specs 0))))
+  "A range-db for a bounded AVET scan of the pattern (constant attribute `a`, free
+  entity and value), or nil when not applicable. The predicates stay as post-filters,
+  so the bounds only have to cover every passing value."
+  [db rel specs hints a]
+  (when (and hints a
+             (contains? #{:free :blank} (:kind (nth specs 0)))
+             (identical? :free (:kind (nth specs 2))))
     (let [^Attr attr (get (:attrs (index/-schema db)) a)
           vt (:value-type attr)]
-      (when (contains? #{:db.type/long :db.type/instant} vt)
+      (when (contains? #{:db.type/long :db.type/ref :db.type/instant :db.type/string :db.type/double} vt)
         (when-let [[lo hi] (range-bounds hints (var-index rel) (:tuples rel) vt)]
-          (range-db db
-                    (codec/encode-prefix :avet (if (nil? lo) [a] [a lo]))
-                    (prefix-successor (codec/encode-prefix :avet (if (nil? hi) [a] [a hi])))))))))
+          (let [dbl? (= vt :db.type/double)
+                ;; a stored NaN compares equal to everything: it passes <= and >= (and
+                ;; nothing else), so unless a strict / equality predicate rejects it the
+                ;; upper end stays open to include it (NaN encodes above +Infinity)
+                nan-passes? (and dbl? (every? #(contains? #{:le :ge} (:op %)) hints))
+                lo (if (and dbl? (some? lo)) (double-edge lo true) lo)
+                hi (if (and dbl? (some? hi)) (double-edge hi false) hi)
+                hi (if nan-passes? nil hi)]
+            (range-db db
+                      (codec/encode-prefix :avet (if (nil? lo) [a] [a lo]))
+                      (prefix-successor (codec/encode-prefix :avet (if (nil? hi) [a] [a hi]))))))))))
 
-(def ^:private hash-join-threshold 1000)
+;; ---- access to the datoms of a pattern
+;;
+;; An access describes how one clause reaches its datoms. Two implementations:
+;; `fast-access` (constant attribute, no tx / added constraint: everything is resolved
+;; once per clause) and `generic-access` (any other shape, resolved per tuple). Both
+;; return {:scan-const (fn [] [idx prefix pass? a] | nil)   the range of the constant parts
+;;         :key-fn     (fn [tuple] join-key | nil)          key of a tuple's bound positions
+;;         :datom-key  (fn [datom] join-key)
+;;         :seek       (fn [tuple f])}                      scan of one tuple's datoms
+
+(defn- datom-key-fn
+  "Join key of a datom at the (sorted) bound positions `bound-pos`."
+  [bound-pos]
+  (if (== 1 (count bound-pos))
+    (let [p (long (first bound-pos))] (fn [^Datom d] (datom-comp d p)))
+    (let [ps (long-array bound-pos)]
+      (fn [^Datom d]
+        (let [ks (object-array (alength ps))]
+          (dotimes [i (alength ps)] (aset ks i (datom-comp d (aget ps i))))
+          (Arrays/asList ks))))))
+
+(defn- same-pass
+  "Datom predicate for the repeated-variable constraints `same`, nil when there are none."
+  [same]
+  (when (seq same)
+    (fn [^Datom d] (every? (fn [[p q]] (= (datom-comp d p) (datom-comp d q))) same))))
+
+(defn- unconstrained? [kind]
+  (or (identical? kind :free) (identical? kind :blank) (identical? kind :same)))
+
+(defn- fast-access
+  "Access for patterns with a constant attribute and no tx / added constraint, nil for
+  other shapes, ::no-match when nothing can match (attribute is not an entity id)."
+  [ctx ^longs cnt db specs bound-pos same]
+  (when (and (identical? :const (:kind (nth specs 1)))
+             (unconstrained? (:kind (nth specs 3)))
+             (unconstrained? (:kind (nth specs 4))))
+    (let [sch (index/-schema db)
+          ra (:val (nth specs 1))
+          a (cond (keyword? ra) (or (get (:idents sch) ra)
+                                    (throw (fns/qerror :db.error/not-an-entity
+                                                       (str "Unable to resolve entity: " ra)
+                                                       {:entity ra})))
+                  (integer? ra) (long ra)
+                  :else ::none)]
+      (if (identical? a ::none)
+        ::no-match
+        (let [a (long a)
+              attr (get (:attrs sch) a)
+              ke (:kind (nth specs 0))
+              kv (:kind (nth specs 2))
+              ;; resolution of position 0 / 2 for the tuple (bound) or once (constant)
+              e-of (case ke
+                     :const (let [d (delay (fns/resolve-eid db (:val (nth specs 0))))]
+                              (fn ^long [_] (long @d)))
+                     :bound (let [i (int (:idx (nth specs 0)))]
+                              (fn ^long [^objects t] (fns/resolve-eid db (aget t i))))
+                     nil)
+              v-of (case kv
+                     :const (let [d (delay (fns/resolve-value db attr (:val (nth specs 2))))]
+                              (fn [_] @d))
+                     :bound (let [i (int (:idx (nth specs 2)))]
+                              (fn [^objects t] (fns/resolve-value db attr (aget t i))))
+                     nil)
+              e-const? (identical? ke :const)
+              v-const? (identical? kv :const)
+              ;; prefix of the entries for position values (e, v), nil e / v = unconstrained
+              build (fn [ev? vv? e v]
+                      (try
+                        (let [kb (codec/new-key-buf)]
+                          (cond
+                            ev? (do (.putLong kb (long e)) (.putLong kb a)
+                                    (when vv? (codec/encode-value kb v)))
+                            vv? (do (.putLong kb a) (codec/encode-value kb v)))
+                          (codec/key-buf-bytes kb))
+                        (catch clojure.lang.ExceptionInfo _ nil)))
+              aevt-prefix (codec/encode-prefix :aevt [a])
+              prefix-fn (fn [t consts-only?]
+                          (let [ev? (and (some? e-of) (or e-const? (not consts-only?)))
+                                vv? (and (some? v-of) (or v-const? (not consts-only?)))
+                                e (if ev? (e-of t) 0)
+                                v (when vv? (v-of t))]
+                            (cond
+                              (and vv? (identical? v ::none)) nil
+                              (or ev? vv?) (build ev? vv? e v)
+                              :else aevt-prefix)))
+              idx-of (fn [consts-only?]
+                       (cond (and e-of (or e-const? (not consts-only?))) :eavt
+                             (and v-of (or v-const? (not consts-only?))) :avet
+                             :else :aevt))
+              pass? (same-pass same)
+              empty-t (object-array 0)
+              bound-e? (identical? ke :bound)
+              bound-v? (identical? kv :bound)
+              seek-idx (idx-of false)
+              key-fn (cond
+                       (and bound-e? bound-v?)
+                       (fn [^objects t]
+                         (let [e (e-of t) v (v-of t)]
+                           (when-not (identical? v ::none)
+                             (Arrays/asList (doto (object-array 2) (aset 0 e) (aset 1 v))))))
+                       bound-e? (fn [^objects t] (e-of t))
+                       bound-v? (fn [^objects t] (let [v (v-of t)] (when-not (identical? v ::none) v)))
+                       :else (fn [_] nil))]
+          {:scan-const (fn []
+                         (when-let [p (prefix-fn empty-t true)]
+                           [(idx-of true) p pass? a]))
+           :key-fn (if (or bound-e? bound-v?) key-fn (fn [_] nil))
+           :datom-key (datom-key-fn bound-pos)
+           :seek (fn [^objects t f]
+                   (when-let [p (prefix-fn t false)]
+                     (scan! ctx cnt db seek-idx p pass? f)))})))))
+
+(defn- generic-access
+  [ctx ^longs cnt db specs terms bound-pos same]
+  (let [bp (vec bound-pos)
+        keyf (if (== 1 (count bp))
+               (let [p (long (first bp))] (fn [full] (nth full p)))
+               (fn [full] (Arrays/asList (to-array (map #(nth full %) bp)))))]
+    {:scan-const (fn []
+                   (when-let [res (resolve-pattern db specs (object-array 0) true)]
+                     (when-let [[idx prefix covered?] (scan-plan res terms)]
+                       (when-let [pass? (datom-filter res covered? same)]
+                         [idx prefix pass? (let [a (nth res 1)] (when-not (free? a) a))]))))
+     :key-fn (fn [t] (when-let [full (resolve-pattern db specs t false)] (keyf full)))
+     :datom-key (datom-key-fn bp)
+     :seek (fn [t f]
+             (when-let [res (resolve-pattern db specs t false)]
+               (when-let [[idx prefix covered?] (scan-plan res terms)]
+                 (when-let [pass? (datom-filter res covered? same)]
+                   (scan! ctx cnt db idx prefix pass? f)))))}))
+
+;; ---- executing a data pattern against a db
+
+(def ^:private hash-join-min-tuples
+  "Relations smaller than this seek per tuple without considering a scan."
+  8)
+
+(def ^:private hash-join-scan-factor
+  "A scan + hash join is abandoned for per-tuple seeks once its index range turns out to
+  have more than this many datoms per relation tuple (a seek costs about as much as
+  scanning this many datoms)."
+  3)
+
+(def ^:private ^WeakHashMap range-size-cache
+  ;; db value -> {range key -> size}; a negative size is a lower bound (-size)
+  (WeakHashMap.))
+
+(defn- range-sizes
+  "The map of range sizes learned so far for `db` (db values are immutable, so a size
+  stays exact for as long as the db lives)."
+  ^ConcurrentHashMap [db]
+  (locking range-size-cache
+    (or (.get range-size-cache db)
+        (let [m (ConcurrentHashMap.)]
+          (.put range-size-cache db m)
+          m))))
+
+(defn- range-key [idx ^bytes prefix]
+  (let [b (byte-array (inc (alength prefix)))]
+    (aset b 0 (unchecked-byte (case idx :eavt 0 :aevt 1 :avet 2 3)))
+    (System/arraycopy prefix 0 b 1 (alength prefix))
+    (ByteBuffer/wrap b)))
 
 (defn- exec-db-pattern [ctx db rel plan terms hints]
   (let [{:keys [specs new-syms new-pos bound-pos same]} plan
@@ -440,71 +678,80 @@
         out (ArrayList.)
         n (.size tuples)
         no-new? (empty? new-pos)
+        np (int-array new-pos)
         emit! (fn [^objects t ^Datom d]
-                (.add out (if no-new? t (extend-tuple t (new-values d new-pos)))))
+                (.add out (if no-new? t (extend-tuple t (new-values d np)))))
         result {:vars (into (:vars rel) new-syms) :tuples out}]
     (when (pos? n)
-      (cond
-        ;; no variable from the relation is involved: one scan, then a product
-        (empty? bound-pos)
-        (when-let [res (resolve-pattern db specs (object-array 0) true)]
-          (when-let [sp (scan-plan res terms)]
-            (when-let [pass? (datom-filter res (nth sp 2) same)]
-              (scan! ctx (or (range-plan db rel specs hints res) db) sp pass?
-                     (fn [^Datom d]
-                       (check-deadline! ctx)
-                       (each-tuple [t tuples ctx] (emit! t d)))))))
-
-;; large relation, constant attribute: scan once and hash join
-        (and (> n hash-join-threshold) (= :const (:kind (nth specs 1))))
-        (when-let [res (resolve-pattern db specs (object-array 0) true)]
-          (when-let [sp (scan-plan res terms)]
-            (when-let [pass? (datom-filter res (nth sp 2) same)]
-              (let [groups (HashMap.)
-                    single? (== 1 (count bound-pos))
-                    bp0 (long (first bound-pos))]
-                (each-tuple [t tuples ctx]
-                  (when-let [full (resolve-pattern db specs t false)]
-                    (let [k (if single?
-                              (nth full bp0)
-                              (mapv #(nth full %) bound-pos))
-                          ^ArrayList g (or (.get groups k)
-                                           (let [g (ArrayList.)] (.put groups k g) g))]
-                      (.add g t))))
-                (scan! ctx db sp pass?
+      (let [cnt (long-array 1)
+            fast (fast-access ctx cnt db specs bound-pos same)]
+        (when-not (identical? fast ::no-match)
+          (let [{:keys [scan-const key-fn datom-key seek]}
+                (or fast (generic-access ctx cnt db specs terms bound-pos same))
+                seeks!
+                ;; a seek per tuple, once per distinct bound key
+                (fn []
+                  (let [cache (HashMap.)
+                        bidx (mapv #(long (:idx (nth specs %))) bound-pos)
+                        single? (== 1 (count bidx))
+                        b0 (long (first bidx))]
+                    (each-tuple [t tuples ctx]
+                      (let [k (if single?
+                                (aget t b0)
+                                (let [ks (object-array (count bidx))]
+                                  (dotimes [i (count bidx)] (aset ks i (aget t (long (nth bidx i)))))
+                                  (Arrays/asList ks)))]
+                        (if (if single? (cache-key? k) (every? cache-key? (.toArray ^List k)))
+                          (let [^ArrayList rows
+                                (or (.get cache k)
+                                    (let [rows (ArrayList.)]
+                                      (seek t (fn [^Datom d]
+                                                (.add rows (if no-new? no-extra (new-values d np)))))
+                                      (.put cache k rows)
+                                      rows))]
+                            (dotimes [i (.size rows)]
+                              (.add out (if no-new? t (extend-tuple t (.get rows i))))))
+                          (seek t (fn [^Datom d] (emit! t d))))))))]
+            (cond
+              ;; no variable from the relation is involved: one scan, then a product
+              (empty? bound-pos)
+              (when-let [[idx prefix pass? a] (scan-const)]
+                (scan! ctx cnt (or (range-plan db rel specs hints a) db) idx prefix pass?
                        (fn [^Datom d]
-                         (when-let [^ArrayList g (.get groups (if single?
-                                                                (datom-comp d bp0)
-                                                                (mapv #(datom-comp d %) bound-pos)))]
-                           (dotimes [i (.size g)] (emit! (.get g i) d)))))))))
+                         (check-deadline! ctx)
+                         (each-tuple [t tuples ctx] (emit! t d)))))
 
-        ;; otherwise a seek per tuple, once per distinct bound key
-        :else
-        (let [cache (HashMap.)
-              bidx (mapv #(long (:idx (nth specs %))) bound-pos)
-              single? (== 1 (count bidx))
-              b0 (long (first bidx))
-              seek! (fn [^objects t f]
-                      (when-let [res (resolve-pattern db specs t false)]
-                        (when-let [sp (scan-plan res terms)]
-                          (when-let [pass? (datom-filter res (nth sp 2) same)]
-                            (scan! ctx db sp pass? f)))))]
-          (each-tuple [t tuples ctx]
-            (let [k (if single?
-                      (aget t b0)
-                      (let [ks (object-array (count bidx))]
-                        (dotimes [i (count bidx)] (aset ks i (aget t (long (nth bidx i)))))
-                        (Arrays/asList ks)))]
-              (if (if single? (cache-key? k) (every? cache-key? (.toArray ^List k)))
-                (let [^ArrayList rows
-                      (or (.get cache k)
-                          (let [rows (ArrayList.)]
-                            (seek! t (fn [^Datom d] (.add rows (if no-new? no-extra (new-values d new-pos)))))
-                            (.put cache k rows)
-                            rows))]
-                  (dotimes [i (.size rows)]
-                    (.add out (if no-new? t (extend-tuple t (.get rows i))))))
-                (seek! t (fn [^Datom d] (emit! t d)))))))))
+              ;; constant attribute, enough tuples: scan the constant part of the pattern
+              ;; once and hash join, unless the range is much larger than the relation
+              (and (>= n hash-join-min-tuples) (identical? :const (:kind (nth specs 1))))
+              (if-let [[idx prefix pass? a] (scan-const)]
+                (let [rdb (range-plan db rel specs hints a)
+                      limit (* hash-join-scan-factor n)
+                      sizes (when-not rdb (range-sizes db))
+                      skey (when sizes (range-key idx prefix))
+                      known (when sizes (.get sizes skey))]
+                  (if (and known (> (Math/abs (long known)) limit))
+                    (seeks!)
+                    (let [groups (HashMap.)]
+                      (each-tuple [t tuples ctx]
+                        (when-let [k (key-fn t)]
+                          (let [^ArrayList g (or (.get groups k)
+                                                 (let [g (ArrayList.)] (.put groups k g) g))]
+                            (.add g t))))
+                      (let [r (long (scan-budget! ctx cnt (or rdb db) idx prefix pass?
+                                                  (fn [^Datom d]
+                                                    (when-let [^ArrayList g (.get groups (datom-key d))]
+                                                      (dotimes [i (.size g)] (emit! (.get g i) d))))
+                                                  limit))]
+                        (when (and sizes (< (.size sizes) 256)
+                                   (or (nil? known) (neg? (long known))))
+                          (.put sizes skey r))
+                        (when (neg? r)
+                          (.clear out)
+                          (seeks!))))))
+                nil)
+
+              :else (seeks!))))))
     result))
 
 (defn- exec-coll-pattern [ctx coll rel plan]
@@ -787,41 +1034,76 @@
     :strs (cond (string? x) x (keyword? x) (subs (str x) 1) :else (str x))
     :syms (cond (symbol? x) x (keyword? x) (symbol (namespace x) (name x)) :else (symbol x))))
 
-(defn- tuple-vec [fs ^objects t]
-  (let [r (object-array (count fs))]
-    (dotimes [i (count fs)] (aset r i ((nth fs i) t)))
-    (vec r)))
+(defn- fn-array
+  "Object[] of the fns of `fs`."
+  ^objects [fs]
+  (object-array fs))
+
+(defn- tuple-array
+  "Object[] of the values of fn-array `fs` applied to tuple `t`."
+  ^objects [^objects fs ^objects t]
+  (let [n (alength fs)
+        r (object-array n)]
+    (dotimes [i n] (aset r i (.invoke ^clojure.lang.IFn (aget fs i) t)))
+    r))
+
+(deftype RowKey [^objects a ^int h]
+  Object
+  (hashCode [_] h)
+  (equals [_ o] (and (instance? RowKey o) (Arrays/equals a ^objects (.-a ^RowKey o)))))
+
+(defn- row-key [^objects a] (->RowKey a (Arrays/hashCode a)))
 
 (defn- distinct-rows
   "Raw rows (vectors aligned with the find elements), de-duplicated together with the
   :with values."
   [ctx rel ffs wfs]
-  (let [seen (LinkedHashSet.)
-        rows (ArrayList.)]
+  (let [allfs (fn-array (concat ffs wfs))
+        ffs (fn-array ffs)
+        nf (alength ffs)
+        with? (pos? (- (alength allfs) nf))
+        n (rel-size rel)
+        seen (HashSet. (int (min 1048576 (+ 16 (* 2 n)))))
+        rows (ArrayList. (int (min 1048576 n)))]
     (each-tuple [t (:tuples rel) ctx]
-      (let [fv (tuple-vec ffs t)
-            k (if (seq wfs) (conj fv (tuple-vec wfs t)) fv)]
-        (when (.add seen k) (.add rows fv))))
+      (if with?
+        (let [all (tuple-array allfs t)]
+          (when (.add seen (row-key all))
+            (.add rows (LazilyPersistentVector/createOwning (Arrays/copyOf all nf)))))
+        (let [fv (tuple-array ffs t)]
+          (when (.add seen (row-key fv))
+            (.add rows (LazilyPersistentVector/createOwning fv))))))
     (vec rows)))
+
+(defn- distinct-row-set
+  "The de-duplicated rows as a HashSet (the plain :find-rel result)."
+  [ctx rel ffs]
+  (let [ffs (fn-array ffs)
+        out (HashSet. (int (min 1048576 (+ 16 (* 2 (rel-size rel))))))]
+    (each-tuple [t (:tuples rel) ctx]
+      (.add out (LazilyPersistentVector/createOwning (tuple-array ffs t))))
+    out))
 
 (defn- group-rows
   "Raw rows for a :find with aggregates: the relation is projected to the non-aggregate
   elements, the aggregate arguments and :with, de-duplicated, grouped by the non-aggregate
   elements and each aggregate applied to the values of its group."
   [ctx rel elems kfs afs wfs aggs]
-  (let [seen (HashSet.)
+  (let [nk (count kfs)
+        allfs (fn-array (concat kfs afs wfs))
+        seen (HashSet.)
         groups (LinkedHashMap.)
         nagg (count afs)]
     (each-tuple [t (:tuples rel) ctx]
-      (let [k (tuple-vec kfs t)
-            a (tuple-vec afs t)]
-        (when (.add seen [k a (tuple-vec wfs t)])
-          (let [^objects cols (or (.get groups k)
+      (let [all (tuple-array allfs t)]
+        (when (.add seen (row-key all))
+          (let [k (LazilyPersistentVector/createOwning (Arrays/copyOf all (int nk)))
+                ^objects cols (or (.get groups k)
                                   (let [c (object-array nagg)]
                                     (dotimes [i nagg] (aset c i (ArrayList.)))
                                     (.put groups k c)
                                     c))]
-            (dotimes [i nagg] (.add ^ArrayList (aget cols i) (nth a i)))))))
+            (dotimes [i nagg] (.add ^ArrayList (aget cols i) (aget all (+ nk i))))))))
     (let [out (ArrayList.)]
       (doseq [[k ^objects cols] groups]
         (check-deadline! ctx)
@@ -854,6 +1136,8 @@
         wfs (mapv #(column-fn rel %) with)
         finishers (mapv #(finish-element-fn ctx rel %) elems)
         pull? (boolean (some some? finishers))
+        plain-set? (and (not lazy?) (= :find-rel (:spec find)) (not return-map)
+                        (not agg?) (not pull?) (empty? wfs))
         rows (if agg?
                (let [plain (remove #(= :agg (:type %)) elems)
                      aggs (filter #(= :agg (:type %)) elems)]
@@ -862,7 +1146,9 @@
                              (mapv #(column-fn rel (:sym (peek (:args %)))) aggs)
                              wfs
                              (mapv aggregates/resolve-agg aggs)))
-               (distinct-rows ctx rel (mapv #(find-element-fn ctx rel %) elems) wfs))
+               (if plain-set?
+                 (distinct-row-set ctx rel (mapv #(find-element-fn ctx rel %) elems))
+                 (distinct-rows ctx rel (mapv #(find-element-fn ctx rel %) elems) wfs)))
         ;; aggregate rows carry results in place; pull finishing applies to pull elements
         pulled (if pull?
                  (fn [row] (vec (map-indexed (fn [i v] (if-let [f (nth finishers i)] (f v) v)) row)))
@@ -888,6 +1174,7 @@
       (case spec
         :find-rel (cond
                     to-map (mapv (comp to-map pulled) rows)
+                    plain-set? rows
                     (or agg? pull? (seq wfs)) (mapv pulled rows)
                     :else (HashSet. ^Collection rows))
         :find-coll (mapv (comp first pulled) rows)

@@ -7,6 +7,7 @@
             [mnemonic.index :as index]
             [mnemonic.tx :as tx])
   (:import (clojure.lang Reflector Var)
+           (java.util Arrays)
            (java.util.concurrent ConcurrentHashMap)
            (mnemonic.datom Datom)
            (mnemonic.schema Attr)))
@@ -101,10 +102,63 @@
 
 (defmacro ^:private both-long? [a b] `(and (instance? Long ~a) (instance? Long ~b)))
 
-(defn- lt [a b] (if (both-long? a b) (< (long a) (long b)) (neg? (compare a b))))
-(defn- gt [a b] (if (both-long? a b) (> (long a) (long b)) (pos? (compare a b))))
-(defn- lte [a b] (if (both-long? a b) (<= (long a) (long b)) (not (pos? (compare a b)))))
-(defn- gte [a b] (if (both-long? a b) (>= (long a) (long b)) (not (neg? (compare a b)))))
+(defn- class-rank
+  "Rank of the class of non-nil `x` in Datomic's order across classes (measured against
+  Datomic: values of different classes order by class, numbers sharing one rank and
+  comparing by value). Unknown classes rank last."
+  ^long [x]
+  (cond
+    (instance? Number x) (if (instance? clojure.lang.Ratio x) 0 1)
+    (string? x) 10
+    (keyword? x) 6
+    (instance? java.util.Date x) (cond (instance? java.sql.Timestamp x) 12
+                                       :else 13)
+    (instance? java.util.UUID x) 14
+    (sequential? x) 2
+    (map? x) 3
+    (set? x) 4
+    (bytes? x) 5
+    (symbol? x) 7
+    (instance? Boolean x) 8
+    (instance? Character x) 9
+    (instance? java.net.URI x) 11
+    :else 15))
+
+(defn- order-within-class
+  "Order of two non-nil values of one class rank. Sequential values compare as vectors."
+  ^long [a b]
+  (cond
+    (sequential? a) (long (compare (vec a) (vec b)))
+    (bytes? a) (let [^bytes x a ^bytes y b
+                     c (Integer/compare (alength x) (alength y))]
+                 (if (zero? c) (long (Arrays/compare x y)) (long c)))
+    :else (long (compare a b))))
+
+(defn compare-values
+  "Total order used by the query comparison built-ins (`<` `>` `<=` `>=`) as in Datomic:
+  nil first, values of one class by `compare`, values of different classes by class rank
+  (numbers of any class compare by value, NaN compares equal to every number)."
+  ^long [a b]
+  (cond
+    (nil? a) (if (nil? b) 0 -1)
+    (nil? b) 1
+    :else
+    (let [ra (class-rank a) rb (class-rank b)]
+      (if (== ra rb)
+        (order-within-class a b)
+        (Long/compare ra rb)))))
+
+(defmacro ^:private cmp-fast
+  "Value of `slow` unless `a` and `b` are both Long / both String."
+  [a b long-op str-op slow]
+  `(cond (both-long? ~a ~b) (~long-op (long ~a) (long ~b))
+         (and (string? ~a) (string? ~b)) (~str-op (.compareTo ~(with-meta a {:tag 'String}) ~(with-meta b {:tag 'String})) 0)
+         :else ~slow))
+
+(defn- lt [a b] (cmp-fast a b < < (neg? (compare-values a b))))
+(defn- gt [a b] (cmp-fast a b > > (pos? (compare-values a b))))
+(defn- lte [a b] (cmp-fast a b <= <= (not (pos? (compare-values a b)))))
+(defn- gte [a b] (cmp-fast a b >= >= (not (neg? (compare-values a b)))))
 
 (defn- unsupported-fulltext [& _]
   (throw (qerror :db.error/unsupported "fulltext is not supported")))
