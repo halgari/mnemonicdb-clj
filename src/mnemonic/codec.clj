@@ -498,6 +498,62 @@
       (unknown-index index))
     (.toBytes out)))
 
+;; Key construction from a value that is already encoded (`vb` = `value->bytes`): the same
+;; layouts as `encode-key`, `encode-prefix` and `encode-log-entry`, without re-encoding.
+
+(defn- put-long!
+  "Writes `x` at `off` of `bb` (big-endian, sign bit flipped); returns the next offset."
+  ^long [^ByteBuffer bb ^long off ^long x]
+  (.putLong bb (int off) (bit-xor x Long/MIN_VALUE))
+  (+ off 8))
+
+(defn encode-key-vb
+  "Like `encode-key` for :eavt, :aevt and :avet, given the value's encoding `vb`."
+  ^bytes [index e a ^bytes vb tx]
+  (let [e (long e) a (long a) tx (long tx)
+        n (alength vb)
+        arr (byte-array (+ 24 n))
+        bb (ByteBuffer/wrap arr)]
+    (case index
+      :eavt (do (put-long! bb 0 e) (put-long! bb 8 a)
+                (System/arraycopy vb 0 arr 16 n)
+                (put-long! bb (+ 16 n) tx))
+      :aevt (do (put-long! bb 0 a) (put-long! bb 8 e)
+                (System/arraycopy vb 0 arr 16 n)
+                (put-long! bb (+ 16 n) tx))
+      :avet (do (put-long! bb 0 a)
+                (System/arraycopy vb 0 arr 8 n)
+                (put-long! bb (+ 8 n) e)
+                (put-long! bb (+ 16 n) tx))
+      (unknown-index index))
+    arr))
+
+(defn encode-vaet-key
+  "VAET key; the value `v` is an entity id, stored as a plain long."
+  ^bytes [^long v ^long a ^long e ^long tx]
+  (let [arr (byte-array 32)
+        bb (ByteBuffer/wrap arr)]
+    (put-long! bb 0 v) (put-long! bb 8 a) (put-long! bb 16 e) (put-long! bb 24 tx)
+    arr))
+
+(defn encode-prefix-eav-vb
+  "Like `(encode-prefix :eavt [e a v])` given the value's encoding `vb`."
+  ^bytes [^long e ^long a ^bytes vb]
+  (let [arr (byte-array (+ 16 (alength vb)))
+        bb (ByteBuffer/wrap arr)]
+    (put-long! bb 0 e) (put-long! bb 8 a)
+    (System/arraycopy vb 0 arr 16 (alength vb))
+    arr))
+
+(defn encode-prefix-av-vb
+  "Like `(encode-prefix :avet [a v])` given the value's encoding `vb`."
+  ^bytes [^long a ^bytes vb]
+  (let [arr (byte-array (+ 8 (alength vb)))
+        bb (ByteBuffer/wrap arr)]
+    (put-long! bb 0 a)
+    (System/arraycopy vb 0 arr 8 (alength vb))
+    arr))
+
 (defn decode-key
   "Decode an index key into a Datom (added = true)."
   ^Datom [index ^bytes k]
@@ -527,6 +583,25 @@
       (encode-value out (.-v d))
       (write-byte! out (if (.-added d) 1 0)))
     (.toBytes out)))
+
+(defn encode-log-entry-vb
+  "Like `encode-log-entry`, with `vbs` the value encodings parallel to `datoms`."
+  ^bytes [datoms vbs]
+  (let [size (reduce (fn [^long n ^bytes vb] (+ n 17 (alength vb))) 4 vbs)
+        arr (byte-array size)
+        bb (ByteBuffer/wrap arr)]
+    (.putInt bb 0 (int (count datoms)))
+    (loop [ds (seq datoms) vs (seq vbs) off 4]
+      (when ds
+        (let [^Datom d (first ds) ^bytes vb (first vs)
+              off (long off)
+              off (put-long! bb off (.-e d))
+              off (put-long! bb off (.-a d))
+              n (alength vb)]
+          (System/arraycopy vb 0 arr (int off) n)
+          (aset arr (+ (int off) n) (byte (if (.-added d) 1 0)))
+          (recur (next ds) (next vs) (+ off n 1)))))
+    arr))
 
 (defn decode-log-entry
   [^long tx ^bytes b]
