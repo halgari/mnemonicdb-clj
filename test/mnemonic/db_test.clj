@@ -30,7 +30,7 @@
   (with-db
     (fn [store db]
       (is (= 72 (ix/-basis-t db)))
-      (is (= {:format 1 :next-t 1000 :next-db-n 73} (bootstrap/read-meta store)))
+      (is (= {:format 2 :next-t 1000 :next-db-n 73} (bootstrap/read-meta store)))
       (testing "EAVT holds all 272 datoms in order"
         (let [ds (seq (ix/datoms-iterable db :eavt (codec/encode-prefix :eavt [])))]
           (is (= 272 (count ds)))

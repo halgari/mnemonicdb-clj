@@ -162,9 +162,11 @@
 (defn- load-schema
   "Schema of `w`, scanned through its own (overlaid) AEVT."
   [w]
-  (schema/schema-from-datoms
-   (into [] (mapcat #(index/datoms-iterable w :aevt (codec/encode-prefix :aevt [%])))
-         (sort schema/schema-attr-ids))))
+  (schema/with-ident-aliases
+   (schema/schema-from-datoms
+    (into [] (mapcat #(index/datoms-iterable w :aevt (codec/encode-prefix :aevt [%])))
+          (sort schema/schema-attr-ids)))
+   (db/ident-history (index/-seek-history w :aevt (codec/encode-prefix :aevt [schema/ident-attr-id])))))
 
 (defn with
   "Applies `tx-data` speculatively to `db*`; returns {:db-before :db-after :tx-data :tempids}.

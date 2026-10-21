@@ -18,8 +18,9 @@
 
 (def format-version
   "On-disk format version, stored in the store meta and checked on connect. Bump it on
-  any change to key or value encodings."
-  1)
+  any change to key or value encodings.
+  1: initial format. 2: BigDecimal values keep their scale."
+  2)
 
 ;; ------------------------------------------------------------------ tags
 
@@ -203,7 +204,10 @@
           (dotimes [i len] (aset mag i (unchecked-byte (bit-xor (aget mag i) -1)))))
         (BigInteger. (if neg -1 1) mag)))))
 
-(defn- write-bigdec! [^ByteArrayOutputStream out ^BigDecimal d]
+(defn- write-bigdec-numeric!
+  "The numeric part: zero, or sign + exponent + significant digits (trailing zeros
+  stripped), so numerically equal values share it."
+  [^ByteArrayOutputStream out ^BigDecimal d]
   (if (zero? (.signum d))
     (write-byte! out 1)
     (let [d (.stripTrailingZeros d)
@@ -216,20 +220,38 @@
       (dotimes [i 8] (write-byte! out (bit-xor (bit-and 0xFF (aget expb i)) mask)))
       (write-escaped! out digits mask))))
 
+(defn- write-bigdec!
+  "Numeric part, then the scale (format 2) as an order-preserving int: values sort
+  numerically, numerically equal values by scale, and decode with their exact scale."
+  [^ByteArrayOutputStream out ^BigDecimal d]
+  (write-bigdec-numeric! out d)
+  (write-int! out (.scale d) 0))
+
+(defn bigdec-numeric-prefix
+  "Tag plus numeric part of `d`: a key prefix matching `d` at every scale."
+  ^bytes [^BigDecimal d]
+  (let [out (ByteArrayOutputStream.)]
+    (write-byte! out tag-bigdec)
+    (write-bigdec-numeric! out d)
+    (.toByteArray out)))
+
 (defn- read-bigdec ^BigDecimal [^ByteBuffer buf]
-  (let [sg (bit-and 0xFF (.get buf))]
-    (if (== sg 1)
-      BigDecimal/ZERO
-      (let [neg (zero? sg)
-            mask (if neg 0xFF 0)
-            eb (byte-array 8)
-            _ (.get buf eb)
-            _ (dotimes [i 8] (aset eb i (unchecked-byte (bit-xor (aget eb i) mask))))
-            exp (bit-xor (.getLong (ByteBuffer/wrap eb)) Long/MIN_VALUE)
-            digits (from-utf8 (read-escaped buf mask))
-            unscaled (BigInteger. ^String digits)]
-        (BigDecimal. (if neg (.negate unscaled) unscaled)
-                     (int (- (count digits) exp 1)))))))
+  (let [sg (bit-and 0xFF (.get buf))
+        ^BigDecimal v
+        (if (== sg 1)
+          BigDecimal/ZERO
+          (let [neg (zero? sg)
+                mask (if neg 0xFF 0)
+                eb (byte-array 8)
+                _ (.get buf eb)
+                _ (dotimes [i 8] (aset eb i (unchecked-byte (bit-xor (aget eb i) mask))))
+                exp (bit-xor (.getLong (ByteBuffer/wrap eb)) Long/MIN_VALUE)
+                digits (from-utf8 (read-escaped buf mask))
+                unscaled (BigInteger. ^String digits)]
+            (BigDecimal. (if neg (.negate unscaled) unscaled)
+                         (int (- (count digits) exp 1)))))
+        scale (bit-xor (.getInt buf) (unchecked-int 0x80000000))]
+    (.setScale v (int scale) java.math.RoundingMode/UNNECESSARY)))
 
 (declare encode-value decode-value)
 
@@ -342,6 +364,21 @@
     (loop [kinds (seq (layout index)) cs (seq components)]
       (when (and kinds cs)
         (write-component! out (first kinds) (first cs))
+        (recur (next kinds) (next cs))))
+    (.toByteArray out)))
+
+(defn encode-prefix-numeric
+  "Like `encode-prefix`, but a BigDecimal as the last component is encoded without its
+  scale, so the prefix matches every numerically equal value (as Datomic's index
+  lookups and ranges do)."
+  ^bytes [index components]
+  (let [out (ByteArrayOutputStream.)]
+    (loop [kinds (seq (layout index)) cs (seq components)]
+      (when (and kinds cs)
+        (let [kind (first kinds) x (first cs)]
+          (if (and (= kind :v) (nil? (next cs)) (instance? BigDecimal x))
+            (write-raw! out (bigdec-numeric-prefix x))
+            (write-component! out kind x)))
         (recur (next kinds) (next cs))))
     (.toByteArray out)))
 

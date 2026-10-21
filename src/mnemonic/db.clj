@@ -5,7 +5,8 @@
             [mnemonic.index :as index]
             [mnemonic.rocks :as rocks]
             [mnemonic.schema :as schema])
-  (:import (mnemonic.rocks IRawCursor Snap)))
+  (:import (mnemonic.datom Datom)
+           (mnemonic.rocks IRawCursor Snap)))
 
 (set! *warn-on-reflection* true)
 
@@ -82,11 +83,30 @@
           acc))
       (finally (.close cur)))))
 
+(defn ident-history
+  "[eid keyword retract-tx] of every retracted :db/ident datom, read from `cur` (a
+  history cursor over the AEVT prefix of :db/ident); closes `cur`."
+  [^mnemonic.index.ICursor cur]
+  (try
+    (loop [acc []]
+      (if (.valid cur)
+        (let [^Datom d (.datom cur)
+              x [(.-e d) (.-v d) (.retractTx cur)]]
+          (.advance cur)
+          (recur (conj acc x)))
+        acc))
+    (finally (.close cur))))
+
 (defn- load-schema
-  "Only the schema-defining attributes are scanned (AEVT), not all of EAVT."
+  "Only the schema-defining attributes are scanned (AEVT), not all of EAVT; retracted
+  idents (AEVT history of :db/ident) become aliases."
   [store snap]
-  (schema/schema-from-datoms
-   (into [] (mapcat #(scan-attr store snap %)) (sort schema/schema-attr-ids))))
+  (schema/with-ident-aliases
+   (schema/schema-from-datoms
+    (into [] (mapcat #(scan-attr store snap %)) (sort schema/schema-attr-ids)))
+   (ident-history (index/prefix-cursor (rocks/raw-cursor store :aevt-h snap)
+                                       (codec/encode-prefix :aevt [schema/ident-attr-id])
+                                       :aevt true))))
 
 (defn base-db
   "Db value over a fresh snapshot of `store`."

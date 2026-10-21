@@ -267,7 +267,7 @@
   (when-not (contains? index-order index) (bad-index index))
   (if-let [comps (resolve-components db* index components)]
     (index/datoms-iterable (view-db db* (indexed-view index index/-view))
-                           index (codec/encode-prefix index comps))
+                           index (codec/encode-prefix-numeric index comps))
     empty-result))
 
 (defn seek-datoms
@@ -276,7 +276,7 @@
   (when-not (contains? index-order index) (bad-index index))
   (if-let [comps (resolve-components db* index components)]
     (index/datoms-iterable (view-db db* (indexed-view index index/-seek-view))
-                           index (codec/encode-prefix index comps))
+                           index (codec/encode-prefix-numeric index comps))
     empty-result))
 
 (deftype UntilCursor [^ICursor c ^bytes stop]
@@ -300,8 +300,8 @@
                      :else (try (tx/coerce-value attr v) (catch clojure.lang.ExceptionInfo _ v))))
         s (norm start)
         e (norm end)
-        start-key (codec/encode-prefix :avet (if (nil? s) [aid] [aid s]))
-        stop-key (codec/encode-prefix :avet (if (nil? e) [(inc aid)] [aid e]))]
+        start-key (codec/encode-prefix-numeric :avet (if (nil? s) [aid] [aid s]))
+        stop-key (codec/encode-prefix-numeric :avet (if (nil? e) [(inc aid)] [aid e]))]
     (index/datoms-iterable
      (view-db db* (fn [d _ _] (->UntilCursor (index/-seek-view d :avet start-key) stop-key)))
      :avet start-key)))
@@ -349,7 +349,7 @@
                                 {:attribute (:ident a)}))))
     (let [comps (or (resolve-components db* index start) [aid])
           attr-prefix (codec/encode-prefix index [aid])
-          start-key (codec/encode-prefix index comps)
+          start-key (codec/encode-prefix-numeric index comps)
           in-attr (fn [^Datom d] (== aid (.-a d)))
           ds (if reverse
                (let [stop (codec/prefix-end start-key)]

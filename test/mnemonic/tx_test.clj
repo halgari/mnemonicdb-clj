@@ -68,7 +68,7 @@
                  (set (map (comp vec (partial take 3) dv) (strip-inst r1)))))
           (is (= 1 (count (filter #(= 50 (:a %)) (:tx-data r1)))))
           (is (every? #(= (:tx r1) (:tx %)) (:tx-data r1))))
-        (is (= {:format 1 :next-t 1001 :next-db-n 75} (select-keys (:meta r1) [:format :next-t :next-db-n])))
+        (is (= {:format 2 :next-t 1001 :next-db-n 75} (select-keys (:meta r1) [:format :next-t :next-db-n])))
         (is (= 1000 (ix/-basis-t (db/base-db store))))
         (let [r2 (run!* store [{:db/id "x" :person/name "Al"} {:db/id "y" :person/name "Bo"}])]
           (is (= (codec/t->tx 1001) (:tx r2)))
