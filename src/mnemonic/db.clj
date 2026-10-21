@@ -18,19 +18,22 @@
   Runnable
   (run [_] (.markReleased snap)))
 
-(defn- open-raw ^IRawCursor [store snap cf]
-  (rocks/raw-cursor store cf snap))
+(defn- open-raw
+  "A raw cursor over `cf`. `prefix` non-nil: the caller reads only keys starting with it
+  (a prefix cursor), which lets RocksDB use the prefix bloom filter; nil: total order."
+  ^IRawCursor [store snap cf prefix]
+  (rocks/raw-cursor store cf snap prefix))
 
 (deftype Base [store ^Snap snap basis-t schema meta ^Releaser releaser]
   index/IDb
   (-seek-current [_ idx prefix]
-    (index/prefix-cursor (open-raw store snap idx) prefix idx false))
+    (index/prefix-cursor (open-raw store snap idx prefix) prefix idx false))
   (-seek-history [_ idx prefix]
-    (index/prefix-cursor (open-raw store snap (history-cf idx)) prefix idx true))
+    (index/prefix-cursor (open-raw store snap (history-cf idx) prefix) prefix idx true))
   (-view [_ idx prefix]
-    (index/prefix-cursor (open-raw store snap idx) prefix idx false))
+    (index/prefix-cursor (open-raw store snap idx prefix) prefix idx false))
   (-seek-view [_ idx start]
-    (index/seek-cursor (open-raw store snap idx) start idx false))
+    (index/seek-cursor (open-raw store snap idx nil) start idx false))
   (-basis-t [_] basis-t)
   (-schema [_] schema)
   (-as-of-t [_] nil)
@@ -42,7 +45,7 @@
 (defn history-seek-cursor
   "Cursor over the history index of `idx` from the first key >= `start` to its end."
   [^Base b idx start]
-  (index/seek-cursor (open-raw (.-store b) (.-snap b) (history-cf idx)) start idx true))
+  (index/seek-cursor (open-raw (.-store b) (.-snap b) (history-cf idx) nil) start idx true))
 
 (defn released?
   "True once `release-db` was called on `db` (or it was collected)."
@@ -97,7 +100,7 @@
         acc))
     (finally (.close cur))))
 
-(defn- load-schema
+(defn load-schema
   "Only the schema-defining attributes are scanned (AEVT), not all of EAVT; retracted
   idents (AEVT history of :db/ident) become aliases."
   [store snap]
@@ -118,6 +121,23 @@
             basis (if tx (codec/tx->t tx) 0)
             sch (load-schema store snap)
             db (->Base store snap basis sch (bootstrap/read-meta store snap) releaser)]
+        (rocks/register-cleanup! db releaser)
+        db)
+      (catch Throwable t
+        (.run ^Releaser releaser)
+        (throw t)))))
+
+(defn successor-db
+  "Db value over a fresh snapshot of `store` taken right after the writer committed the
+  tx that moved `prev` to `basis-t` / `meta` (writer thread only). The schema object of
+  `prev` is reused unless `schema-changed?`, in which case it is reloaded from the new
+  snapshot. No log or meta reads."
+  [store ^Base prev basis-t meta schema-changed?]
+  (let [snap (rocks/snapshot store)
+        releaser (->Releaser snap)]
+    (try
+      (let [sch (if schema-changed? (load-schema store snap) (.-schema prev))
+            db (->Base store snap basis-t sch meta releaser)]
         (rocks/register-cleanup! db releaser)
         db)
       (catch Throwable t

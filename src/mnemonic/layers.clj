@@ -206,6 +206,31 @@
 
 ;; ------------------------------------------------------------------ time views
 
+(defn- key-tx
+  "The tx of an index key: its trailing 8 bytes (big-endian, sign bit flipped)."
+  ^long [^bytes k]
+  (let [n (alength k)]
+    (loop [i (- n 8) acc 0]
+      (if (< i n)
+        (recur (inc i) (bit-or (bit-shift-left acc 8) (bit-and 0xFF (long (aget k i)))))
+        (bit-xor acc Long/MIN_VALUE)))))
+
+(defn- key-with-tx
+  "Copy of index key `k` with its trailing tx replaced by `tx`."
+  ^bytes [^bytes k ^long tx]
+  (let [n (alength k)
+        r (Arrays/copyOf k n)
+        x (bit-xor tx Long/MIN_VALUE)]
+    (dotimes [i 8]
+      (aset r (+ (- n 8) i) (unchecked-byte (unsigned-bit-shift-right x (* 8 (- 7 i))))))
+    r))
+
+(defmacro ^:private visible-entry?
+  [c lo hi]
+  `(let [tx# (key-tx (.key ~c))
+         rtx# (.retractTx ~c)]
+     (and (> tx# ~lo) (<= tx# ~hi) (or (neg? rtx#) (< ~hi rtx#)))))
+
 (deftype VisibleCursor [^ICursor c ^long lo ^long hi
                         ^:unsynchronized-mutable ^boolean closed?]
   ICursor
@@ -214,10 +239,7 @@
     (when-not closed?
       (.advance c)
       (loop []
-        (when (and (.valid c)
-                   (not (let [tx (.-tx ^Datom (.datom c))
-                              rtx (.retractTx c)]
-                          (and (> tx lo) (<= tx hi) (or (neg? rtx) (< hi rtx))))))
+        (when (and (.valid c) (not (visible-entry? c lo hi)))
           (.advance c)
           (recur))))
     nil)
@@ -234,13 +256,10 @@
   "Entries visible in a non-history view with since < tx <= as-of: current entries by
   their tx, history entries when they were asserted by as-of and retracted after it."
   [^ICursor c lo hi]
-  (let [lo (long lo) hi (long hi)
-        visible? (fn [] (let [tx (.-tx ^Datom (.datom c))
-                              rtx (.retractTx c)]
-                          (and (> tx lo) (<= tx hi) (or (neg? rtx) (< hi rtx)))))]
+  (let [lo (long lo) hi (long hi)]
     (try
       (loop []
-        (when (and (.valid c) (not (visible?)))
+        (when (and (.valid c) (not (visible-entry? c lo hi)))
           (.advance c)
           (recur)))
       (catch Throwable t
@@ -257,35 +276,69 @@
     (and (== n (alength b))
          (Arrays/equals a 0 (- n 8) b 0 (- n 8)))))
 
+(defn- event-before?
+  "Newest first; an assert before a retract on equal tx."
+  [^Event a ^Event b]
+  (let [ta (.-tx a) tb (.-tx b)]
+    (or (> ta tb)
+        (and (== ta tb) (.-added a) (not (.-added b))))))
+
+(defn- sort-events!
+  "Stable insertion sort of the first `n` events (groups are small)."
+  [^objects evs ^long n]
+  (loop [i 1]
+    (when (< i n)
+      (let [x (aget evs i)]
+        (loop [j (dec i)]
+          (if (and (>= j 0) (event-before? x (aget evs j)))
+            (do (aset evs (inc j) (aget evs j)) (recur (dec j)))
+            (aset evs (inc j) x))))
+      (recur (inc i))))
+  evs)
+
 (defn- read-group
   "Consumes the next group of source entries sharing (index key minus tx) and returns its
-  events with since < tx <= as-of, newest first (an assert before a retract on equal tx)."
-  ^objects [^ICursor src idx ^long lo ^long hi]
-  (loop [evs []]
+  events with since < tx <= as-of, newest first (an assert before a retract on equal tx).
+  Visibility is decided from the key's tx bytes; a datom is decoded only when emitted.
+  `scratch` is a one-element array holding a reusable, growable event buffer."
+  ^objects [^ICursor src ^objects scratch ^long lo ^long hi]
+  (loop []
     (if-not (.valid src)
-      (object-array evs)
+      (object-array 0)
       (let [k0 (.key src)
-            evs (loop [evs evs]
-                  (if (and (.valid src) (same-group? k0 (.key src)))
-                    (let [^Datom d (.datom src)
-                          rtx (.retractTx src)
-                          tx (.-tx d)
-                          evs (if (and (> tx lo) (<= tx hi))
-                                (conj evs (->Event (.key src) d tx true))
-                                evs)
-                          evs (if (and (>= rtx 0) (> rtx lo) (<= rtx hi))
-                                (conj evs (->Event (codec/encode-key idx (.-e d) (.-a d) (.-v d) rtx)
-                                                   (datom/datom (.-e d) (.-a d) (.-v d) rtx false)
-                                                   rtx false))
-                                evs)]
-                      (.advance src)
-                      (recur evs))
-                    evs))]
-        (if (empty? evs)
-          (recur [])
-          (object-array (sort-by (fn [^Event e] [(- (.tx e)) (if (.added e) 0 1)]) evs)))))))
+            n (loop [n 0]
+                (if (and (.valid src) (same-group? k0 (.key src)))
+                  (let [k (.key src)
+                        tx (key-tx k)
+                        rtx (.retractTx src)
+                        a? (and (> tx lo) (<= tx hi))
+                        r? (and (>= rtx 0) (> rtx lo) (<= rtx hi))]
+                    (if (or a? r?)
+                      (let [^Datom d (.datom src)
+                            evs (let [^objects evs (aget scratch 0)]
+                                  (if (<= (+ n 2) (alength evs))
+                                    evs
+                                    (let [g (Arrays/copyOf evs (* 2 (alength evs)))]
+                                      (aset scratch 0 g)
+                                      g)))
+                            n (if a?
+                                (do (aset evs n (->Event k d tx true)) (inc n))
+                                n)
+                            n (if r?
+                                (do (aset evs n (->Event (key-with-tx k rtx)
+                                                         (datom/datom (.-e d) (.-a d) (.-v d) rtx false)
+                                                         rtx false))
+                                    (inc n))
+                                n)]
+                        (.advance src)
+                        (recur n))
+                      (do (.advance src) (recur n))))
+                  n))]
+        (if (zero? n)
+          (recur)
+          (Arrays/copyOf ^objects (sort-events! (aget scratch 0) n) (int n)))))))
 
-(deftype HistoryCursor [^ICursor src idx ^long lo ^long hi
+(deftype HistoryCursor [^ICursor src ^objects scratch ^long lo ^long hi
                         ^:unsynchronized-mutable ^objects buf
                         ^:unsynchronized-mutable ^long pos
                         ^:unsynchronized-mutable ^boolean closed?]
@@ -295,7 +348,7 @@
     (when (< pos (alength buf))
       (set! pos (inc pos))
       (when (>= pos (alength buf))
-        (set! buf (read-group src idx lo hi))
+        (set! buf (read-group src scratch lo hi))
         (set! pos 0)))
     nil)
   (key [_] (when (< pos (alength buf)) (.key ^Event (aget buf pos))))
@@ -309,9 +362,10 @@
     nil))
 
 (defn- history-cursor [^ICursor src idx lo hi]
-  (let [lo (long lo) hi (long hi)]
+  (let [lo (long lo) hi (long hi)
+        scratch (doto (object-array 1) (aset 0 (object-array 16)))]
     (try
-      (->HistoryCursor src idx lo hi (read-group src idx lo hi) 0 false)
+      (->HistoryCursor src scratch lo hi (read-group src scratch lo hi) 0 false)
       (catch Throwable t
         (.close src)
         (throw t)))))

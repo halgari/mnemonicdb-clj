@@ -103,11 +103,11 @@
         _ (m/create-database u)
         c (m/connect u)
         real mnemonic.db/base-db
+        real-succ mnemonic.db/successor-db
         calls (atom 0)
-        r (with-redefs [mnemonic.db/base-db (fn [store]
-                                              (if (<= (swap! calls inc) 2)
-                                                (throw (RuntimeException. "boom"))
-                                                (real store)))]
+        boom! #(when (<= (swap! calls inc) 2) (throw (RuntimeException. "boom")))
+        r (with-redefs [mnemonic.db/successor-db (fn [& args] (boom!) (apply real-succ args))
+                        mnemonic.db/base-db (fn [store] (boom!) (real store))]
             (try @(m/transact c [{:db/ident :x/committed}]) (catch ExecutionException e e)))
         cause (.getCause ^Throwable r)
         data (ex-data cause)]

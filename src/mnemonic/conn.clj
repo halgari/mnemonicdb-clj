@@ -7,8 +7,10 @@
             [mnemonic.db :as db]
             [mnemonic.index :as index]
             [mnemonic.rocks :as rocks]
+            [mnemonic.schema :as schema]
             [mnemonic.tx :as tx])
   (:import (java.io File)
+           (mnemonic.datom Datom)
            (java.util.concurrent CompletableFuture ExecutionException ExecutorService Executors
                                  RejectedExecutionException ThreadFactory TimeUnit)
            (java.util.concurrent.atomic AtomicLong)))
@@ -335,28 +337,59 @@
               :committed? true :tx txid :t (codec/tx->t txid) :tempids (:tempids r)}
              t)))
 
+(defn- schema-touched?
+  "True when `tx-data` (Datoms) asserts or retracts a schema-defining attribute."
+  [tx-data]
+  (boolean (some (fn [^Datom d] (contains? schema/schema-attr-ids (.-a d))) tx-data)))
+
+(defn- db-released-error? [^Throwable t]
+  (= :db.error/db-released (:db/error (ex-data t))))
+
+(defn- prepare-tx
+  "Prepares `tx-data` against the published db. The published db may be released by a
+  caller (d/release-db) at any moment, which makes reads through it fail; nothing has
+  been written yet, so rebuild it and retry."
+  [^Connection conn tx-data]
+  (loop [attempt 0]
+    (let [s @(:state conn)]
+      (when (:released? s) (throw (released-ex)))
+      (when (needs-rebuild? s) (rebuild-db! conn))
+      (let [{:keys [db meta]} @(:state conn)
+            r (try (tx/prepare db meta tx-data)
+                   (catch Throwable t
+                     (if (and (db-released-error? t) (< attempt 3))
+                       ::retry
+                       (throw t))))]
+        (if (identical? r ::retry)
+          (do (rebuild-db! conn) (recur (inc attempt)))
+          [db r])))))
+
 (defn- do-transact
   "Runs on the transactor thread. Once the batch is written the new meta is recorded
   immediately, so a failure while building the new db cannot make the next tx reuse
-  ids; the db is then rebuilt lazily (:stale?) at the start of the next tx."
+  ids; the db is then published incrementally from the prepare result (new snapshot,
+  basis-t, meta, and the schema reloaded only when the tx touched it). If that fails the
+  db is rebuilt lazily (:stale?)."
   [^Connection conn tx-data]
-  (let [s @(:state conn)]
-    (when (:released? s) (throw (released-ex)))
-    (when (needs-rebuild? s) (rebuild-db! conn))
-    (let [{:keys [db meta]} @(:state conn)
-          r (tx/prepare db meta tx-data)
-          _ (rocks/write! (:store conn) (:ops r) {:sync? (file-uri? conn)})
-          _ (swap! (:state conn) assoc :meta (:meta r) :stale? true)
-          ;; the tx is durable: retry the db build once instead of failing the caller
-          new-db (try (rebuild-db! conn)
-                      (catch Throwable _
-                        (try (rebuild-db! conn)
-                             (catch Throwable t
-                               (throw (post-commit-error r t))))))
-          report {:db-before db :db-after new-db :tx-data (:tx-data r) :tempids (:tempids r)}]
-      (doseq [^java.util.Queue q @(:queues conn)]
-        (.add q report))
-      report)))
+  (let [[db r] (prepare-tx conn tx-data)
+        store (:store conn)
+        _ (rocks/write! store (:ops r) {:sync? (file-uri? conn)})
+        _ (swap! (:state conn) assoc :meta (:meta r) :stale? true)
+        publish (fn []
+                  (let [d (db/successor-db store db (codec/tx->t (:tx r)) (:meta r)
+                                           (schema-touched? (:tx-data r)))]
+                    (swap! (:state conn) assoc :db d :stale? false)
+                    d))
+        ;; the tx is durable: retry the db build once instead of failing the caller
+        new-db (try (publish)
+                    (catch Throwable _
+                      (try (rebuild-db! conn)
+                           (catch Throwable t
+                             (throw (post-commit-error r t))))))
+        report {:db-before db :db-after new-db :tx-data (:tx-data r) :tempids (:tempids r)}]
+    (doseq [^java.util.Queue q @(:queues conn)]
+      (.add q report))
+    report))
 
 (defn transact-async
   "Enqueues `tx-data`; returns a future of the tx report {:db-before :db-after :tx-data

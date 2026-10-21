@@ -99,10 +99,12 @@
   (let [n (quot (count args) 2)]
     (not= (take n args) (drop n args))))
 
-(defn- lt [a b] (neg? (compare a b)))
-(defn- gt [a b] (pos? (compare a b)))
-(defn- lte [a b] (not (pos? (compare a b))))
-(defn- gte [a b] (not (neg? (compare a b))))
+(defmacro ^:private both-long? [a b] `(and (instance? Long ~a) (instance? Long ~b)))
+
+(defn- lt [a b] (if (both-long? a b) (< (long a) (long b)) (neg? (compare a b))))
+(defn- gt [a b] (if (both-long? a b) (> (long a) (long b)) (pos? (compare a b))))
+(defn- lte [a b] (if (both-long? a b) (<= (long a) (long b)) (not (pos? (compare a b)))))
+(defn- gte [a b] (if (both-long? a b) (>= (long a) (long b)) (not (neg? (compare a b)))))
 
 (defn- unsupported-fulltext [& _]
   (throw (qerror :db.error/unsupported "fulltext is not supported")))

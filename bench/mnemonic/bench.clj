@@ -14,7 +14,8 @@
             [mnemonic.bench.backend :as be :refer [call tx! db]]
             [mnemonic.bench.data :as data]
             [mnemonic.bench.util :as u :refer [size timed-ns]])
-  (:import (java.util Random)))
+  (:import (java.util Random)
+           (org.rocksdb FlushOptions RocksDB)))
 
 (set! *warn-on-reflection* true)
 
@@ -375,6 +376,107 @@
                  ["db dir size MB" size-mb :lo]]
        :checks-m {}})))
 
+;; --- cold point lookups (flushed SSTs, empty block cache) and multi-threaded readers
+
+(defn- flush-store!
+  "Flushes every column family to SSTs (plain RocksDB calls: works on any version)."
+  [store]
+  (with-open [fo (doto (FlushOptions.) (.setWaitForFlush true))]
+    (.flush ^RocksDB (:db store) fo ^java.util.List (vec (vals (:cfs store))))))
+
+(defn- compact-store! [store]
+  (doseq [h (vals (:cfs store))] (.compactRange ^RocksDB (:db store) ^org.rocksdb.ColumnFamilyHandle h)))
+
+(defn- entity-sum
+  "Reads three attributes of entity `eid`; the sum keeps the work observable."
+  ^long [b db* ^long eid]
+  (let [e (call b :entity db* eid)]
+    (+ (long (:p/age e)) (count ^String (:p/name e)) (count ^String (:p/email e)))))
+
+(defn- pass-ns
+  "Nanoseconds to run (f x) over every element of `xs` (a long array)."
+  ^long [^longs xs f]
+  (let [t0 (System/nanoTime)]
+    (dotimes [i (alength xs)] (f (aget xs i)))
+    (- (System/nanoTime) t0)))
+
+(defn cold-lookup
+  "mnemonic-file only. The loaded dataset is flushed to SST files (and compacted when
+  MNEMONIC_BENCH_COMPACT is set; otherwise the L0 files stay as flushed, where bloom
+  filters matter most), the connection is reopened (empty block cache), then random
+  point lookups run: entities and lookup refs that hit and that miss, first pass cold,
+  second pass warm."
+  [b sz]
+  (let [labels ["cold entity+3 attrs/sec" "warm entity+3 attrs/sec"
+                "cold entid hit/sec" "warm entid hit/sec" "entid miss/sec (distinct)"
+                "entid miss/sec (same shape)"]]
+    (if-not (= "mnemonic-file" (:name b))
+      {:metrics (mapv (fn [l] [l nil :hi]) labels)}
+      (let [{:keys [ctx eids]} (dataset! b sz)
+            uri (:uri ctx)]
+        (flush-store! (:store (:conn ctx)))
+        (when (System/getenv "MNEMONIC_BENCH_COMPACT") (compact-store! (:store (:conn ctx))))
+        (call b :release (:conn ctx))
+        (u/gc!)
+        (let [conn (call b :connect uri)
+              _ (swap! datasets assoc-in [(:name b) :ctx :conn] conn)
+              db* (call b :db conn)
+              n (:lookups sz)
+              ids (random-eids eids n 51)
+              ent (fn [eid] (entity-sum b db* eid))
+              ents (:entities sz)
+              r (Random. 52)
+              hit-ids (long-array (repeatedly n #(.nextInt r (int ents))))
+              miss-ids (long-array (repeatedly n #(+ ents 10 (.nextInt r 1000000))))
+              hit (fn [i] (m/entid db* [:p/email (data/email i)]))
+              miss (fn [i] (m/entid db* [:p/email (str "nobody-" i "@nowhere.example")]))
+              miss2 (fn [i] (m/entid db* [:p/email (data/email i)]))
+              c1 (pass-ns ids ent)
+              c2 (pass-ns ids ent)
+              h1 (pass-ns hit-ids hit)
+              h2 (pass-ns hit-ids hit)
+              m1 (pass-ns miss-ids miss)
+              m2 (pass-ns miss-ids miss2)]
+          {:metrics [[(first labels) (per-sec n c1) :hi]
+                     [(second labels) (per-sec n c2) :hi]
+                     [(nth labels 2) (per-sec n h1) :hi]
+                     [(nth labels 3) (per-sec n h2) :hi]
+                     [(nth labels 4) (per-sec n m1) :hi]
+                     [(nth labels 5) (per-sec n m2) :hi]]})))))
+
+(defn mt-lookup
+  "Entity lookups and lookup-ref resolution from 1, 4 and 8 reader threads on one db
+  value (override with MNEMONIC_BENCH_THREADS=1,2,4,...). Total ops/sec."
+  [b sz]
+  (let [{:keys [ctx eids]} (dataset! b sz)
+        db* (db ctx)
+        threads (mapv #(Long/parseLong %) (str/split (u/env "MNEMONIC_BENCH_THREADS" "1,4,8") #","))
+        n (:lookups sz)
+        ^longs ids (random-eids eids n 53)
+        entid-fn (if (= :datomic (:kind b)) d/entid m/entid)
+        r (Random. 54)
+        refs (vec (repeatedly n #(vector :p/email (data/email (.nextInt r (int (:entities sz)))))))
+        run (fn [t work]
+              (let [chunk (quot n t)
+                    sums (long-array t)
+                    ts (mapv (fn [k]
+                               (Thread. ^Runnable
+                                        (fn [] (aset sums k (long (work (* k chunk) (* (inc k) chunk)))))))
+                             (range t))
+                    t0 (System/nanoTime)]
+                (doseq [^Thread th ts] (.start th))
+                (doseq [^Thread th ts] (.join th))
+                [(per-sec (* chunk t) (- (System/nanoTime) t0)) (reduce + sums)]))
+        ent-work (fn [^long from ^long to]
+                   (loop [i from acc 0] (if (< i to) (recur (inc i) (+ acc (entity-sum b db* (aget ids i)))) acc)))
+        ref-work (fn [^long from ^long to]
+                   (loop [i from acc 0] (if (< i to) (recur (inc i) (if (entid-fn db* (nth refs i)) (inc acc) acc)) acc)))]
+    (ent-work 0 (min n 20000))
+    (ref-work 0 (min n 20000))
+    {:metrics (vec (concat
+                    (for [t threads] [(str "entity+3 attrs/sec, " t " threads") (first (run t ent-work)) :hi])
+                    (for [t threads] [(str "entid [:p/email x]/sec, " t " threads") (first (run t ref-work)) :hi])))}))
+
 (def workloads
   [["bulk-load" bulk-load]
    ["small-tx" small-tx]
@@ -384,7 +486,9 @@
    ["lookup-ref" lookup-ref]
    ["queries" queries]
    ["as-of-history" as-of-history]
-   ["open-reopen" open-reopen]])
+   ["open-reopen" open-reopen]
+   ["cold-lookup" cold-lookup]
+   ["mt-lookup" mt-lookup]])
 
 ;; ------------------------------------------------------------------ reporting
 

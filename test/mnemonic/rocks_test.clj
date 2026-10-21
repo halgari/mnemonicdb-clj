@@ -190,3 +190,178 @@
         (.close c)
         (is (zero? (count (:snaps s))) "freed when the last cursor closes"))
       (finally (r/close-store s)))))
+
+;; ------------------------------------------------------------------ iterator pool
+
+(deftest cursor-open-close-recycles-iterators
+  (let [s (r/open-store {:path "mem-pool" :mem? true})]
+    (try
+      (r/write! s [[:put :eavt (bs 1) (bs 1)] [:put :eavt (bs 2) (bs 2)]] {})
+      (let [snap (r/snapshot s)]
+        (dotimes [_ 50]
+          (with-open [c (r/raw-cursor s :eavt snap)]
+            (is (= [1] (ub (.seekKey c (bs 1)))))))
+        (is (= 1 (count (:cursors s))) "one native iterator serves all sequential cursors")
+        (with-open [a (r/raw-cursor s :eavt snap)
+                    b (r/raw-cursor s :eavt snap)]
+          (is (= [1] (ub (.seekKey a (bs 1)))))
+          (is (= [2] (ub (.seekKey b (bs 2)))))
+          (is (= [1] (ub (.key a))) "simultaneous cursors are independent")
+          (is (= 2 (count (:cursors s)))))
+        (r/release-snapshot s snap)
+        (is (zero? (count (:cursors s))) "release drains the idle iterators")
+        (is (zero? (count (:snaps s))) "and frees the snapshot"))
+      (finally (r/close-store s)))))
+
+(deftest recycled-cursor-looks-fresh-and-closed-lease-stays-closed
+  (let [s (r/open-store {:path "mem-pool-fresh" :mem? true})
+        kind (fn [f] (try (f) :ok (catch clojure.lang.ExceptionInfo e (:db/error (ex-data e)))))]
+    (try
+      (r/write! s [[:put :eavt (bs 1) (bs 1)]] {})
+      (let [snap (r/snapshot s)
+            c1 (r/raw-cursor s :eavt snap)]
+        (.seekToFirst c1)
+        (is (true? (.isValid c1)))
+        (.close c1)
+        (is (= :db.error/cursor-closed (kind #(.isValid c1))) "closed lease")
+        (with-open [c2 (r/raw-cursor s :eavt snap)]
+          (is (false? (.isValid c2)) "a recycled iterator is not positioned")
+          (is (= :db.error/cursor-closed (kind #(.next c1))) "a stale lease never touches the recycled iterator"))
+        (r/release-snapshot s snap))
+      (finally (r/close-store s)))))
+
+(deftest release-with-leased-and-idle-iterators
+  (let [s (r/open-store {:path "mem-pool-release" :mem? true})]
+    (try
+      (r/write! s [[:put :eavt (bs 1) (bs 1)] [:put :aevt (bs 1) (bs 1)]] {})
+      (let [snap (r/snapshot s)
+            leased (r/raw-cursor s :eavt snap)]
+        (.close (r/raw-cursor s :aevt snap))     ; idle in the pool
+        (.seekToFirst leased)
+        (r/release-snapshot s snap)
+        (is (= 1 (count (:cursors s))))
+        (is (= 1 (count (:snaps s))) "kept alive by the leased cursor")
+        (is (true? (.isValid leased)) "a leased cursor keeps working")
+        (.close leased)                          ; released snapshot: destroyed, not pooled
+        (is (zero? (count (:cursors s))))
+        (is (zero? (count (:snaps s)))))
+      (finally (r/close-store s)))))
+
+(deftest concurrent-cursors-and-close-store
+  (testing "threads opening/closing pooled cursors while the store closes never crash"
+    (dotimes [round 5]
+      (let [s (r/open-store {:path (str "mem-pool-race-" round) :mem? true})
+            _ (r/write! s (for [i (range 200)] [:put :eavt (bs 0 i) (bs i)]) {})
+            snap (r/snapshot s)
+            stop (atom false)
+            ok-kinds #{:db.error/connection-released :db.error/db-released}
+            workers (doall
+                     (for [_ (range 6)]
+                       (future
+                         (loop [n 0]
+                           (if @stop
+                             n
+                             (do (try
+                                   (with-open [c (r/raw-cursor s :eavt snap)]
+                                     (loop [k (.seekKey c (bs 0 0)) i 0]
+                                       (when (and k (< i 20)) (recur (.nextKey c) (inc i)))))
+                                   (catch clojure.lang.ExceptionInfo e
+                                     (when-not (ok-kinds (:db/error (ex-data e))) (throw e))))
+                                 (recur (inc n))))))))]
+        (Thread/sleep 30)
+        (r/close-store s)
+        (reset! stop true)
+        (is (every? #(>= (long @%) 0) workers))))))
+
+;; ------------------------------------------------------------------ prefix bloom filters
+
+(defn- prefix-scan
+  "Keys read through a prefix cursor the way index.clj does: seek, then next while the
+  key starts with `prefix`."
+  [s snap cf ^bytes prefix]
+  (with-open [c (r/raw-cursor s cf snap prefix)]
+    (let [n (alength prefix)]
+      (loop [k (.seekKey c prefix) acc []]
+        (if (and k (>= (alength ^bytes k) n) (java.util.Arrays/equals ^bytes k 0 n prefix 0 n))
+          (recur (.nextKey c) (conj acc (ub k)))
+          acc)))))
+
+(defn- expected-scan [keys prefix]
+  (let [p (ub prefix)]
+    (vec (filter #(= p (vec (take (count p) %))) keys))))
+
+(defn- bytewise [a b]
+  (java.util.Arrays/compareUnsigned ^bytes (apply bs a) ^bytes (apply bs b)))
+
+(defn- prefix-test-keys
+  "Clustered keys: `head` bytes (several keys share each 8/16/17/25-byte prefix) plus a
+  0..6 byte tail."
+  [^java.util.Random rnd head]
+  (vec (sort bytewise
+             (distinct
+              (for [_ (range 3000)]
+                (vec (concat (repeat 7 0) [(.nextInt rnd 6)]
+                             (repeat (- head 11) 0)
+                             [(.nextInt rnd 5) (.nextInt rnd 4) (.nextInt rnd 3)]
+                             (repeatedly (.nextInt rnd 7) #(.nextInt rnd 3)))))))))
+
+(defn- random-probe
+  "A prefix of an existing key (any length) or of an existing key with one byte changed
+  (usually absent)."
+  [^java.util.Random rnd keys*]
+  (let [k (nth keys* (.nextInt rnd (count keys*)))
+        k (if (zero? (.nextInt rnd 3))
+            (update k (.nextInt rnd (count k)) #(mod (inc %) 7))
+            k)]
+    (vec (take (inc (.nextInt rnd (count k))) k))))
+
+(deftest prefix-cursors-match-total-order-across-sst-levels
+  (testing "random prefixes of every length, keys spread over memtable and several SSTs"
+    (doseq [[cf head] [[:eavt 16] [:aevt-h 16] [:vaet 16] [:avet r/avet-prefix-len] [:avet-h (inc r/avet-prefix-len)]]]
+      (let [dir (temp-dir)
+            path (str (.resolve dir "db"))
+            rnd (java.util.Random. 7)
+            keys* (prefix-test-keys rnd head)]
+        (try
+          (let [s (r/open-store {:path path})]
+            (try
+              (doseq [[i part] (map-indexed vector (partition-all 700 (shuffle keys*)))]
+                (r/write! s (for [k part] [:put cf (apply bs k) (bs 0)]) {})
+                (when (even? i) (r/flush! s)))
+              (let [snap (r/snapshot s)]
+                (dotimes [_ 1200]
+                  (let [p (random-probe rnd keys*)]
+                    (is (= (expected-scan keys* (apply bs p)) (prefix-scan s snap cf (apply bs p)))
+                        (str cf " prefix " p))))
+                (r/release-snapshot s snap))
+              (finally (r/close-store s))))
+          (finally (delete-tree dir)))))))
+
+(deftest stores-written-without-prefix-extractor-open-and-read-correctly
+  (testing "existing stores (no extractor) stay readable; new and compacted files get the filter"
+    (let [dir (temp-dir)
+          path (str (.resolve dir "db"))
+          rnd (java.util.Random. 11)
+          keys* (prefix-test-keys rnd 16)
+          extra (vec (repeat 24 9))
+          all (conj keys* extra)           ; extra sorts last
+          check (fn [s]
+                  (let [snap (r/snapshot s)]
+                    (dotimes [_ 800]
+                      (let [p (apply bs (random-probe rnd all))]
+                        (is (= (expected-scan all p) (prefix-scan s snap :eavt p)))))
+                    (r/release-snapshot s snap)))]
+      (try
+        (let [s (r/open-store {:path path :prefix-bloom? false})]
+          (r/write! s (for [k keys*] [:put :eavt (apply bs k) (bs 0)]) {})
+          (r/flush! s)
+          (r/close-store s))
+        (let [s (r/open-store {:path path})]
+          (try
+            (r/write! s [[:put :eavt (apply bs extra) (bs 0)]] {})
+            (r/flush! s)
+            (check s)
+            (r/compact! s)
+            (check s)
+            (finally (r/close-store s))))
+        (finally (delete-tree dir))))))

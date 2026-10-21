@@ -15,9 +15,10 @@
             [mnemonic.query.aggregates :as aggregates]
             [mnemonic.query.fns :as fns]
             [mnemonic.query.parser :as parser])
-  (:import (java.util ArrayList Arrays Collection HashMap HashSet LinkedHashMap LinkedHashSet List)
+  (:import (java.util ArrayList Arrays Collection Date HashMap HashSet LinkedHashMap LinkedHashSet List UUID)
            (java.util.concurrent TimeoutException)
-           (mnemonic.datom Datom)))
+           (mnemonic.datom Datom)
+           (mnemonic.schema Attr)))
 
 (set! *warn-on-reflection* true)
 
@@ -303,9 +304,137 @@
       (aset r i (datom-comp d (long (nth new-pos i)))))
     r))
 
+;; ---- AVET range pushdown
+
+(def ^:private no-extra (object-array 0))
+
+(defn- cache-key?
+  "True when `x` is a plain value whose equals / hashCode agree with how the pattern
+  resolves it (so equal keys always resolve to the same seek)."
+  [x]
+  (or (instance? Long x) (instance? String x) (keyword? x) (instance? Boolean x)
+      (instance? UUID x) (instance? Date x)))
+
+(def ^:private cmp-ops {'< :lt, '<= :le, '> :gt, '>= :ge, '= :eq})
+(def ^:private flip-op {:lt :gt, :le :ge, :gt :lt, :ge :le, :eq :eq})
+
+(defn- range-hints
+  "Comparison predicates on `vsym` found at the head of `clauses` (the clauses that will
+  run right after the pattern binding it): [{:op :lt|:le|:gt|:ge|:eq :bound term} ...],
+  with `vsym` as the left operand. Stops at the first other clause so that no clause
+  that could observe or fail on the out-of-range values is skipped."
+  [vsym clauses]
+  (loop [cs (seq clauses) acc []]
+    (if-let [c (first cs)]
+      (let [op (when (= :pred (:clause c)) (get cmp-ops (:fn c)))
+            [x y :as args] (:args c)
+            var? (fn [t] (and (= :var (:type t)) (= vsym (:sym t))))
+            ok? (fn [t] (#{:var :const} (:type t)))]
+        (if (and op (== 2 (count args)) (ok? x) (ok? y) (not (and (var? x) (var? y))))
+          (cond
+            (var? x) (recur (next cs) (conj acc {:op op :bound y}))
+            (var? y) (recur (next cs) (conj acc {:op (flip-op op) :bound x}))
+            :else acc)
+          acc))
+      acc)))
+
+(defn- hint-clause
+  "Data pattern `c` annotated with the range predicates that follow it."
+  [c cs pending]
+  (if (and (= :data-pattern (:clause c)) (= :var (:type (get (:terms c) 2))))
+    (let [hs (range-hints (:sym (get (:terms c) 2))
+                          (concat pending (take-while #(= :pred (:clause %)) cs)))]
+      (if (seq hs) (assoc c ::range-hints hs) c))
+    c))
+
+(defn- range-vt-ok? [vt b]
+  (case vt
+    :db.type/long (instance? Long b)
+    :db.type/instant (instance? Date b)
+    false))
+
+(defn- range-bounds
+  "[lo hi] (either may be nil = open) covering, for every tuple of the relation, the
+  values that can pass all `hints`; nil when no usable bound exists or a bound has a
+  type other than the attribute's (the predicate then runs unfiltered)."
+  [hints vidx ^ArrayList tuples vt]
+  (let [hs (into [] (keep (fn [{:keys [op bound]}]
+                            (when-let [b (if (= :const (:type bound))
+                                           bound
+                                           (when-let [i (get vidx (:sym bound))] {:idx (long i)}))]
+                              [op b])))
+                 hints)]
+    (when (seq hs)
+      (let [n (.size tuples)]
+        (loop [ti 0 hull-lo nil hull-hi nil lo-open? false hi-open? false]
+          (if (< ti n)
+            (let [^objects t (.get tuples ti)
+                  r (reduce
+                     (fn [[lo hi] [op b]]
+                       (let [bv (if (contains? b :idx) (aget t (long (:idx b))) (:val b))]
+                         (if-not (range-vt-ok? vt bv)
+                           (reduced nil)
+                           (let [lo (if (contains? #{:gt :ge :eq} op)
+                                      (if (or (nil? lo) (pos? (compare bv lo))) bv lo)
+                                      lo)
+                                 hi (if (contains? #{:lt :le :eq} op)
+                                      (if (or (nil? hi) (neg? (compare bv hi))) bv hi)
+                                      hi)]
+                             [lo hi]))))
+                     [nil nil] hs)]
+              (when r
+                (let [[lo hi] r]
+                  (recur (inc ti)
+                         (cond lo-open? nil (nil? lo) nil (nil? hull-lo) lo (neg? (compare lo hull-lo)) lo :else hull-lo)
+                         (cond hi-open? nil (nil? hi) nil (nil? hull-hi) hi (pos? (compare hi hull-hi)) hi :else hull-hi)
+                         (or lo-open? (nil? lo))
+                         (or hi-open? (nil? hi))))))
+            (when (or hull-lo hull-hi)
+              [hull-lo hull-hi])))))))
+
+(defn- prefix-successor
+  "Smallest byte string greater than every string starting with `p`; nil when none."
+  ^bytes [^bytes p]
+  (loop [i (dec (alength p))]
+    (when (>= i 0)
+      (if (== 0xFF (bit-and 0xFF (aget p i)))
+        (recur (dec i))
+        (let [r (Arrays/copyOf p (inc i))]
+          (aset r i (unchecked-byte (inc (bit-and 0xFF (aget r i)))))
+          r)))))
+
+(deftype StopCursor [^mnemonic.index.ICursor c ^bytes stop]
+  mnemonic.index.ICursor
+  (valid [_] (and (.valid c) (or (nil? stop) (neg? (Arrays/compareUnsigned ^bytes (.key c) stop)))))
+  (advance [_] (.advance c))
+  (key [_] (.key c))
+  (datom [_] (.datom c))
+  (retractTx [_] (.retractTx c))
+  (close [_] (.close c)))
+
+(defn- range-db
+  "A db view whose reads are the AVET entries of `db` from `start` up to (excluding) `stop`."
+  [db ^bytes start ^bytes stop]
+  (reify index/IDb
+    (-view [_ _ _] (->StopCursor (index/-seek-view db :avet start) stop))))
+
+(defn- range-plan
+  "[range-db] for a bounded AVET scan of the pattern, or nil when not applicable. The
+  predicates stay as post-filters, so the bounds only have to cover every passing value."
+  [db rel specs hints [e a v _ _]]
+  (when (and hints (free? e) (free? v) (not (free? a))
+             (contains? #{:free :blank} (:kind (nth specs 0))))
+    (let [^Attr attr (get (:attrs (index/-schema db)) a)
+          vt (:value-type attr)]
+      (when (contains? #{:db.type/long :db.type/instant} vt)
+        (when-let [[lo hi] (range-bounds hints (var-index rel) (:tuples rel) vt)]
+          (range-db db
+                    (codec/encode-prefix :avet (if (nil? lo) [a] [a lo]))
+                    (prefix-successor (codec/encode-prefix :avet (if (nil? hi) [a] [a hi])))))))))
+
 (def ^:private hash-join-threshold 1000)
 
-(defn- exec-db-pattern [ctx db rel plan terms]
+(defn- exec-db-pattern [ctx db rel plan terms hints]
   (let [{:keys [specs new-syms new-pos bound-pos same]} plan
         ^ArrayList tuples (:tuples rel)
         out (ArrayList.)
@@ -321,35 +450,61 @@
         (when-let [res (resolve-pattern db specs (object-array 0) true)]
           (when-let [sp (scan-plan res terms)]
             (when-let [pass? (datom-filter res (nth sp 2) same)]
-              (scan! ctx db sp pass?
+              (scan! ctx (or (range-plan db rel specs hints res) db) sp pass?
                      (fn [^Datom d]
                        (check-deadline! ctx)
                        (each-tuple [t tuples ctx] (emit! t d)))))))
 
-        ;; large relation, constant attribute: scan once and hash join
+;; large relation, constant attribute: scan once and hash join
         (and (> n hash-join-threshold) (= :const (:kind (nth specs 1))))
         (when-let [res (resolve-pattern db specs (object-array 0) true)]
           (when-let [sp (scan-plan res terms)]
             (when-let [pass? (datom-filter res (nth sp 2) same)]
-              (let [groups (HashMap.)]
+              (let [groups (HashMap.)
+                    single? (== 1 (count bound-pos))
+                    bp0 (long (first bound-pos))]
                 (each-tuple [t tuples ctx]
                   (when-let [full (resolve-pattern db specs t false)]
-                    (let [k (mapv #(nth full %) bound-pos)
+                    (let [k (if single?
+                              (nth full bp0)
+                              (mapv #(nth full %) bound-pos))
                           ^ArrayList g (or (.get groups k)
                                            (let [g (ArrayList.)] (.put groups k g) g))]
                       (.add g t))))
                 (scan! ctx db sp pass?
                        (fn [^Datom d]
-                         (when-let [^ArrayList g (.get groups (mapv #(datom-comp d %) bound-pos))]
+                         (when-let [^ArrayList g (.get groups (if single?
+                                                                (datom-comp d bp0)
+                                                                (mapv #(datom-comp d %) bound-pos)))]
                            (dotimes [i (.size g)] (emit! (.get g i) d)))))))))
 
-        ;; otherwise a seek per tuple
+        ;; otherwise a seek per tuple, once per distinct bound key
         :else
-        (each-tuple [t tuples ctx]
-          (when-let [res (resolve-pattern db specs t false)]
-            (when-let [sp (scan-plan res terms)]
-              (when-let [pass? (datom-filter res (nth sp 2) same)]
-                (scan! ctx db sp pass? (fn [^Datom d] (emit! t d)))))))))
+        (let [cache (HashMap.)
+              bidx (mapv #(long (:idx (nth specs %))) bound-pos)
+              single? (== 1 (count bidx))
+              b0 (long (first bidx))
+              seek! (fn [^objects t f]
+                      (when-let [res (resolve-pattern db specs t false)]
+                        (when-let [sp (scan-plan res terms)]
+                          (when-let [pass? (datom-filter res (nth sp 2) same)]
+                            (scan! ctx db sp pass? f)))))]
+          (each-tuple [t tuples ctx]
+            (let [k (if single?
+                      (aget t b0)
+                      (let [ks (object-array (count bidx))]
+                        (dotimes [i (count bidx)] (aset ks i (aget t (long (nth bidx i)))))
+                        (Arrays/asList ks)))]
+              (if (if single? (cache-key? k) (every? cache-key? (.toArray ^List k)))
+                (let [^ArrayList rows
+                      (or (.get cache k)
+                          (let [rows (ArrayList.)]
+                            (seek! t (fn [^Datom d] (.add rows (if no-new? no-extra (new-values d new-pos)))))
+                            (.put cache k rows)
+                            rows))]
+                  (dotimes [i (.size rows)]
+                    (.add out (if no-new? t (extend-tuple t (.get rows i))))))
+                (seek! t (fn [^Datom d] (emit! t d)))))))))
     result))
 
 (defn- exec-coll-pattern [ctx coll rel plan]
@@ -390,11 +545,11 @@
   (throw (qerror :db.error/unsupported (str "Unsupported clause: " (pr-str (:clause clause)))
                  {:clause clause})))
 
-(defmethod execute-clause :data-pattern [ctx rel {:keys [src terms]}]
+(defmethod execute-clause :data-pattern [ctx rel {:keys [src terms] hints ::range-hints}]
   (let [s (source ctx src)
         plan (compile-pattern (:vars rel) terms)]
     (if (db? s)
-      (exec-db-pattern ctx s rel plan terms)
+      (exec-db-pattern ctx s rel plan terms hints)
       (exec-coll-pattern ctx s rel plan))))
 
 (defmethod execute-clause :and [ctx rel {:keys [clauses]}]
@@ -495,7 +650,7 @@
       (if-let [c (first cs)]
         (if (and (deferrable? c) (not (clause-ready? ctx rel c)))
           (recur rel (next cs) (conj pending c))
-          (let [[rel' pending'] (drain (execute-clause ctx rel c) pending)]
+          (let [[rel' pending'] (drain (execute-clause ctx rel (hint-clause c (next cs) pending)) pending)]
             (recur rel' (next cs) pending')))
         (if (seq pending)
           (let [vidx (var-index rel)
