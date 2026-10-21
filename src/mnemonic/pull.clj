@@ -1,13 +1,308 @@
 (ns mnemonic.pull
-  "Pull. Stubs until the pull task.")
+  "Pull: pattern parsing into an AST and evaluation over EAVT/VAET.
+
+  Semantics follow Datomic (probed against 1.0.7745):
+  - results with no content are nil; empty nested results are dropped
+  - cardinality-many values are vectors, limited to 1000 unless :limit says otherwise
+  - component refs without a sub-pattern expand like a wildcard pull
+  - recursion: expanding a recursive attribute of node n adds n to the path's `seen`
+    set (shared by all recursive attributes and inherited by nested sub-patterns);
+    an entity pulled while in `seen` is in revisit mode, where its recursive children
+    are not expanded; a child that is not expanded (revisit mode, or past the depth
+    of its recursive attribute) is rendered as {:db/id n} when the pattern pulls
+    :db/id and dropped otherwise"
+  (:require [mnemonic.entity :as entity]
+            [mnemonic.index :as index]
+            [mnemonic.schema :as schema]
+            [mnemonic.tx :as tx])
+  (:import (java.util.concurrent ConcurrentHashMap)
+           (java.util.concurrent.atomic AtomicLong)
+           (mnemonic.datom Datom)
+           (mnemonic.schema Attr)))
 
 (set! *warn-on-reflection* true)
 
-(defn- unsupported [what]
-  (throw (ex-info (str what " is not implemented yet")
-                  {:db/error :db.error/unsupported
-                   :cognitect.anomalies/category :cognitect.anomalies/unsupported
-                   :feature what})))
+;; ------------------------------------------------------------------ AST
 
-(defn pull [db pattern eid] (unsupported "pull"))
-(defn pull-many [db pattern eids] (unsupported "pull-many"))
+(defrecord PullPattern [wildcard? id? attrs override])
+
+(defrecord AttrSpec [attr reverse? key limit default xform sub recur rid])
+
+(def ^:private default-limit 1000)
+
+(defn- spec-error [kind msg data]
+  (tx/error kind msg data))
+
+(defn- invalid-attr-spec [x]
+  (spec-error :db.error/invalid-attr-spec
+              (str "Cannot interpret as an attribute spec: " (pr-str x) " of class: " (class x))
+              {:spec x}))
+
+(defn- invalid-attr-identifier [x]
+  (spec-error :db.error/invalid-attr-spec
+              (str "Attribute identifier " x " of class: class java.lang.String"
+                   " does not start with a colon")
+              {:spec x}))
+
+(def ^:private ^AtomicLong rid-counter (AtomicLong. 0))
+
+(defn- resolve-xform [x]
+  (cond
+    (nil? x) nil
+    (fn? x) x
+    (var? x) x
+    (keyword? x) x
+    (symbol? x) (or (if (namespace x)
+                      (try (requiring-resolve x) (catch Exception _ nil))
+                      (ns-resolve 'clojure.core x))
+                    (throw (spec-error :db.error/invalid-attr-spec
+                                       (str "Cannot resolve :xform " x) {:xform x})))
+    :else (throw (spec-error :db.error/invalid-attr-spec
+                             (str "Cannot interpret as a :xform function: " (pr-str x))
+                             {:xform x}))))
+
+(defn- legacy-head? [x]
+  (and (symbol? x) (#{"limit" "default"} (name x))))
+
+(defn- parse-options
+  "Option map {:as :limit :default :xform} from alternating key/value args."
+  [spec-form args]
+  (when (odd? (count args))
+    (throw (invalid-attr-spec spec-form)))
+  (reduce (fn [opts [k v]]
+            (case k
+              :as (assoc opts :as v)
+              :limit (assoc opts :limit (if (or (nil? v) (number? v)) v default-limit))
+              :default (assoc opts :default v)
+              :xform (assoc opts :xform (resolve-xform v))
+              opts))
+          {} (partition 2 args)))
+
+(defn- parse-attr-expr
+  "[attr-keyword options] for an attribute expression: a keyword, a seq
+  `(attr :opt val ...)`, or the legacy `(limit attr n)` / `(default attr v)`."
+  [form]
+  (cond
+    (keyword? form) [form {}]
+    (and (sequential? form) (seq form))
+    (let [[head & more :as all] form]
+      (cond
+        (legacy-head? head)
+        (let [[a v] more]
+          (when-not (keyword? a) (throw (invalid-attr-spec form)))
+          [a (if (< (count more) 2)
+               {}
+               (if (= "limit" (name head))
+                 {:limit (if (or (nil? v) (number? v)) v default-limit)}
+                 {:default v}))])
+
+        (keyword? head) [head (parse-options form more)]
+        (string? head) (throw (entity/not-a-keyword head))
+        :else (throw (invalid-attr-spec all))))
+    :else (throw (invalid-attr-spec form))))
+
+(declare parse-seq)
+
+(defn- parse-recursion-or-sub
+  "[sub recur] for the value of a map spec entry."
+  [v]
+  (cond
+    (= '... v) [nil {:depth nil}]
+    (and (integer? v) (pos? (long v))) [nil {:depth (long v)}]
+    (or (vector? v) (seq? v) (list? v)) [(parse-seq v) nil]
+    :else (throw (spec-error :db.error/invalid-recur-limit
+                             (str "Cannot interpret as a recursive pull specification: " v)
+                             {:value v}))))
+
+(defn- make-spec [kw opts sub recur]
+  (let [fk (entity/reverse-attr-name kw)]
+    (map->AttrSpec
+     {:attr (or fk kw)
+      :reverse? (boolean fk)
+      :key (if (contains? opts :as) (:as opts) kw)
+      :limit (if (contains? opts :limit) (:limit opts) default-limit)
+      :default (:default opts)
+      :xform (:xform opts)
+      :sub sub
+      :recur recur
+      :rid (when recur (.incrementAndGet rid-counter))})))
+
+(defn- parse-seq [pattern]
+  (when-not (or (sequential? pattern) (nil? pattern))
+    (throw (spec-error :db.error/invalid-attr-spec
+                       (str "Cannot interpret as a pull pattern: " (pr-str pattern))
+                       {:pattern pattern})))
+  (let [seen (volatile! #{})
+        wildcard? (volatile! false)
+        id? (volatile! false)
+        specs (volatile! [])
+        add! (fn [kw opts sub recur]
+               (if (= :db/id kw)
+                 (when-not (or sub recur) (vreset! id? true))
+                 (let [spec (make-spec kw opts sub recur)
+                       k [(:attr spec) (:reverse? spec)]]
+                   (when (contains? @seen k)
+                     (throw (spec-error :pull/duplicate-attribute
+                                        (str "Multiple specifications for " kw)
+                                        {:attribute kw})))
+                   (vswap! seen conj k)
+                   (vswap! specs conj spec))))]
+    (doseq [form pattern]
+      (cond
+        (= '* form) (vreset! wildcard? true)
+        (map? form)
+        (doseq [[ae v] form]
+          (let [[kw opts] (parse-attr-expr ae)
+                [sub recur] (parse-recursion-or-sub v)]
+            (add! kw opts sub recur)))
+        (or (keyword? form) (sequential? form))
+        (let [[kw opts] (parse-attr-expr form)]
+          (add! kw opts nil nil))
+        (string? form) (throw (invalid-attr-identifier form))
+        :else (throw (invalid-attr-identifier (str form)))))
+    (let [specs @specs]
+      (->PullPattern @wildcard? (or @wildcard? @id?) specs
+                     (into #{} (comp (remove :reverse?) (map :attr)) specs)))))
+
+(def ^:private ^ConcurrentHashMap parse-cache (ConcurrentHashMap.))
+
+(defn parse-pattern
+  "Pattern -> AST. An AST is returned unchanged. Parsed patterns are cached."
+  [pattern]
+  (if (instance? PullPattern pattern)
+    pattern
+    (if (nil? pattern)
+      (->PullPattern false false [] #{})
+      (or (.get parse-cache pattern)
+          (let [ast (parse-seq pattern)]
+            (when (> (.size parse-cache) 1000) (.clear parse-cache))
+            (.put parse-cache pattern ast)
+            ast)))))
+
+(def ^:private wildcard-ast (parse-seq '[*]))
+
+;; ------------------------------------------------------------------ evaluation
+
+(def ^:private empty-state {:seen #{} :depths {} :revisit false})
+
+(declare pull-entity)
+
+(defn- ref-attr? [^Attr attr]
+  (= :db.type/ref (:value-type attr)))
+
+(defn- default-ref-value
+  "A ref target without a sub-pattern: components expand, other refs are {:db/id}."
+  [db sch ^Attr attr eid]
+  (if (:component? attr)
+    (pull-entity db sch eid wildcard-ast empty-state)
+    {:db/id eid}))
+
+(defn- recursion-child
+  "Child `c` of recursive attribute `spec` of node `eid`. A revisited node (already
+  expanded along this path) is pulled in revisit mode: its recursive children are not
+  expanded. Past the depth limit, or in revisit mode, a child is rendered as {:db/id c}
+  when the pattern pulls :db/id and dropped otherwise."
+  [db sch eid c ast st ^AttrSpec spec]
+  (let [depth (:depth (:recur spec))
+        remaining (when depth (get (:depths st) (:rid spec) depth))]
+    (if (or (:revisit st) (and remaining (<= (long remaining) 0)))
+      (when (:id? ast) {:db/id c})
+      (pull-entity db sch c ast
+                   (cond-> (update st :seen conj eid)
+                     remaining (assoc-in [:depths (:rid spec)] (dec (long remaining))))))))
+
+(defn- child-value
+  "The pulled value of target `c` of a ref (or, for sub-patterns, any) attribute of `eid`."
+  [db sch eid ^Attr attr c ast st ^AttrSpec spec]
+  (cond
+    (:recur spec) (when (integer? c) (recursion-child db sch eid (long c) ast st spec))
+    (:sub spec) (cond
+                  (integer? c) (pull-entity db sch (long c) (:sub spec) st)
+                  (string? c) (throw (entity/not-a-keyword c))
+                  :else nil)
+    (:reverse? spec) {:db/id (long c)}
+    (ref-attr? attr) (default-ref-value db sch attr (long c))
+    :else c))
+
+(defn- spec-raw
+  "Value of `spec` for `eid` before :xform/:default, or nil when absent."
+  [db sch eid ast st ^AttrSpec spec]
+  (let [^Attr attr (schema/attr sch (:attr spec))]
+    (when attr
+      (let [many? (= :db.cardinality/many (:cardinality attr))
+            limit (:limit spec)]
+        (if (:reverse? spec)
+          (when (ref-attr? attr)
+            (when-let [ds (entity/datoms-seq db :vaet [eid (:id attr)]
+                                             (if (:component? attr) 1 limit))]
+              (let [vs (keep (fn [^Datom d] (child-value db sch eid attr (.-e d) ast st spec)) ds)]
+                (when (seq vs)
+                  (if (:component? attr) (first vs) (vec vs))))))
+          (when-let [ds (entity/datoms-seq db :eavt [eid (:id attr)] (if many? limit 1))]
+            (if many?
+              (let [vs (keep (fn [^Datom d] (child-value db sch eid attr (.-v d) ast st spec))
+                             ds)]
+                (when (seq vs) (vec vs)))
+              (child-value db sch eid attr (.-v ^Datom (first ds)) ast st spec))))))))
+
+(defn- spec-value [db sch eid ast st ^AttrSpec spec]
+  (let [raw (spec-raw db sch eid ast st spec)
+        v (if-let [xf (:xform spec)] (xf raw) raw)]
+    (if (and (nil? v) (some? (:default spec)))
+      (:default spec)
+      v)))
+
+(defn- wildcard-entries
+  "[key value] for every attribute of `eid` not overridden by an explicit spec."
+  [db sch eid override]
+  (->> (entity/datoms-seq db :eavt [eid])
+       (partition-by (fn [^Datom d] (.-a d)))
+       (keep (fn [ds]
+               (let [^Attr attr (get (:attrs sch) (.-a ^Datom (first ds)))]
+                 (when (and attr (not (contains? override (:ident attr))))
+                   (let [value (fn [^Datom d] (if (ref-attr? attr)
+                                                (default-ref-value db sch attr (long (.-v d)))
+                                                (.-v d)))]
+                     [(:ident attr)
+                      (if (= :db.cardinality/many (:cardinality attr))
+                        (vec (map value (take default-limit ds)))
+                        (value (first ds)))])))))))
+
+(defn- pull-entity
+  "Map for `eid` under `ast`, or nil when it has no content."
+  [db sch eid ^PullPattern ast st]
+  (let [st (if (and (not (:revisit st)) (contains? (:seen st) eid)) (assoc st :revisit true) st)
+        m (if (:id? ast) {:db/id eid} {})
+        m (if (:wildcard? ast)
+            (reduce (fn [acc [k v]] (assoc acc k v)) m (wildcard-entries db sch eid (:override ast)))
+            m)
+        m (reduce (fn [acc ^AttrSpec spec]
+                    (let [k (:key spec)]
+                      (if (contains? acc k)
+                        acc
+                        (let [v (spec-value db sch eid ast st spec)]
+                          (if (nil? v) acc (assoc acc k v))))))
+                  m (:attrs ast))]
+    (when (seq m) m)))
+
+(defn pull-from-ast
+  "Pulls `eid` (a long, or anything `entity/resolve-eid` accepts) from `db` under a
+  parsed pattern. For use by the query engine."
+  [db ast eid]
+  (let [ast (parse-pattern ast)
+        e (entity/resolve-eid db eid)]
+    (if (nil? e)
+      (when (and (nil? eid) (:id? ast)) {:db/id nil})
+      (pull-entity db (index/-schema db) e ast empty-state))))
+
+(defn pull
+  "Pulls `eid` (id, ident or lookup ref) from `db` using `pattern`."
+  [db pattern eid]
+  (when (some? pattern)
+    (pull-from-ast db (parse-pattern pattern) eid)))
+
+(defn pull-many
+  "Pulls each of `eids`; a vector of results (nil for entities with no content)."
+  [db pattern eids]
+  (let [ast (parse-pattern pattern)]
+    (mapv #(pull-from-ast db ast %) eids)))
