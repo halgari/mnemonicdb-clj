@@ -126,12 +126,16 @@
   (keyword (name vt)))
 
 (defn resolve-callable
-  "The var named by `sym`: qualified symbols load their namespace on demand, unqualified
-  symbols resolve in clojure.core. Nil when the var does not exist."
+  "The fn var named by `sym`: qualified symbols load their namespace on demand, unqualified
+  symbols resolve in clojure.core. Nil when the var does not exist; a var that is not
+  a function is :db.error/not-a-data-function."
   [sym]
-  (if (qualified-symbol? sym)
-    (requiring-resolve sym)
-    (ns-resolve (the-ns 'clojure.core) sym)))
+  (when-some [v (if (qualified-symbol? sym)
+                  (requiring-resolve sym)
+                  (ns-resolve (the-ns 'clojure.core) sym))]
+    (if (fn? @v)
+      v
+      (fail :db.error/not-a-data-function (str "Not a function: " sym) {:function sym}))))
 
 (def ^:private scalar-types
   #{:db.type/ref :db.type/keyword :db.type/long :db.type/string :db.type/boolean
@@ -274,8 +278,17 @@
   to expand nested tx-data."
   (fn [op-kw _ctx _op] op-kw))
 
-;; The :default method (transaction function calls) and :db/cas, :db/retractEntity are
-;; defined in mnemonic.tx-fns, which is loaded at the end of this namespace.
+;; :db/cas, :db/retractEntity and transaction function calls are implemented in
+;; mnemonic.tx-fns, which requires this namespace; they are reached through a var resolved
+;; at call time so neither namespace needs the other at load time.
+(defn- expand-via-fns [head ctx op]
+  ((requiring-resolve 'mnemonic.tx-fns/expand-call) head ctx op))
+
+(defmethod expand-op :default [head ctx op] (expand-via-fns head ctx op))
+(defmethod expand-op :db/cas [head ctx op] (expand-via-fns head ctx op))
+(defmethod expand-op :db.fn/cas [head ctx op] (expand-via-fns head ctx op))
+(defmethod expand-op :db/retractEntity [head ctx op] (expand-via-fns head ctx op))
+(defmethod expand-op :db.fn/retractEntity [head ctx op] (expand-via-fns head ctx op))
 
 (defn- check-arity [op n]
   (when-not (= n (count op))
@@ -736,23 +749,28 @@
 
 ;; ------------------------------------------------------------------ composite tuples
 
-(defonce ^:private composite-cache (atom nil))
+(defonce ^:private composite-cache
+  ;; A few recent [schema index] pairs, matched by identity (hashing a schema is costly),
+  ;; so several connections do not evict each other's entry.
+  (atom []))
+
+(defn- build-composite-index [schema]
+  (reduce (fn [m ^Attr a]
+            (reduce (fn [m kw]
+                      (if-some [cid (get (:idents schema) kw)]
+                        (update m cid (fnil conj []) a)
+                        m))
+                    m (distinct (:tuple-attrs a))))
+          {} (filter :tuple-attrs (vals (:attrs schema)))))
 
 (defn- composite-index
   "Component attribute id -> composite Attrs built from it."
   [schema]
-  (let [[s idx] @composite-cache]
-    (if (identical? s schema)
-      idx
-      (let [idx (reduce (fn [m ^Attr a]
-                          (reduce (fn [m kw]
-                                    (if-some [cid (get (:idents schema) kw)]
-                                      (update m cid (fnil conj []) a)
-                                      m))
-                                  m (distinct (:tuple-attrs a))))
-                        {} (filter :tuple-attrs (vals (:attrs schema))))]
-        (reset! composite-cache [schema idx])
-        idx))))
+  (if-some [[_ idx] (some #(when (identical? (first %) schema) %) @composite-cache)]
+    idx
+    (let [idx (build-composite-index schema)]
+      (swap! composite-cache #(conj (if (>= (count %) 8) (subvec % 1) %) [schema idx]))
+      idx)))
 
 (defn- composite-ops
   "Ops maintaining composite tuples after `res` (the effective changes of `ops`). Returns
@@ -1023,7 +1041,9 @@
         auto (schema-installs ctx asserts alter-eids)
         ;; ids allocated to entities that ended up without datoms (for example only a
         ;; dropped composite tuple) are not consumed
-        n-shared (let [used (into #{} (mapcat (fn [^Datom d]
+        n-shared (if (empty? dropped)
+                   n-shared
+                   (let [used (into #{} (mapcat (fn [^Datom d]
                                                 (cond-> [(.-e d)] (ref-attr? schema (.-a d)) (conj (.-v d)))))
                                   asserts)
                        mask (dec (bit-shift-left 1 42))
@@ -1034,7 +1054,7 @@
                                          (max m n)
                                          m)))
                                    t (vals tempids))]
-                   (inc (long top)))
+                   (inc (long top))))
         ;; the tx's own instant
         now (System/currentTimeMillis)
         last-ms (last-instant db-before)
@@ -1071,7 +1091,3 @@
      :ops ops
      :meta (assoc meta :next-t n-shared :next-db-n n-db)
      :tx tx}))
-
-;; Registers :db/cas, :db/retractEntity and transaction function calls (loaded here because
-;; mnemonic.tx-fns requires this namespace).
-(require 'mnemonic.tx-fns)

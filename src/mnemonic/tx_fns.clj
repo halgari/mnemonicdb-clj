@@ -71,26 +71,44 @@
     (->DbFn (keyword (name (:lang m))) (vec (:imports m)) (vec (:requires m))
             (vec (:params m)) (:code m))))
 
-;; Compiled functions are cached by their definition, so a stored function is evaluated
-;; once however often (and from however many databases) it is called.
-(defonce ^:private ^ConcurrentHashMap compiled (ConcurrentHashMap.))
+;; Compiled functions are cached (bounded, least recently used) by their definition, so a
+;; stored function is evaluated once however often it is called. Each compiled function
+;; lives in its own namespace, which is removed when the entry is evicted.
+(def ^:private cache-limit 1000)
 
-(defn- compile* [^DbFn f]
+(defonce ^:private ^java.util.LinkedHashMap compiled
+  (proxy [java.util.LinkedHashMap] [16 (float 0.75) true]
+    (removeEldestEntry [eldest]
+      (let [evict? (> (.size ^java.util.Map this) cache-limit)]
+        (when evict?
+          (remove-ns (second (.getValue ^java.util.Map$Entry eldest))))
+        evict?))))
+
+(defn- compile* [^DbFn f ns-sym]
   (when-not (= :clojure (:lang f))
     (throw (tx/error :db.error/unsupported (str "Unsupported function language " (:lang f))
                      :cognitect.anomalies/unsupported {:lang (:lang f)})))
-  (let [ns (create-ns (gensym "mnemonic.txfn"))]
-    (binding [*ns* ns]
-      (refer-clojure)
-      (doseq [r (:requires f)] (require r))
-      (doseq [i (:imports f)] (eval (list 'clojure.core/import (list 'quote i))))
-      (let [body (read-string (str "(do " (:code f) "\n)"))]
-        (eval (list 'fn (vec (:params f)) body))))))
+  (binding [*ns* (create-ns ns-sym)]
+    (refer-clojure)
+    (doseq [r (:requires f)] (require r))
+    (doseq [i (:imports f)] (eval (list 'clojure.core/import (list 'quote i))))
+    (let [body (read-string (str "(do " (:code f) "\n)"))]
+      (eval (list 'fn (vec (:params f)) body)))))
 
-(defn- compile-fn [^DbFn f]
-  (or (.get compiled f)
-      (let [c (compile* f)]
-        (or (.putIfAbsent compiled f c) c))))
+(defn- cached-fn
+  "The compiled function for cache key `k`; `make-def` builds its DbFn on a miss."
+  [k make-def]
+  (or (locking compiled (first (.get compiled k)))
+      (let [^DbFn f (make-def)
+            ns-sym (gensym "mnemonic.txfn")
+            c (try (compile* f ns-sym)
+                   (catch Throwable t (remove-ns ns-sym) (throw t)))]
+        (locking compiled
+          (if-some [existing (.get compiled k)]
+            (do (remove-ns ns-sym) (first existing))
+            (do (.put compiled k [c ns-sym]) c))))))
+
+(defn- compile-fn [^DbFn f] (cached-fn f (fn [] f)))
 
 ;; ------------------------------------------------------------------ built-ins
 
@@ -180,7 +198,7 @@
       (when-some [d (first (tx/datoms-of db :eavt [eid 52]))]
         (let [v (:v d)]
           (when (string? v)
-            (stored->fn v))))))
+            (cached-fn v #(stored->fn v)))))))
 
 (defn- lookup-callable
   "[:fn f], [:unresolved] (unknown ident/symbol) or [:not-fn id]."
@@ -227,26 +245,17 @@
     (throw (tx/error :db.error/invalid-tx-data (str "Wrong number of elements in " (pr-str op))
                      {:op op}))))
 
-(defmethod tx/expand-op :db/cas [_ ctx op]
-  (check-arity op 5)
-  (call-forms ctx cas op))
-
-(defmethod tx/expand-op :db.fn/cas [_ ctx op]
-  (check-arity op 5)
-  (call-forms ctx cas op))
-
-(defmethod tx/expand-op :db/retractEntity [_ ctx op]
-  (check-arity op 2)
-  (call-forms ctx retract-entity op))
-
-(defmethod tx/expand-op :db.fn/retractEntity [_ ctx op]
-  (check-arity op 2)
-  (call-forms ctx retract-entity op))
-
-(defmethod tx/expand-op :default [head ctx op]
-  (let [[tag f] (lookup-callable (:db ctx) head)]
-    (case tag
-      :fn (call-forms ctx f op)
-      :not-fn (throw (not-a-data-function (str "Not a data function: " f) head))
-      :unresolved (throw (not-a-data-function (str "Unable to resolve data function: " (pr-str head))
-                                              head)))))
+(defn expand-call
+  "Expands a list-form op whose head is `head`: the built-ins :db/cas and
+  :db/retractEntity (and their :db.fn aliases), or a transaction function call. Called by
+  the expand-op methods in mnemonic.tx."
+  [head ctx op]
+  (case head
+    (:db/cas :db.fn/cas) (do (check-arity op 5) (call-forms ctx cas op))
+    (:db/retractEntity :db.fn/retractEntity) (do (check-arity op 2) (call-forms ctx retract-entity op))
+    (let [[tag f] (lookup-callable (:db ctx) head)]
+      (case tag
+        :fn (call-forms ctx f op)
+        :not-fn (throw (not-a-data-function (str "Not a data function: " f) head))
+        :unresolved (throw (not-a-data-function (str "Unable to resolve data function: " (pr-str head))
+                                                head))))))

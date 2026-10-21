@@ -192,3 +192,22 @@
     (is (= :db.error/entity-pred (kind c [[:db/add [:p/name "n"] :p/age 5]
                                           [:db/add [:p/name "n"] :db/ensure :ent/is99]])))
     (is (tf/datoms (m/db c) :avet :p/name "n"))))
+
+(deftest namespaces-load-in-either-order
+  (doseq [first-ns ['mnemonic.tx-fns 'mnemonic.tx]]
+    (let [java (str (java.io.File. (java.io.File. (System/getProperty "java.home") "bin") "java"))
+          form (pr-str `(do (require '~first-ns) (require 'mnemonic.api) (shutdown-agents)))
+          pb (doto (ProcessBuilder. ^java.util.List
+                                    [java "--enable-native-access=ALL-UNNAMED"
+                                     "-cp" (System/getProperty "java.class.path")
+                                     "clojure.main" "-e" form])
+               (.redirectErrorStream true))
+          proc (.start pb)
+          out (slurp (.getInputStream proc))]
+      (is (zero? (.waitFor proc)) (str first-ns " first: " out)))))
+
+(deftest compiled-function-cache-is-reused
+  (let [f (m/function '{:lang "clojure" :params [x] :code (inc x)})]
+    (is (= 2 (f 1)))
+    (is (= 3 (f 2)))
+    (is (thrown? Exception ((m/function '{:lang "clojure" :params [x] :code (nope-undefined x)}) 1)))))
