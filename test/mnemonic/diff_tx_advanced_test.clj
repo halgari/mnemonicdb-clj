@@ -157,11 +157,11 @@
     (ok [[:my/millis [:p/name "al"]]])
     (ok [{:db/ident :my/chain
           :db/fn (fnspec '{:lang "clojure" :params [db e]
-                           :code [[:my/inc-age e] ['mnemonic.test-fns/add-age e 40]
+                           :code [[:my/inc-age e] [:db/add e :a/city "from-chain"]
                                   {:db/id "made" :p/name "made-by-chain" :p/boss e}]})}])
     (ok [[:my/chain [:p/name "al"]]])
     (ok [{:db/id "f" :db/fn (fnspec '{:lang "clojure" :params [db] :code []})}])
-    (err :db.error/not-a-data-function [[:my/inc-age]  [:p/name 1]])
+    (err :db.error/not-a-data-function [[:my/no-such-fn 1]])
     (err :db.error/not-a-data-function [{:db/ident :my/later
                                          :db/fn (fnspec '{:lang "clojure" :params [db] :code []})}
                                         [:my/later]])
@@ -423,8 +423,22 @@
     (ok [{:db/id :s/comp :db/isComponent false}])
     (ok [{:db/id :s/nh :db/noHistory false}])]])
 
+(def no-id-schema-scenario
+  ["schema maps without :db/id"
+   [(ok [{:db/ident :n/name :db/valueType :db.type/string :db/cardinality one}
+         {:db/ident :n/tags :db/valueType :db.type/string :db/cardinality many :db/index true}])
+    (ok [{:n/name "first"}
+         {:db/ident :n/age :db/valueType :db.type/long :db/cardinality one}
+         {:n/tags ["a" "b"]}
+         {:db/ident :n/boss :db/valueType :db.type/ref :db/cardinality one :db/isComponent true}
+         {:db/id "named" :n/name "named"}
+         {:db/ident :n/enum}])
+    (ok [{:n/age 3 :n/name "x"}
+         {:db/ident :n/uniq :db/valueType :db.type/string :db/cardinality one :db/unique :db.unique/identity}])
+    (ok [{:n/uniq "u" :n/age 1}])]])
+
 (def scenarios
-  (into [cas-scenario retract-entity-scenario tx-fn-scenario stored-fn-scenario tuple-scenario
+  (into [no-id-schema-scenario cas-scenario retract-entity-scenario tx-fn-scenario stored-fn-scenario tuple-scenario
          tuple-install-scenario attr-pred-scenario ensure-scenario alter-sequence-scenario]
         alter-scenarios))
 
@@ -462,6 +476,12 @@
             (let [{:keys [datomic mnemonic]} (o/index-dump dd dm idx)]
               [idx {:datomic (fix datomic) :mnemonic (fix mnemonic)}])))))
 
+(def ^:private avet-exempt
+  "Datomic keeps listing an attribute in AVET after its :db/index or :db/unique is removed
+  (until reindexing); MnemonicDB stops listing it (see docs/deviations.md)."
+  #{"errors: alter index true->false" "errors: alter index retract" "errors: alter unique remove"
+    "errors: alter unique remove + index false"})
+
 (defn- run-scenario [[nm steps]]
   (o/with-both [cd cm]
     (doseq [[i step] (map-indexed vector steps)]
@@ -473,12 +493,12 @@
           (let [actual (cond (not (contains? mnemonic :error)) :ok
                              (vector? kind) :unclassified
                              :else kind)]
-            (is (= (::expect step) actual) (str nm " / step " i " expected " (::expect step) " got " actual))))
+            (is (= (::expect step) actual) (str nm " / step " i " expected " (::expect step) " got " actual " " (pr-str (:error mnemonic))))))
         (is (= datomic mnemonic) (str nm " / step " i))))
     (let [snap (index-snapshot cd cm)]
       (is (apply = (:basis-t snap)) (str nm " basis-t " (:basis-t snap)))
       (is (apply = (:next-t snap)) (str nm " next-t " (:next-t snap)))
-      (doseq [idx o/indexes]
+      (doseq [idx o/indexes :when (not (and (= idx :avet) (contains? avet-exempt nm)))]
         (let [{:keys [datomic mnemonic]} (get snap idx)]
           (is (= (count datomic) (count mnemonic)) (str nm " " idx " count"))
           (is (= datomic mnemonic) (str nm " " idx " datoms")))))))

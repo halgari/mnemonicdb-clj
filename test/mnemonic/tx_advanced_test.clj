@@ -172,7 +172,7 @@
     (tx! c base)
     (tx! c [{:db/id :p/age :db/noHistory true}])
     (tx! c [{:db/id :p/age :db/noHistory false}])
-    (is (= 1 (count (m/datoms (m/db c) :eavt 0 :db.alter/attribute))))))
+    (is (= 1 (count (seq (m/datoms (m/db c) :eavt 0 :db.alter/attribute)))))))
 
 (deftest attr-pred-and-ensure-resolution-failures
   (with-conn [c]

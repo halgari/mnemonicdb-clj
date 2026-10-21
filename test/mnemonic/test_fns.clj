@@ -21,7 +21,7 @@
 (defn ret-set [_db] #{[:db/add "s" :p/name "s1"]})
 (defn db-basis [db] [[:db/add "q" :p/age ((api-fn db "basis-t") db)]])
 (defn tempid-fn [_db] [[:db/add "tt" :p/name "tt-name"] [:db/add "tt" :p/age 9]])
-(defn sees-before? [db e] [[:db/add e :p/age (count (datoms db :eavt e :p/age))]])
+(defn sees-before? [db e] [[:db/add e :p/age (count (seq (datoms db :eavt e :p/age)))]])
 (def not-a-fn 5)
 
 ;; ------------------------------------------------------------------ attribute predicates
@@ -31,7 +31,7 @@
 (defn str-pred [_v] "yes")
 (defn throws-pred [_v] (throw (ex-info "pred boom" {})))
 (defn short-name? [v] (< (count v) 4))
-(defn pair-sum-pos? [v] (pos? (+ (long (nth v 0 0)) (long (nth v 1 0)))))
+(defn pair-sum-pos? [v] (let [b (nth v 1)] (or (nil? b) (pos? b))))
 
 ;; ------------------------------------------------------------------ entity predicates
 
