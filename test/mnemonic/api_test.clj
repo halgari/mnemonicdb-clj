@@ -227,18 +227,26 @@
     (is (= before (.get index/open-cursors)))))
 
 (deftest base-db-failure-after-write-test
-  (let [c (fresh)]
-    (tx! c schema)
-    (let [real mnemonic.db/base-db
-          calls (atom 0)
-          f (with-redefs [mnemonic.db/base-db (fn [store]
-                                                (if (= 1 (swap! calls inc))
-                                                  (throw (RuntimeException. "boom"))
-                                                  (real store)))]
-              (let [f (m/transact c [{:db/id "a" :person/name "Al"}])]
-                (try @f nil (catch ExecutionException e e))))]
-      (is (some? f))
-      (let [r (tx! c [{:db/id "b" :person/name "Bo"}])]
-        (is (= 1003 (m/basis-t (:db-after r))) "new t (1001 and entity 1002 were used)")
-        (is (= #{"Al" "Bo"}
-               (set (map :v (seq (m/datoms (m/db c) :avet :person/name))))))))))
+  (let [real mnemonic.db/base-db
+        run (fn [c fail-n]
+              (let [calls (atom 0)]
+                (with-redefs [mnemonic.db/base-db (fn [store]
+                                                    (if (<= (swap! calls inc) fail-n)
+                                                      (throw (RuntimeException. "boom"))
+                                                      (real store)))]
+                  (try @(m/transact c [{:db/id "a" :person/name "Al"}])
+                       (catch ExecutionException e e)))))]
+    (testing "one failed rebuild is retried; the tx succeeds"
+      (let [c (fresh)]
+        (tx! c schema)
+        (is (map? (run c 1)))
+        (is (= 1001 (m/basis-t (m/db c))))))
+    (testing "two failed rebuilds fail the future, but d/db and the next tx see the commit"
+      (let [c (fresh)]
+        (tx! c schema)
+        (is (instance? ExecutionException (run c 2)))
+        (is (= #{"Al"} (set (map :v (seq (m/datoms (m/db c) :avet :person/name))))))
+        (let [r (tx! c [{:db/id "b" :person/name "Bo"}])]
+          (is (= 1003 (m/basis-t (:db-after r))) "new t (1001 and entity 1002 were used)")
+          (is (= #{"Al" "Bo"}
+                 (set (map :v (seq (m/datoms (m/db c) :avet :person/name)))))))))))

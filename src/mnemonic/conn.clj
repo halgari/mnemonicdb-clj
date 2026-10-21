@@ -6,7 +6,7 @@
             [mnemonic.db :as db]
             [mnemonic.rocks :as rocks]
             [mnemonic.tx :as tx])
-  (:import (java.util.concurrent CompletableFuture ExecutorService Executors
+  (:import (java.util.concurrent CompletableFuture ExecutionException ExecutorService Executors
                                  RejectedExecutionException ThreadFactory TimeUnit)
            (java.util.concurrent.atomic AtomicLong)))
 
@@ -121,9 +121,10 @@
   (let [^ExecutorService ex (:executor conn)]
     (.shutdown ex)
     (fn []
-      (.awaitTermination ex 30 TimeUnit/SECONDS)
-      (when close-store?
-        (rocks/close-store (:store conn)))
+      (try (.awaitTermination ex 30 TimeUnit/SECONDS)
+           (finally
+             (when close-store?
+               (rocks/close-store (:store conn)))))
       nil)))
 
 (defn release
@@ -147,11 +148,11 @@
               :mem (if-let [store (get-in @registry [:mem name])]
                      (let [fin (when conn (release* conn false))]
                        (swap! registry update :mem dissoc name)
-                       [true (fn [] (when fin (fin)) (rocks/close-store store))])
+                       [true (fn [] (try (when fin (fin)) (finally (rocks/close-store store))))])
                      [false nil])
               :file (if (or conn (file-db-exists? path))
                       (let [fin (when conn (release* conn true))]
-                        [true (fn [] (when fin (fin)) (rocks/destroy-store path))])
+                        [true (fn [] (try (when fin (fin)) (finally (rocks/destroy-store path))))])
                       [false nil]))))]
     (when finish (finish))
     existed?))
@@ -165,7 +166,10 @@
                      stores (vec (vals (:mem @registry)))]
                  (reset! registry {:mem {} :conns {}})
                  (conj fins (fn [] (doseq [st stores] (rocks/close-store st))))))]
-    (doseq [f fins] (f))
+    (let [errs (volatile! nil)]
+      (doseq [f fins]
+        (try (f) (catch Throwable t (vswap! errs #(or % t)))))
+      (when-let [t @errs] (throw t)))
     nil))
 
 ;; ------------------------------------------------------------------ reads
@@ -174,14 +178,32 @@
   (tx/error :db.error/connection-released "The connection has been released."
             :cognitect.anomalies/conflict nil))
 
+(defn- rebuild-db!
+  "Rebuilds the published db from the store (writer thread only)."
+  [^Connection conn]
+  (let [d (db/base-db (:store conn))]
+    (swap! (:state conn) assoc :db d :stale? false)
+    d))
+
 (defn current-db
-  "The latest published db of `conn`."
+  "The latest published db of `conn`. If a post-write rebuild failed earlier, the rebuild
+  is run on the writer thread first."
   [^Connection conn]
   (let [s @(:state conn)]
     (when (:released? s) (throw (released-ex)))
-    (:db s)))
-
-;; ------------------------------------------------------------------ writes
+    (if (:stale? s)
+      (let [f (CompletableFuture.)]
+        (try
+          (.execute ^ExecutorService (:executor conn)
+                    ^Runnable (fn []
+                                (try (.complete f (if (:stale? @(:state conn))
+                                                    (rebuild-db! conn)
+                                                    (:db @(:state conn))))
+                                     (catch Throwable t (.completeExceptionally f t)))))
+          (catch RejectedExecutionException _ (throw (released-ex))))
+        (try (.get f)
+             (catch ExecutionException e (throw (or (.getCause e) e)))))
+      (:db s))))
 
 (defn- do-transact
   "Runs on the transactor thread. Once the batch is written the new meta is recorded
@@ -190,15 +212,15 @@
   [^Connection conn tx-data]
   (let [{:keys [released? stale?]} @(:state conn)]
     (when released? (throw (released-ex)))
-    (when stale?
-      (swap! (:state conn) assoc :db (db/base-db (:store conn)) :stale? false))
+    (when stale? (rebuild-db! conn))
     (let [{:keys [db meta]} @(:state conn)
           r (tx/prepare db meta tx-data)
           _ (rocks/write! (:store conn) (:ops r) {:sync? (file-uri? conn)})
           _ (swap! (:state conn) assoc :meta (:meta r) :stale? true)
-          new-db (db/base-db (:store conn))
+          ;; the tx is durable: retry the db build once instead of failing the caller
+          new-db (try (rebuild-db! conn)
+                      (catch Throwable _ (rebuild-db! conn)))
           report {:db-before db :db-after new-db :tx-data (:tx-data r) :tempids (:tempids r)}]
-      (swap! (:state conn) assoc :db new-db :stale? false)
       (doseq [^java.util.Queue q @(:queues conn)]
         (.add q report))
       report)))
