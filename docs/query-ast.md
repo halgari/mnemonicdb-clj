@@ -88,7 +88,7 @@ Find elements:
 ```clojure
 {:type :var :sym ?x}
 {:type :agg :agg count :args [<term> ...]}     ; (count ?x), (min 3 ?y), (my.ns/f ?x)
-{:type :pull :src $ :var ?x :pattern <pat>}    ; (pull ?x [...]) / (pull $2 ?x ?pat)
+{:type :pull :src $ :var ?x :pattern <pat>}    ; (pull ?x [...]) / (pull $2 ?x pattern) / (pull ?x ?pat)
 ```
 
 - `:agg` is the aggregate symbol as written (may be qualified for custom
@@ -96,7 +96,13 @@ Find elements:
   `:var`. So `(min 3 ?y)` is `[{:type :const :val 3} {:type :var :sym ?y}]`.
 - `:pattern` of a pull is `{:type :const :val <raw pattern>}` (the raw vector
   or map, unparsed -- Task 7 owns the pull grammar) or `{:type :var :sym ?pat}`
-  when the pattern comes from an input.
+  when the pattern comes from an input. Datomic's form is a plain symbol
+  (`(pull ?e pattern)` with `:in $ pattern`); a `?`-prefixed variable is also accepted.
+  In `:in`, plain symbols (not starting with `?`/`$`, not `_`/`%`) are accepted as scalar
+  bindings (also inside `[pattern ...]`, tuples, relations) and bind that symbol; they are
+  only usable as pull patterns (elsewhere a plain symbol is a constant). A pull pattern
+  symbol not bound by a top-level scalar `:in` binding (nested forms like `[pattern ...]`
+  do not count, as in Datomic) raises `:db.error/pattern-not-bound`.
 - The same plain variable cannot appear twice in `:find`; duplicate
   aggregate/pull elements are allowed (`[:find (count ?e) (count ?e)]`).
 

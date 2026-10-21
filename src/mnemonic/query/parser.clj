@@ -47,15 +47,25 @@
 
 ;; ---------------------------------------------------------------- bindings
 
+(def ^:private ^:dynamic *bare-in*
+  "True while parsing :in bindings, where Datomic also accepts plain symbols (the pull
+  pattern inputs: `:in $ pattern`)."
+  false)
+
+(defn- bare-sym? [x]
+  (and (plain-sym? x) (not (var-sym? x)) (not (src-sym? x)) (not= '_ x) (not= '% x)
+       (not= '... x)))
+
 (defn- scalar-or-blank [x form]
   (cond (var-sym? x) {:bind :scalar :sym x}
+        (and *bare-in* (bare-sym? x)) {:bind :scalar :sym x}
         (= '_ x) {:bind :blank}
         :else (fail (str "Invalid binding element " (pr-str x) " in " (pr-str form))
                     {:form form})))
 
 (defn- parse-binding [form]
   (cond
-    (or (var-sym? form) (= '_ form)) (scalar-or-blank form form)
+    (or (var-sym? form) (= '_ form) (and *bare-in* (bare-sym? form))) (scalar-or-blank form form)
 
     (and (vector? form) (seq form))
     (cond
@@ -73,7 +83,8 @@
 (defn- parse-in-binding [form]
   (cond (= '% form) {:bind :rules}
         (src-sym? form) {:bind :src :sym form}
-        (or (var-sym? form) (= '_ form) (vector? form)) (parse-binding form)
+        (or (var-sym? form) (= '_ form) (vector? form) (bare-sym? form))
+        (binding [*bare-in* true] (parse-binding form))
         :else (fail (str "Argument " (pr-str form) " in :in is not a source, rule set, or binding")
                     {:form form})))
 
@@ -291,7 +302,18 @@
   (let [initial (set (mapcat binding-vars in))
         bound (check-bindings where initial)
         used (concat (mapcat find-elem-vars (:elements find)) with)
-        missing (set (remove bound used))]
+        missing (set (remove bound used))
+        top-scalars (set (keep #(when (= :scalar (:bind %)) (:sym %)) in))
+        pattern-missing (set (keep #(when (and (= :pull (:type %)) (= :var (:type (:pattern %))))
+                                      (let [ps (:sym (:pattern %))]
+                                        (when-not (if (var-sym? ps) (contains? bound ps) (contains? top-scalars ps))
+                                          ps)))
+                                   (:elements find)))
+        missing (set (remove pattern-missing missing))]
+    (when (seq pattern-missing)
+      (fail :db.error/pattern-not-bound
+            (str "Pull pattern not found in inputs: " (str/join ", " pattern-missing))
+            {:variables pattern-missing}))
     (when (seq missing)
       (fail :db.error/unbound-query-variables
             (str "Query is referencing unbound variables: " (pr-str missing))
@@ -307,11 +329,13 @@
                                           {:form form}))]
     (when-not (var-sym? x)
       (fail (str "Entity in " (pr-str form) " is not a variable") {:form form}))
-    (when-not (or (vector? pattern) (map? pattern) (var-sym? pattern))
+    (when-not (or (vector? pattern) (map? pattern) (var-sym? pattern) (bare-sym? pattern))
       (fail (str "Pull pattern in " (pr-str form) " must be a vector, map or variable")
             {:form form}))
     {:type :pull :src src :var x
-     :pattern (if (var-sym? pattern) {:type :var :sym pattern} {:type :const :val pattern})}))
+     :pattern (if (or (var-sym? pattern) (bare-sym? pattern))
+                {:type :var :sym pattern}
+                {:type :const :val pattern})}))
 
 (defn- parse-find-elem [x]
   (cond

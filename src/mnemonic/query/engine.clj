@@ -547,7 +547,7 @@
 (defn- term-srcs [terms]
   (into #{} (keep #(when (= :src (:type %)) (:sym %))) terms))
 
-(defn- clause-srcs [c]
+(defn clause-srcs [c]
   (case (:clause c)
     :data-pattern #{(:src c)}
     (:pred :fn) (term-srcs (:args c))
@@ -720,7 +720,14 @@
       (case spec
         :find-rel (when (seq rows) (lazy-map (if to-map (comp to-map pulled) pulled) rows))
         :find-coll (when (seq rows) (lazy-map (comp first pulled) rows))
-        :find-scalar (some-> (first rows) pulled first seq)
+        :find-scalar (when-let [row (first rows)]
+                       (let [v (first (pulled row))]
+                         (cond
+                           (nil? v) nil
+                           (or (coll? v) (instance? Collection v) (string? v)) (seq v)
+                           :else (throw (IllegalArgumentException.
+                                         (str "Don't know how to create ISeq from: "
+                                              (.getName (class v))))))))
         :find-tuple (when-let [row (first rows)]
                       (seq (let [r (pulled row)] (if to-map (to-map r) r)))))
       (case spec

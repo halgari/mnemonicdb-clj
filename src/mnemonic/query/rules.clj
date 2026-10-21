@@ -242,16 +242,27 @@
           (throw (qerror :db.error/invalid-query "Invalid argument in rule call"
                          {:arg a})))))))
 
+(defn- check-rule-sources!
+  "Datomic rejects explicit source vars in rule bodies; we allow declared ones but an
+  undeclared source var is an error when the rule is called."
+  [ctx name defs]
+  (doseq [s (into #{} (comp (mapcat :body) (mapcat e/clause-srcs)) defs)]
+    (when (and s (not= s '$) (not (contains? (:sources ctx) s)))
+      (throw (qerror :db.error/invalid-query
+                     (str "Data source not supplied: " s " (in rule " name ")")
+                     {:source s :rule name})))))
+
 (defmethod e/execute-clause :rule [ctx rel {:keys [src name args] :as clause}]
   (let [defs (get (:rules ctx) name)]
     (when (empty? defs)
       (throw (qerror :db.error/invalid-query (str "Unable to resolve rule: " name)
                      {:rule name})))
-    (when (not= (count (:head (first defs))) (count args))
+    (when-not (every? #(= (count (:head %)) (count args)) defs)
       (throw (qerror :db.error/invalid-query
                      (str "Rule " name " called with " (count args) " arguments, expected "
-                          (count (:head (first defs))))
+                          (vec (distinct (map (comp count :head) defs))))
                      {:rule name})))
+    (check-rule-sources! ctx name defs)
     (let [plan (call-plan (e/var-index rel) args)
           mask (mapv #(contains? #{:const :bound} (:kind %)) plan)
           bound-plans (filterv #(contains? #{:const :bound} (:kind %)) plan)

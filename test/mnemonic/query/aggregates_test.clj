@@ -204,6 +204,15 @@
       (is (= {:p/name "D"} (m/q '[:find (pull $ ?e [:p/name]) . :where [?e :p/age 4]] db)))
       (is (= {:p/name "D"} (m/q '[:find (pull $2 ?e [:p/name]) . :in $ $2 :where [$2 ?e :p/age 4]] db db)))
       (is (= {:p/name "A"} (m/q '[:find (pull ?e [:p/name]) . :in $ ?e :where] db [:p/name "A"]))))
+    (testing "bare-symbol pattern input (Datomic syntax)"
+      (is (= {:p/name "D"} (m/q '[:find (pull ?e pattern) . :in $ pattern :where [?e :p/age 4]] db [:p/name])))
+      (is (= {:p/name "D"} (m/q '[:find (pull $ ?e pattern) . :in $ pattern :where [?e :p/age 4]] db [:p/name])))
+      (is (= :db.error/pattern-not-bound
+             (err #(m/q '[:find (pull ?e pattern) . :in $ [pattern ...] :where [?e :p/age 4]] db [[:p/name]]))))
+      (is (= :db.error/pattern-not-bound
+             (err #(m/q '[:find (pull ?e pattern) . :where [?e :p/age 4]] db))))
+      (is (= :db.error/too-few-inputs
+             (err #(m/q '[:find (pull ?e pattern) . :in $ pattern :where [?e :p/age 4]] db)))))
     (testing "errors"
       (is (some? (err #(m/q '[:find (pull ?e [:p/name]) :where [?e :p/age 4]] (m/history db)))))
       (is (some? (err #(m/q '[:find (pull ?e [:p/name]) . :in $c :where [$c ?e]] [[1]]))))
@@ -226,6 +235,11 @@
             (is (< @calls 5))
             (doall s)
             (is (= 5 @calls))))))
+    (testing "scalar find: nil when empty, seq error for non-seqable values"
+      (is (nil? (m/qseq '[:find ?e . :where [?e :p/age 99]] db)))
+      (is (instance? IllegalArgumentException
+                     (try (m/qseq '[:find ?e . :where [?e :p/age 4]] db) (catch Throwable t t))))
+      (is (= [[:p/name "D"]] (seq (m/qseq '[:find (pull ?e [:p/name]) . :where [?e :p/age 4]] db)))))
     (testing "find specs"
       (is (nil? (m/qseq '[:find ?e :where [?e :p/age 99]] db)))
       (is (nil? (m/qseq '[:find ?e . :where [?e :p/age 99]] db)))

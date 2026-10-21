@@ -201,7 +201,23 @@
    ['[:find (pull ?e [:p/name]) :in $ % :where (anc ?e _)] :DB anc]
    ['[:find (pull ?e [:p/name]) . :where [?e :p/name "Al"]] :ASOF]
    ['[:find (pull ?e [:p/name]) . :where [?e :p/name "Al"]] :HIST]
-   ['[:find (pull ?e [:p/name]) . :in $c :where [$c ?e]] [[1]]]])
+   ['[:find (pull ?e [:p/name]) . :in $c :where [$c ?e]] [[1]]]
+   ;; ---- bare-symbol pull pattern inputs
+   ['[:find (pull ?e pattern) . :in $ pattern :where [?e :p/age 10]] :DB [:p/name]]
+   ['[:find (pull ?e pattern) . :in $ pattern :where [?e :p/age 10]] :DB [:p/name {:p/boss [:p/name]}]]
+   ['[:find (pull ?e pattern) :in $ pattern :where [?e :p/age 20]] :DB '[*]]
+   ['[:find (pull $ ?e pattern) . :in $ pattern :where [?e :p/age 10]] :DB [:p/name]]
+   ['[:find (pull ?e pattern) . :in $ pattern :where [?e :p/age 10]] :DB]
+   ['[:find (pull ?e pattern) . :in $ pattern :where [?e :p/age 10]] :DB nil]
+   ['[:find (pull ?e pattern) . :in $ ?pattern :where [?e :p/age 10]] :DB [:p/name]]
+   ['[:find (pull ?e pattern) . :where [?e :p/age 10]] :DB]
+   ['[:find (pull ?e pattern) . :in $ [pattern ...] :where [?e :p/age 10]] :DB [[:p/name]]]
+   ['[:find ?e :in $ x :where [?e :p/age 10]] :DB 1]
+   ['[:find ?e :in $ x :where [?e :p/age 10]] :DB]
+   ['[:find ?e :in $ % :where (r ?e)] :DB '[[(r ?e) [$2 ?e :p/age 10]]]]
+   ['[:find ?e :in $ % :where [?e :p/age 10]] :DB '[[(r ?e) [$2 ?e :p/age 10]]]]
+   ['[:find ?e :in $ % :where (anc ?x ?e)] :DB '[[(anc ?x ?y) [?x :p/age ?y]]]]
+   ['[:find ?e :in $ % :where (anc ?x ?e)] :DB '[[(anc ?x ?y) [?x ?a ?y]]]]])
 
 (defn- subst [x dbs]
   (get dbs x x))
@@ -303,7 +319,10 @@
                           ['[:find ?n :keys n :in $ :where [?e :p/name ?n]] :DB]
                           ['[:find ?e :in $ :where [?e :p/age 999]] :DB]
                           ['[:find ?n :in $ % :where (anc ?x ?y) [?x :p/name ?n]] :DB anc]
-                          ['[:find ?e . :in $ :where [?e :p/age 20]] :DB]]
+                          ['[:find ?e . :in $ :where [?e :p/age 20]] :DB]
+                          ['[:find (count ?e) . :in $ :where [?e :p/age 20]] :DB]
+                          ['[:find (pull ?e [:p/name]) . :in $ :where [?e :p/age 10]] :DB]
+                          ['[:find ?e . :in $ :where [?e :p/age 999]] :DB]]
               :let [ad (map #(if (= % :DB) db-d %) args)
                     am (map #(if (= % :DB) db-m %) args)
                     rd (try {:ok (canon (frequencies (d/qseq {:query q :args (vec ad)})))}

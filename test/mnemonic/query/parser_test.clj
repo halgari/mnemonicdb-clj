@@ -187,8 +187,21 @@
          (err-kind #(p/parse-query '[:find (count ?q) :where [?x :a _]]))))
   (is (= :db.error/unbound-query-variables
          (err-kind #(p/parse-query '[:find (pull ?q [*]) :where [?x :a _]]))))
-  (is (= :db.error/unbound-query-variables
+  (is (= :db.error/pattern-not-bound
          (err-kind #(p/parse-query '[:find (pull ?x ?pat) :where [?x :a _]]))))
+  (is (= :db.error/pattern-not-bound
+         (err-kind #(p/parse-query '[:find (pull ?x pattern) :where [?x :a _]]))))
+  (testing "bare symbols as pull pattern inputs"
+    (is (= {:type :var :sym 'pattern}
+           (-> (p/parse-query '[:find (pull ?x pattern) :in $ pattern :where [?x :a _]])
+               :find :elements first :pattern)))
+    (is (= [{:bind :src :sym '$} {:bind :scalar :sym 'pattern}]
+           (:in (p/parse-query '[:find (pull ?x pattern) :in $ pattern :where [?x :a _]]))))
+    (is (= {:bind :coll :elem {:bind :scalar :sym 'pattern}}
+           (second (:in (p/parse-query '[:find ?x :in $ [pattern ...] :where [?x :a _]])))))
+    (is (= :db.error/pattern-not-bound
+           (err-kind #(p/parse-query '[:find (pull ?x pattern) :in $ [pattern ...] :where [?x :a _]]))))
+    (is (some? (p/parse-query '[:find ?x :in $ y :where [?x :a _]]))))
   (testing "vars bound by fn bindings, rules, or, and inputs are bound"
     (is (some? (p/parse-query '[:find ?r ?s ?o :in $ % ?i
                                 :where [?x :a _] [(inc ?i) ?r] (rule ?s)

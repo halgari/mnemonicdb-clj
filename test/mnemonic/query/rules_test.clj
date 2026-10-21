@@ -153,6 +153,17 @@
     (is (= 5 (count (m/q '[:find ?n :in $ $2 % :where (nm ?e ?n)] db db2 rs))))
     (is (= :db.error/invalid-query (thrown (m/q '[:find ?n :in $ % :where ($3 nm ?e ?n)] db rs))))))
 
+(deftest rule-source-and-arity-checks
+  (let [db (fresh-db)]
+    (testing "undeclared source in a called rule body"
+      (is (= :db.error/invalid-query
+             (thrown (m/q '[:find ?e :in $ % :where (r ?e)] db '[[(r ?e) [$2 ?e :p/age 1]]]))))
+      (is (= #{} (m/q '[:find ?e :in $ % :where [?e :p/age 99]] db '[[(r ?e) [$2 ?e :p/age 1]]]))))
+    (testing "arity differing between definitions is rejected with the rules"
+      (is (= :db.error/invalid-query
+             (thrown (m/q '[:find ?e :in $ % :where (r ?e)] db
+                          '[[(r ?e) [?e :p/age 1]] [(r ?e ?f) [?e :p/age ?f]]])))))))
+
 (deftest rule-timeout
   (let [db (fresh-db)]
     (is (= :db.error/query-timeout
