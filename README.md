@@ -33,8 +33,7 @@ through `org.rocksdb/rocksdbjni`. On recent JDKs add
 
 Query parameters are `sync` (`true` or `false`) and the storage options `cache-mb`,
 `write-buffer-mb` and `compression` (`none`, `lz4` or `lz4+zstd`); combine them with `&`.
-An unknown key is rejected with `:db.error/invalid-db-uri`, a bad value with
-`:db.error/invalid-uri`. They belong to the connection, not the database's identity: the
+An unknown key or a bad value is rejected with `:db.error/invalid-db-uri`. They belong to the connection, not the database's identity: the
 first `create-database` / `connect` per process decides. `mnemonic:mem://name` accepts the
 same storage options (`sync` is accepted and ignored); they apply when the database is
 created.

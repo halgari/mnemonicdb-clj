@@ -51,9 +51,9 @@
       (finally (conn/reset-registry!) (delete-tree dir)))))
 
 (deftest invalid-options-test
-  (is (= :db.error/invalid-uri (err #(m/create-database "mnemonic:file:///tmp/x?cache-mb=abc"))))
-  (is (= :db.error/invalid-uri (err #(m/create-database "mnemonic:file:///tmp/x?cache-mb=0"))))
-  (is (= :db.error/invalid-uri (err #(m/create-database "mnemonic:file:///tmp/x?compression=gzip"))))
+  (is (= :db.error/invalid-db-uri (err #(m/create-database "mnemonic:file:///tmp/x?cache-mb=abc"))))
+  (is (= :db.error/invalid-db-uri (err #(m/create-database "mnemonic:file:///tmp/x?cache-mb=0"))))
+  (is (= :db.error/invalid-db-uri (err #(m/create-database "mnemonic:file:///tmp/x?compression=gzip"))))
   (is (= :db.error/invalid-db-uri (err #(m/create-database "mnemonic:file:///tmp/x?cache=1"))))
   (is (= :db.error/invalid-db-uri (err #(m/create-database "mnemonic:file:///tmp/x?sync=maybe")))))
 

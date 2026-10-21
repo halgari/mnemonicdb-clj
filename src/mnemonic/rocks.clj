@@ -119,7 +119,7 @@
 
 (defn query-store-opts
   "Store options from a parsed URI query map {\"cache-mb\" \"512\" ...} (string keys);
-  throws ex-info :db.error/invalid-uri for a bad value. Unknown keys are ignored."
+  throws ex-info :db.error/invalid-db-uri for a bad value. Unknown keys are ignored."
   [kvs]
   (reduce-kv
    (fn [acc k v]
@@ -129,13 +129,13 @@
                 (if (#{"none" "lz4" "lz4+zstd"} v)
                   v
                   (throw (ex-info (str "Invalid " k " option: " v)
-                                  {:db/error :db.error/invalid-uri})))
+                                  {:db/error :db.error/invalid-db-uri})))
                 (try (let [n (Long/parseLong ^String v)]
                        (when-not (pos? n) (throw (NumberFormatException.)))
                        n)
                      (catch NumberFormatException _
                        (throw (ex-info (str "Invalid " k " option: " v " (positive integer expected)")
-                                       {:db/error :db.error/invalid-uri}))))))
+                                       {:db/error :db.error/invalid-db-uri}))))))
        acc))
    {} kvs))
 
