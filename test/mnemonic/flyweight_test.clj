@@ -76,3 +76,39 @@
     (is (= (set (:t/s ent)) (set (:t/s (m/pull db [:t/s] e)))))
     (is (= (:t/d ent) 10.5))
     ))
+
+(deftest views-equal-copies-time-views-and-merges
+  ;; history / as-of / since views merge current and history cursors; with-dbs merge an
+  ;; overlay. Each read three times (the later ones through cached segments).
+  (let [uri (str "mnemonic:mem://" (random-uuid))
+        c (fixture uri)
+        t1 (m/basis-t (m/db c))
+        ids (vec (map :e (m/datoms (m/db c) :aevt :t/n)))
+        _ @(m/transact c (for [e (take 20 ids)] [:db/add e :t/n (+ 7 e)]))
+        _ @(m/transact c (for [[i e] (map-indexed vector (take 10 ids))] [:db/retract e :t/s (str "é" i)]))
+        db (m/db c)
+        w (:db-after (m/with db [{:t/n 42 :t/s ["w"]} [:db/add (first ids) :t/d 99.5]]))]
+    (doseq [[label d] [["history" (m/history db)] ["as-of" (m/as-of db t1)]
+                       ["since" (m/since db t1)] ["with" w]
+                       ["filter" (m/filter db (fn [_ dt] (even? (:e dt))))]]
+            idx [:eavt :aevt :avet :vaet]
+            _ (range 3)]
+      (let [ds (m/datoms d idx)]
+        (is (= (plain ds) (fly ds)) (str label " " idx))))
+    (is (seq (plain (m/datoms (m/since db t1) :aevt :t/n))))
+    (m/release c)
+    (m/delete-database uri)))
+
+(deftest view-after-close-throws
+  (let [uri (str "mnemonic:mem://" (random-uuid))
+        c (fixture uri)
+        ^mnemonic.db.Base b (index/-raw (m/db c))
+        ^mnemonic.index.ICursor cur
+        (index/prefix-cursor (mnemonic.rocks/raw-cursor (.-store b) :aevt (.-snap b))
+                             (byte-array 0) :aevt false)
+        ^IDatomView v (index/view-of cur)]
+    (is (some? (.value v)) "readable while the cursor is on it")
+    (.close cur)
+    (is (thrown? IllegalStateException (.eid v)))
+    (is (thrown? IllegalStateException (.value v)))
+    (m/release c)))

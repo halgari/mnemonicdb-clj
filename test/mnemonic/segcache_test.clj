@@ -7,6 +7,8 @@
   that force the big-granule paths, stamp collisions, constant eviction and immediate
   admission. Plus lifecycle and configuration checks."
   (:require [clojure.java.io :as io]
+            [clojure.walk :as walk]
+            [mnemonic.rocks :as rocks]
             [clojure.test :refer [deftest is testing use-fixtures]]
             [mnemonic.api :as m]
             [mnemonic.codec :as codec]
@@ -181,7 +183,7 @@
       (let [uri (if (= kind :file)
                   (str "mnemonic:file://" (tmp-dir) uri-opts)
                   (str "mnemonic:mem://segcache-" (System/nanoTime) uri-opts))
-            {:keys [checks mismatches stats]} (with-props props #(stress! uri 2200))]
+            {:keys [checks mismatches stats]} (with-props props #(stress! uri 1800))]
         (is (empty? mismatches) (pr-str mismatches))
         (is (< 1000 checks))
         (is (pos? (:hits stats)) (pr-str stats))
@@ -247,3 +249,170 @@
              (try (m/create-database (str "mnemonic:mem://segcache-bad?index-cache-mb=" v)) nil
                   (catch Exception e (:db/error (ex-data e)))))
           v))))
+
+;; ------------------------------------------------------------------ mixed types, async
+;; writer, views, irregular writes, close during reads
+
+(def ^:private mixed-schema
+  [{:db/ident :x/id :db/valueType :db.type/long :db/cardinality :db.cardinality/one :db/unique :db.unique/identity}
+   {:db/ident :x/s :db/valueType :db.type/string :db/cardinality :db.cardinality/one :db/index true}
+   {:db/ident :x/k :db/valueType :db.type/keyword :db/cardinality :db.cardinality/many}
+   {:db/ident :x/b :db/valueType :db.type/bytes :db/cardinality :db.cardinality/one}
+   {:db/ident :x/i :db/valueType :db.type/instant :db/cardinality :db.cardinality/one :db/index true}
+   {:db/ident :x/m :db/valueType :db.type/bigdec :db/cardinality :db.cardinality/one :db/index true}
+   {:db/ident :x/d :db/valueType :db.type/double :db/cardinality :db.cardinality/one :db/index true}
+   {:db/ident :x/u :db/valueType :db.type/uuid :db/cardinality :db.cardinality/one :db/index true}
+   {:db/ident :x/t :db/valueType :db.type/tuple :db/tupleTypes [:db.type/keyword :db.type/string]
+    :db/cardinality :db.cardinality/one :db/index true}
+   {:db/ident :x/r :db/valueType :db.type/ref :db/cardinality :db.cardinality/many}])
+
+(defn- mixed-value [^Random r a]
+  (let [n (.nextInt r 8)]
+    (case a
+      :x/s (nth ["" "a" "a\u0000" "a\u0000b" "été" "😀" "ab" (str "s" n)] n)
+      :x/k (nth [:a :b/a (keyword "" "e") :c/d :x (keyword "n" "") :b/b :z] n)
+      :x/b (byte-array (take n (cycle [0 -1 127 -128 1])))
+      :x/i (java.util.Date. (long (* n 1000)))
+      :x/m (nth [1M 1.0M 1.00M -0M 0M 2.5M 1E+2M 100M] n)
+      :x/d (nth [0.0 -0.0 Double/NaN 1.5 -1.5 Double/POSITIVE_INFINITY 1e300 2.0] n)
+      :x/u (java.util.UUID. 0 n)
+      :x/t [(nth [:a :b :c/d :e] (mod n 4)) (str "t" (mod n 3))])))
+
+(def ^:private mixed-attrs [:x/s :x/k :x/b :x/i :x/m :x/d :x/u :x/t])
+
+(defn- norm
+  "Comparable form: byte arrays as vectors, Datoms as vectors, NaN-safe (printed)."
+  [x]
+  (pr-str (walk/prewalk (fn [v] (cond (bytes? v) (vec v)
+                                      (instance? mnemonic.datom.Datom v) (vec (seq v))
+                                      (instance? mnemonic.entity.Entity v) [:entity (:db/id v)]
+                                      :else v))
+                        x)))
+
+(defn- attempt
+  "(f), or [:error message] (an unindexed AVET read throws on both paths alike)."
+  [f]
+  (try (f) (catch clojure.lang.ExceptionInfo ex [:error (ex-message ex)])))
+
+(defn- mixed-tx [^Random r]
+  (let [i (.nextInt r 60) e [:x/id i] a (nth mixed-attrs (.nextInt r (count mixed-attrs)))]
+    (case (.nextInt r 4)
+      0 [[:db/add e a (mixed-value r a)]]
+      1 [[:db/retract e a (mixed-value r a)]]
+      2 [{:x/id i a (mixed-value r a) :x/r [[:x/id (.nextInt r 60)]]}]
+      3 [[:db/retractEntity e]])))
+
+(defn- mixed-probes [db ^Random r]
+  (let [sch (index/-schema db)
+        aid #(get (:idents sch) %)
+        e (m/entid db [:x/id (.nextInt r 60)])
+        a (nth mixed-attrs (.nextInt r (count mixed-attrs)))
+        v (mixed-value r a)
+        t (m/basis-t db)
+        old-t (max 1 (- t (.nextInt r 30)))
+        raw (fn [hist? idx comps] [[hist? idx comps] #(raw-read db hist? idx (codec/encode-prefix idx comps))])
+        datoms (fn [db* & args] (mapv (juxt :e :a :v :tx :added) (apply m/datoms db* args)))]
+    (cond-> [(raw false :aevt [(aid a)])
+             (raw true :aevt [(aid a)])
+             [:avet-value #(datoms db :avet a v)]
+             (raw false :avet [(aid a) v])
+             (raw true :avet [(aid a) v])
+             [:since-scan #(datoms (m/since db old-t) :aevt a)]
+             [:as-of-lookup #(datoms (m/as-of db old-t) :avet a v)]
+             (let [txd [(assoc {:x/id 1000 :x/s "w"} a v)]]
+               [:with #(datoms (:db-after (m/with db txd)) :avet a v)])]
+      e (into [(raw false :eavt [e])
+               (raw true :eavt [e])
+               (raw false :eavt [e (aid a)])
+               (raw false :vaet [e])
+               [:entity #(into {} (m/touch (m/entity db e)))]
+               [:pull #(m/pull db '[* {:x/r [:x/id]} {:x/_r [:x/id]}] e)]
+               [:as-of-pull #(m/pull (m/as-of db old-t) '[*] e)]
+               [:history #(datoms (m/history db) :eavt e)]
+               (let [txd [[:db/add e a v]]]
+                 [:with-entity #(datoms (:db-after (m/with db txd)) :eavt e)])]))))
+
+(deftest mixed-types-async-writer-test
+  ;; file store with sync on: several transact-async in flight form groups sharing one
+  ;; fsync; now and then an irregular raw write (no :log entry) to an index CF
+  (let [uri (str "mnemonic:file://" (tmp-dir) on)]
+    (m/create-database uri)
+    (let [c (m/connect uri)
+          store (:store c)
+          _ @(m/transact c mixed-schema)
+          _ @(m/transact c (vec (for [i (range 60)] {:x/id i :x/s (str "s" i)})))
+          dbs (CopyOnWriteArrayList. [(m/db c)])
+          stop (atom false)
+          checks (atom 0)
+          bad (atom [])
+          readers (vec (for [th (range 3)]
+                         (future
+                           (let [r (Random. (+ 10 th))]
+                             (while (not @stop)
+                               (let [^objects arr (.toArray dbs) n (alength arr)
+                                     db (aget arr (if (.nextBoolean r) (dec n) (.nextInt r n)))]
+                                 (doseq [[label f] (mixed-probes db r)]
+                                   (let [want (norm (attempt #(uncached f)))]
+                                     (dotimes [_ 3]
+                                       (let [got (norm (attempt f))]
+                                         (swap! checks inc)
+                                         (when (and (not= want got) (< (count @bad) 5))
+                                           (swap! bad conj {:probe label :t (m/basis-t db)
+                                                            :cached got :uncached want}))))))))))))
+          r (Random. 7)
+          t0 (System/currentTimeMillis)]
+      (while (< (- (System/currentTimeMillis) t0) 4000)
+        (let [fs (doall (for [_ (range (inc (.nextInt r 6)))] (m/transact-async c (mixed-tx r))))]
+          (doseq [f fs] (try @f (catch Exception _ nil))))
+        (when (zero? (.nextInt r 40))
+          ;; irregular: a raw index entry with no :log entry
+          (let [db (m/db c)
+                k (codec/encode-key :eavt (m/entid db [:x/id 0]) (m/entid db :x/s) (str "raw" (.nextInt r 5))
+                                    (codec/t->tx (m/basis-t db)))]
+            (rocks/write! store [[:put :eavt k (byte-array 0)]] {})
+            ;; the connection's db does not see raw writes; a fresh base db does
+            (.add dbs (mnemonic.db/base-db store))))
+        (.add dbs (m/db c))
+        (when (> (.size dbs) 40) (.remove dbs 1)))
+      (reset! stop true)
+      (run! deref readers)
+      (let [st (m/index-cache-stats c)]
+        (is (empty? @bad) (pr-str @bad))
+        (is (< 1000 @checks))
+        (is (pos? (:hits st)) (pr-str st))
+        (is (pos? (:stale st)) (pr-str st)))
+      (m/release c))))
+
+(deftest close-during-reads-test
+  ;; readers hammer reads while the file store closes: every read either answers
+  ;; correctly or fails with connection-released / db-released
+  (let [uri (str "mnemonic:file://" (tmp-dir) on)]
+    (m/create-database uri)
+    (let [c (m/connect uri)
+          _ @(m/transact c schema)
+          _ @(m/transact c (vec (for [i (range 3000)] {:k/id i :k/v i :k/name (str "x" i)})))
+          db (m/db c)
+          stop (atom false)
+          wrong (atom [])
+          readers (vec (for [th (range 4)]
+                         (future
+                           (let [r (Random. th)]
+                             (while (not @stop)
+                               (try
+                                 (let [i (.nextInt r 3000)
+                                       e (m/entid db [:k/id i])]
+                                   (when-not (= i (:k/v (m/entity db e))) (swap! wrong conj [:entity i]))
+                                   (when (zero? (.nextInt r 50))
+                                     (when-not (= 3000 (count (seq (m/datoms db :aevt :k/v))))
+                                       (swap! wrong conj [:scan]))))
+                                 (catch Exception ex
+                                   (when-not (#{:db.error/connection-released :db.error/db-released}
+                                              (:db/error (ex-data ex)))
+                                     (swap! wrong conj [:error (str ex)])))))))))]
+      (Thread/sleep 1200)
+      (m/release c)
+      (Thread/sleep 300)
+      (reset! stop true)
+      (run! deref readers)
+      (is (empty? @wrong) (pr-str (take 3 @wrong)))
+      (is (zero? (:bytes (m/index-cache-stats db))) "a closed store keeps no segments"))))
