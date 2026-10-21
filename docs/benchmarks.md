@@ -473,3 +473,33 @@ now includes decoded values: 0.94-1.02 of measured heap across longs, 20/200-cha
 strings, instants, uuids, keywords and bytes (segcache-heap-test). With values detached
 only for segments that hold Dates, bytes or tuples (50ae530, 3 runs, cache on): AEVT
 118-121M/s mem, 83-84M/s file; EAVT 24.0-24.8M/s mem, 20.8-23.0M/s file.
+
+## Read performance: flyweight + index segment cache (bf70c3f)
+
+Full suite, scale 1.0, quiet machine. Values are mnemonic-mem unless noted; the last column
+is the factor vs Datomic mem from the same run (below 1 = MnemonicDB faster).
+Raw: `bench/results/2026-10-21-bf70c3f.md`.
+
+| workload | baseline (fbc31df) | round 2 (6ba6bd3) | now (bf70c3f) | vs Datomic |
+|---|---:|---:|---:|---:|
+| AEVT scan datoms/s | 2.89M | 5.07M | 110M (file 82M) | 0.32x |
+| EAVT scan datoms/s | 1.98M | 3.76M | 19.9M | 0.65x |
+| entity + 3 attrs /s (each entity read once) | 166k | 308k | 281k (file 313k) | 2.47x |
+| entity + 3 attrs, 8 threads /s | — | 2.33M | 6.74M | 0.24x |
+| pull nested /s | 77k | 123k | 267k (file 336k) | 0.88x |
+| pull [*] /s | 154k | 229k | 249k (file 349k) | 0.72x |
+| lookup-ref entid /s | 411k | 711k | 761k | 1.46x |
+| entity via lookup ref /s | 198k | 279k | 383k | 1.26x |
+| query a / b / c ms | 0.034 / 0.646 / 58.7 | 0.017 / 0.171 / 1.35 | 0.006 / 0.039 / 0.404 | 0.13x / 0.14x / 0.45x |
+| query d / e / f ms | 168 / 111 / 2.11 | 79.3 / 66.2 / 1.04 | 26.8 / 42.2 / 0.235 | 0.14x / 0.66x / 0.29x |
+| as-of query ms | 7.46 | 2.72 | 0.444 | 0.59x |
+| as-of 3-attr scan datoms/s | 0.57M | 1.09M | 7.12M | 1.16x |
+| history scan datoms/s | 2.38M | 5.80M | 18.2M | 2.74x |
+| bulk-load entities/s | 22.1k | 41.9k | 44.7k | 1.38x |
+| small-tx tx/s | 4.4k | 21.5k | 21.1k | 1.54x |
+
+Repeat reads (the suite reads each entity once; see "Index cache" above): entity + 3 warm
+1.27M/s and 90/1 hot set 1.19M/s (Datomic mem ~0.71M / 1.27M); larger-than-cache 90/10
+skew 3.0x vs cache off; uniform larger-than-cache reads roughly unchanged; cold first reads
+~10-20 percent slower than cache off. Durable writes unchanged: 314 / 606 / 2,291 tx/s at
+1 / 4 / 16 threads with fsync, 23-34k tx/s with `?sync=false`.
