@@ -172,3 +172,30 @@
       (is (= "Can't pull from history" (msg #(m/pull h [:p/age] a))))
       (is (= "Can't pull from history" (msg #(m/pull-many h [:p/age] [a])))))
     (is (not= (m/entity old a) (m/entity db a)))))
+
+(deftest shared-entity-concurrent-reads-test
+  (testing "one entity read by many threads (lazy cache) always yields the same values"
+    (let [{:keys [db ids]} (fixture)
+          a (m/entity db (ids "a"))
+          expected {:p/name "Al" :p/age 30 :p/tags #{"x" "y"} :p/kind :kind/admin}
+          absent #{:p/nothing :p/boss :p/friends}
+          ks [:p/name :p/age :p/tags :p/kind :p/nothing :p/boss :p/friends]
+          run (fn []
+                (dotimes [_ 200]
+                  (doseq [k (shuffle ks)]
+                    (let [v (get a k)]
+                      (when (and (contains? expected k) (not= (expected k) v))
+                        (throw (ex-info "torn read" {:k k :v v})))
+                      (when (and (absent k) (some? v))
+                        (throw (ex-info "phantom value" {:k k :v v})))))
+                  (when-not (= 6 (count (seq a)))
+                    (throw (ex-info "torn entity seq" {:n (count (seq a))})))))
+          fs (doall (repeatedly 8 #(future (run))))]
+      (doseq [f fs] (is (nil? @f)))))
+  (testing "absent attributes are cached as absent, not as a value"
+    (let [{:keys [db ids]} (fixture)
+          b (m/entity db (ids "b"))]
+      (is (nil? (:p/age b)))
+      (is (nil? (:p/age b)))
+      (is (= :nf (get b :p/age :nf)))
+      (is (not (contains? b :p/age))))))

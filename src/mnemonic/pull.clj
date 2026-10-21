@@ -274,26 +274,40 @@
     (ref-attr? attr) (default-ref-value db sch attr eid (long c) st)
     :else c))
 
+(defn- collect-children
+  "Vector of the non-nil `(child-value ... (getter d) ...)` over the datoms `ds`, or nil
+  when empty."
+  [db sch eid ^Attr attr ds ast st ^AttrSpec spec e?]
+  (let [n (count ds)]
+    (loop [i 0 out (transient [])]
+      (if (< i n)
+        (let [^Datom d (nth ds i)
+              r (child-value db sch eid attr (if e? (.-e d) (.-v d)) ast st spec)]
+          (recur (inc i) (if (nil? r) out (conj! out r))))
+        (let [out (persistent! out)]
+          (when (pos? (count out)) out))))))
+
 (defn- spec-raw
   "Value of `spec` for `eid` before :xform/:default, or nil when absent."
   [db sch eid ast st ^AttrSpec spec]
   (let [^Attr attr (schema/attr sch (:attr spec))]
     (when attr
       (let [many? (= :db.cardinality/many (:cardinality attr))
-            limit (:limit spec)]
+            limit (:limit spec)
+            prefix (entity/ea-prefix eid (long (:id attr)))]
         (if (:reverse? spec)
           (when (ref-attr? attr)
-            (when-let [ds (entity/datoms-seq db :vaet [eid (:id attr)]
-                                             (if (:component? attr) 1 limit))]
-              (let [vs (keep (fn [^Datom d] (child-value db sch eid attr (.-e d) ast st spec)) ds)]
-                (when (seq vs)
-                  (if (:component? attr) (first vs) (vec vs))))))
-          (when-let [ds (entity/datoms-seq db :eavt [eid (:id attr)] (if many? limit 1))]
-            (if many?
-              (let [vs (keep (fn [^Datom d] (child-value db sch eid attr (.-v d) ast st spec))
-                             ds)]
-                (when (seq vs) (vec vs)))
-              (child-value db sch eid attr (.-v ^Datom (first ds)) ast st spec))))))))
+            (if (:component? attr)
+              ;; component: only the first datom is read
+              (when-let [ds (entity/datoms-by-prefix db :vaet prefix 1)]
+                (first (collect-children db sch eid attr ds ast st spec true)))
+              (when-let [ds (entity/datoms-by-prefix db :vaet prefix limit)]
+                (collect-children db sch eid attr ds ast st spec true))))
+          (if many?
+            (when-let [ds (entity/datoms-by-prefix db :eavt prefix limit)]
+              (collect-children db sch eid attr ds ast st spec false))
+            (when-let [^Datom d (entity/first-datom db :eavt prefix)]
+              (child-value db sch eid attr (.-v d) ast st spec))))))))
 
 (defn- spec-value [db sch eid ast st ^AttrSpec spec]
   (let [raw (spec-raw db sch eid ast st spec)
@@ -305,18 +319,25 @@
 (defn- wildcard-entries
   "[key value] for every attribute of `eid` not overridden by an explicit spec."
   [db sch eid override st]
-  (->> (entity/datoms-seq db :eavt [eid])
-       (partition-by (fn [^Datom d] (.-a d)))
-       (keep (fn [ds]
-               (let [^Attr attr (get (:attrs sch) (.-a ^Datom (first ds)))]
-                 (when (and attr (not (contains? override (:ident attr))))
-                   (let [value (fn [^Datom d] (if (ref-attr? attr)
-                                                (default-ref-value db sch attr eid (long (.-v d)) st)
-                                                (.-v d)))]
-                     [(:ident attr)
-                      (if (= :db.cardinality/many (:cardinality attr))
-                        (vec (map value (take default-limit ds)))
-                        (value (first ds)))])))))))
+  (let [ds (entity/datoms-by-prefix db :eavt (entity/e-prefix eid) nil)]
+    (entity/keep-attr-groups
+     ds
+     (fn [a i j]
+       (let [^Attr attr (get (:attrs sch) a)]
+         (when (and attr (not (contains? override (:ident attr))))
+           (let [value (fn [^Datom d] (if (ref-attr? attr)
+                                        (default-ref-value db sch attr eid (long (.-v d)) st)
+                                        (.-v d)))
+                 i (long i)
+                 j (long j)]
+             [(:ident attr)
+              (if (= :db.cardinality/many (:cardinality attr))
+                (let [end (min j (+ i (long default-limit)))]
+                  (loop [k i out (transient [])]
+                    (if (< k end)
+                      (recur (inc k) (conj! out (value (nth ds k))))
+                      (persistent! out))))
+                (value (nth ds i)))])))))))
 
 (defn- pull-entity
   "Map for `eid` under `ast`, or nil when it has no content."
