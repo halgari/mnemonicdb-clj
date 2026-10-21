@@ -470,4 +470,6 @@ above (mem: AEVT 7.6M -> 103M/s, EAVT 3.2M -> 22.0M/s, pull nested 90k -> 272k/s
 query 2.03 -> 0.45 ms, entity+3 warm 255k -> 1.14M/s, 8 threads 0.91M -> 7.8M/s,
 bulk-load -5%; big-file skewed 263k -> 832k/s, uniform 1.08-1.18x). The heap estimate
 now includes decoded values: 0.94-1.02 of measured heap across longs, 20/200-character
-strings, instants, uuids, keywords and bytes (segcache-heap-test).
+strings, instants, uuids, keywords and bytes (segcache-heap-test). With values detached
+only for segments that hold Dates, bytes or tuples (50ae530, 3 runs, cache on): AEVT
+118-121M/s mem, 83-84M/s file; EAVT 24.0-24.8M/s mem, 20.8-23.0M/s file.
