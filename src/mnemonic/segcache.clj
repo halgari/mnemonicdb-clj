@@ -36,8 +36,9 @@
 
   Memory: two CLOCK pools with byte budgets (estimated ~130 B per datom): points (entity,
   reverse refs, [a v] lookups) get 3/4, AEVT scan chunks 1/4, so a large scan never
-  evicts hot entities. Admission on the second miss (a doorkeeper of hashes): one-off
-  reads do not pay for copying and storing a granule. Granules larger than `point-cap` /
+  evicts hot entities. Admission on the second miss by a later read (a sliding Bloom
+  doorkeeper, see `admit?`): one-off reads do not pay for copying and storing a granule,
+  and a working set much larger than the budget does not churn it. Granules larger than `point-cap` /
   `chunk-cap` entries are remembered as 'big' and streamed from RocksDB."
   (:import (java.util Arrays)
            (java.util.concurrent ConcurrentHashMap ConcurrentLinkedQueue)

@@ -398,3 +398,68 @@ Startup (JVM start to first answer, 100k-entity file db, JDK 27; `bench/mnemonic
 | + JDK AOT cache (JEP 483) | 0.22-0.23 s | 25-28 ms | 90 ms |
 
 The cold 100 ms connect is the native library extraction and load (62 ms) plus class initialisation; a warm connect (second one in the same JVM) is 22 ms, of which opening RocksDB with 10 column families is 19 ms and loading the schema 0.5-2 ms, so schema caching was not worth adding. See README "Tuning" for how to build the AOT jar and the CDS/AOT archives in an application.
+
+## Index cache
+
+The heap index segment cache (`mnemonic.segcache`, README "Tuning"), cache off
+(`-Dmnemonic.index-cache-mb=0`) against on (default 256 MB), commit ef1910a. File
+databases on a real filesystem (`target/`, btrfs, not tmpfs). Off and on runs
+interleaved, 3 each, medians; the machine was otherwise idle. Suite at scale 1.0
+(`MNEMONIC_BENCH_BACKENDS=mnemonic-mem,mnemonic-file`); controlled hit rates and the
+larger-than-cache rows from `bench/mnemonic/cache_bench.clj` (100k people; `big-file`:
+150k people, about 4x a 32 MB budget).
+
+| row | mem off | mem on | file off | file on |
+|---|---:|---:|---:|---:|
+| AEVT :p/age scan datoms/s | 8.17M | 121M (14.9x) | 8.03M | 92.3M (11.5x) |
+| EAVT scan (10k entities) datoms/s | 3.27M | 25.1M (7.7x) | 3.54M | 23.6M (6.7x) |
+| entity + 3 attrs /s (suite: 100k random, each read once) | 238k | 299k (1.26x) | 276k | 324k (1.18x) |
+| pull nested /s | 91k | 296k (3.3x) | 104k | 347k (3.4x) |
+| pull [*] /s | 207k | 238k (1.15x) | 279k | 346k (1.24x) |
+| entid lookup-ref (hit) /s | 563k | 787k (1.4x) | 597k | 794k (1.3x) |
+| entity via lookup ref /s | 246k | 398k (1.6x) | 276k | 435k (1.6x) |
+| entid miss, distinct (cold-lookup, file) /s | | | 1.24M | 1.05M (0.85x) |
+| query a / b / c ms | 0.017 / 0.222 / 1.92 | 0.006 / 0.042 / 0.398 | 0.017 / 0.199 / 1.69 | 0.006 / 0.041 / 0.401 |
+| query d / e / f ms | 53.7 / 58.8 / 1.51 | 27.7 / 43.7 / 0.236 | 57.7 / 58.9 / 1.46 | 27.0 / 43.5 / 0.232 |
+| as-of query ms | 2.03 | 0.447 (4.5x) | 2.22 | 0.516 (4.3x) |
+| as-of 3-attr AEVT scan datoms/s | 1.48M | 7.36M (5.0x) | 1.33M | 6.74M (5.1x) |
+| history :p/age AEVT scan datoms/s | 7.16M | 18.5M (2.6x) | 6.76M | 17.1M (2.5x) |
+| entity + 3 attrs, 8 threads /s | 906k | 7.65M (8.4x) | 1.82M | 7.90M (4.3x) |
+| entid, 8 threads /s | 1.77M | 7.05M (4.0x) | 3.16M | 13.2M (4.2x) |
+| bulk-load entities/s | 47.3k | 44.9k (-5%) | 39.4k | 38.2k (-3%) |
+| small-tx tx/s (file: fsync per tx) | 22.2k | 21.6k (-3%) | 318 | 300 (-6%, noise level) |
+
+Controlled hit rates (`cache_bench mem`; file within 10 percent):
+
+| row | off | on |
+|---|---:|---:|
+| entity, one attribute, uniform, cold | 520k | 422k (0.81x) |
+| entity + 3, uniform pass 1 / 2 / 3 | 247k / 251k / 254k | 261k / 504k / 1.27M |
+| entity + 3, 90 percent of reads on 1 percent | 278k | 1.19M (4.3x) |
+| same, writer at ~2.8k tx/s, fresh `d/db` per 10 reads | 236k | 1.03M (4.4x) |
+| pull nested pass 1 / 3 | 95k / 95k | 154k / 449k |
+| entid lookup-ref pass 1 / 3 | 593k / 598k | 506k / 1.84M |
+| entid miss (same misses again) | 995k | 2.08M |
+| as-of db, entity + 3, warm | 185k | 594k (3.2x) |
+| heap with every entity and email cached | | 112 MB, 147 B/datom (estimate 134 MB) |
+
+Larger than the cache (`cache_bench big-file`, 32 MB budget, 150k people):
+
+| row | off | on |
+|---|---:|---:|
+| entity + 3, uniform, pass 1 / 2 | 252k / 255k | 261k / 284k |
+| entity + 3, 90 percent of reads on 10 percent | 274k | 813k (3.0x) |
+| same, after two full AEVT scans of :p/age | 269k | 780k (2.9x) |
+| AEVT :p/age full scan (larger than the scan pool: streamed) | 6.96M | 7.09M |
+| pull [*] uniform | 236k | 224k |
+
+Reading the numbers: a hit costs no JNI call, decode or lock, so warm reads are 3-5x
+faster and reader threads scale; the suite's single-pass rows (entity, pull [*]) gain
+less because a segment is only admitted when a later read wants it again. First reads
+of uncached data cost 10-20 percent more (hash, map probe, admission bookkeeping,
+copying a granule when it is admitted). Writers pay one stamp per touched granule
+(3-5 percent of a bulk load). Variants measured and dropped: eager entity reads (one
+`[e]` read on the first attribute; 2.4x slower warm than slicing `[e a]` out of the
+cached segment), admission on the second probe of the same read (filled and evicted on
+every read of a too-large working set: -16 percent uniform), a 4096-entry chunk cap
+(history chunks of updated attributes did not fit: as-of query 1.6 ms instead of 0.5).
