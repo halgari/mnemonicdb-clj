@@ -59,6 +59,9 @@
     (bytes? a) (and (bytes? b) (Arrays/equals ^bytes a ^bytes b))
     (and (float? a) (Double/isNaN (double a))) (and (float? b) (Double/isNaN (double b)))
     (vector? a) (and (vector? b) (= (count a) (count b)) (every? true? (map same? a b)))
+    ;; bigints decode to clojure.lang.BigInt whatever integer class was written
+    (or (instance? BigInteger a) (instance? clojure.lang.BigInt a))
+    (and (instance? clojure.lang.BigInt b) (= a b))
     (decimal? a) (and (decimal? b) (zero? (.compareTo ^BigDecimal a ^BigDecimal b)))
     :else (and (= a b) (= (class a) (class b)))))
 
@@ -125,7 +128,11 @@
 (defspec order-instant 2000 (order-prop gen-date compare))
 (defspec order-uuid 2000 (order-prop gen-uuid compare))
 (defspec order-boolean 100 (order-prop gen/boolean compare))
-(defspec order-bytes 2000 (order-prop gen-bytes #(Arrays/compareUnsigned ^bytes %1 ^bytes %2)))
+;; Datomic orders byte arrays by length, then by signed byte values
+(defspec order-bytes 2000 (order-prop gen-bytes #(let [^bytes a %1 ^bytes b %2]
+                                                   (if (= (alength a) (alength b))
+                                                     (Arrays/compare a b)
+                                                     (compare (alength a) (alength b))))))
 (defspec order-tuple 2000 (order-prop gen-tuple-long lex-compare))
 
 (deftest bigdec-order-is-numeric
@@ -264,3 +271,10 @@
     (is (= by-value by-bytes))
     (is (every? #(= % (rt %)) ss) "including unpaired surrogates")
     (is (= (rt :a/😀) :a/😀))))
+
+(deftest bigint-decodes-to-clojure-bigint
+  ;; Datomic returns clojure.lang.BigInt for :db.type/bigint (Java hashCode differs from BigInteger)
+  (doseq [n [0N 5N -3N 123456789012345678901234567890N]]
+    (is (instance? clojure.lang.BigInt (rt n)))
+    (is (instance? clojure.lang.BigInt (rt (biginteger n))))
+    (is (= n (rt n)))))

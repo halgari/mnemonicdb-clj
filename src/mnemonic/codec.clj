@@ -82,6 +82,21 @@
   (write-byte! out mask)
   (write-byte! out mask))
 
+(defn- write-byte-array!
+  "Datomic orders byte arrays by length, then by signed byte values: a 4-byte length followed
+  by the bytes with the sign bit flipped (self-delimiting, no escaping needed)."
+  [^ByteArrayOutputStream out ^bytes bs]
+  (write-raw! out (.array (.putInt (ByteBuffer/allocate 4) (alength bs))))
+  (dotimes [i (alength bs)]
+    (write-byte! out (bit-xor 0x80 (bit-and 0xFF (aget bs i))))))
+
+(defn- read-byte-array ^bytes [^ByteBuffer buf]
+  (let [n (.getInt buf)
+        bs (byte-array n)]
+    (dotimes [i n]
+      (aset-byte bs i (unchecked-byte (bit-xor 0x80 (bit-and 0xFF (.get buf))))))
+    bs))
+
 (defn- read-escaped ^bytes [^ByteBuffer buf ^long mask]
   (let [out (ByteArrayOutputStream.)]
     (loop []
@@ -227,7 +242,7 @@
                     (write-escaped! out (utf8 (or (namespace v) "")) 0)
                     (write-escaped! out (utf8 (name v)) 0))
     (instance? URI v) (do (write-byte! out tag-uri) (write-escaped! out (utf8 (str v)) 0))
-    (bytes? v) (do (write-byte! out tag-bytes) (write-escaped! out v 0))
+    (bytes? v) (do (write-byte! out tag-bytes) (write-byte-array! out v))
     (vector? v) (do (write-byte! out tag-tuple)
                     (doseq [x v] (encode-value out x))
                     (write-byte! out tag-tuple-end))
@@ -253,7 +268,7 @@
       0x01 nil
       0x10 (not (zero? (.get buf)))
       0x11 (read-long buf)
-      0x12 (read-bigint buf)
+      0x12 (bigint (read-bigint buf))
       0x13 (let [b (.getInt buf)]
              (Float/intBitsToFloat (bit-xor b (if (neg? b) Integer/MIN_VALUE -1))))
       0x14 (let [b (.getLong buf)]
@@ -265,7 +280,7 @@
       0x19 (let [n (read-escaped buf 0)] (ns-name->symbol n (read-escaped buf 0) keyword))
       0x1A (let [n (read-escaped buf 0)] (ns-name->symbol n (read-escaped buf 0) symbol))
       0x1B (URI. (from-utf8 (read-escaped buf 0)))
-      0x1C (read-escaped buf 0)
+      0x1C (read-byte-array buf)
       0x1D (loop [acc (transient [])]
              (if (zero? (bit-and 0xFF (.get buf (.position buf))))
                (do (.get buf) (persistent! acc))
