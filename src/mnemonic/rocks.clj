@@ -42,7 +42,7 @@
   (:import (java.lang.ref Cleaner)
            (java.nio.charset StandardCharsets)
            (java.util ArrayList Set)
-           (java.util.concurrent ConcurrentHashMap ConcurrentLinkedDeque)
+           (java.util.concurrent ConcurrentHashMap)
            (java.util.concurrent.atomic AtomicBoolean AtomicInteger AtomicLong AtomicLongArray
                                         AtomicReferenceArray)
            (java.util.concurrent.locks LockSupport)
@@ -295,7 +295,10 @@
 (deftype Slot [^Store store ^RocksIterator it ^ReadOptions own-ro snap
                ^long cfi ^long mode ^AtomicInteger state])
 
-(deftype Pool [^ConcurrentLinkedDeque q ^AtomicInteger n])
+;; Idle slots of one (cf, mode, thread stripe): a tiny array stack guarded by its own
+;; monitor (almost never contended: stripes are per thread). Never hold the pool monitor
+;; while taking a slot monitor.
+(deftype Pool [^objects arr ^ints cnt])   ; cnt[0] = number of idle slots
 
 (declare drain-pools!)
 
@@ -384,24 +387,63 @@
   (let [^AtomicReferenceArray pools (.-pools snap)
         i (int (+ (* (+ (* cfi 2) mode) pool-stripes) (bit-and (thread-id) (dec pool-stripes))))]
     (or (.get pools i)
-        (let [p (Pool. (ConcurrentLinkedDeque.) (AtomicInteger. 0))]
+        (let [p (Pool. (object-array pool-cap) (int-array 1))]
           (if (.compareAndSet pools i nil p) p (.get pools i))))))
 
+(defn- pool-pop!
+  "An idle slot of `p`, or nil."
+  [^Pool p]
+  (locking p
+    (let [^ints c (.-cnt p)
+          n (aget c 0)]
+      (when (pos? n)
+        (let [^objects a (.-arr p)
+              i (dec n)
+              s (aget a i)]
+          (aset a i nil)
+          (aset c 0 i)
+          s)))))
+
+(defn- pool-push!
+  "Pushes `s`; false when `p` is full."
+  [^Pool p s]
+  (locking p
+    (let [^ints c (.-cnt p)
+          n (aget c 0)]
+      (when (< n pool-cap)
+        (aset ^objects (.-arr p) n s)
+        (aset c 0 (unchecked-inc-int n))
+        true))))
+
+(defn- drain-pool!
+  "Destroys every idle slot of `p`. Slots are taken out under the pool monitor and
+  destroyed outside it."
+  [^Pool p]
+  (loop []
+    (when-let [s (pool-pop! p)]
+      (destroy-slot! s)
+      (recur))))
+
 (defn- drain-pools!
-  "Destroys every idle slot of `snap` (the snapshot was released)."
+  "Destroys every idle slot of `snap`'s pools."
   [^Snap snap]
   (let [^AtomicReferenceArray pools (.-pools snap)]
     (dotimes [i (.length pools)]
-      (when-let [^Pool p (.get pools i)]
-        (loop []
-          (when-let [s (.pollFirst ^ConcurrentLinkedDeque (.-q p))]
-            (.decrementAndGet ^AtomicInteger (.-n p))
-            (destroy-slot! s)
-            (recur))))))
+      (when-let [p (.get pools i)]
+        (drain-pool! p))))
   nil)
 
+(defn retire-snapshot!
+  "Closes the idle pooled iterators of `snap` WITHOUT releasing it: the snapshot and every
+  open cursor stay valid, later reads simply open (and pool) fresh iterators. Called for
+  superseded published dbs so that their idle iterators do not pin memtables/SSTs until
+  the GC runs the Cleaner."
+  [_store ^Snap snap]
+  (drain-pools! snap))
+
 (defn- give-back!
-  "A leased slot is no longer used: pool it, or destroy it when it cannot be reused."
+  "A leased slot is no longer used: pool it, or destroy it when it cannot be reused.
+  Must not be called holding any slot monitor."
   [^Slot s]
   (let [snap (.-snap s)]
     (if (and snap pool-enabled?
@@ -409,14 +451,12 @@
              (not (.isReleased ^ISnap snap))
              (not (closed? (.-store s))))
       (let [^Pool p (pool-of snap (.-cfi s) (.-mode s))]
-        (if (< (.incrementAndGet ^AtomicInteger (.-n p)) (inc pool-cap))
-          (do (.addFirst ^ConcurrentLinkedDeque (.-q p) s)
-              ;; the snapshot may have been released after the check above, with its
-              ;; drain already past this stack: drain again (release sets the flag
-              ;; before draining, we push before re-reading it)
-              (when (.isReleased ^ISnap snap) (drain-pools! snap)))
-          (do (.decrementAndGet ^AtomicInteger (.-n p))
-              (destroy-slot! s))))
+        (if (pool-push! p s)
+          ;; the snapshot may have been released after the check above, with its
+          ;; drain already past this stack: drain again (release sets the flag
+          ;; before draining, we push before re-reading it)
+          (when (.isReleased ^ISnap snap) (drain-pools! snap))
+          (destroy-slot! s)))
       (destroy-slot! s))))
 
 (defn- new-slot
@@ -447,11 +487,10 @@
       (when (.isReleased ^ISnap snap) (throw (db-released-ex)))
       (let [^Pool p (pool-of snap (long cfi) (long mode))]
         (loop []
-          (if-let [^Slot s (.pollFirst ^ConcurrentLinkedDeque (.-q p))]
-            (do (.decrementAndGet ^AtomicInteger (.-n p))
-                (if (zero? (.get ^AtomicInteger (.-state s)))
-                  s
-                  (recur)))
+          (if-let [^Slot s (pool-pop! p)]
+            (if (zero? (.get ^AtomicInteger (.-state s)))
+              s
+              (recur))
             (new-slot store cf cfi mode snap)))))
     (new-slot store cf cfi mode snap)))
 
@@ -477,7 +516,11 @@
   "Atomically apply `ops`: seq of [:put cf k v] / [:delete cf k]."
   [^Store store ops {:keys [sync?]}]
   (with-open [wb (WriteBatch.)
-              wo (doto (WriteOptions.) (.setSync (boolean sync?)))]
+              ;; mem stores are not durable: no WAL (a synced write needs the WAL)
+              wo (let [mem? (some? (.-env store))]
+                   (doto (WriteOptions.)
+                     (.setDisableWAL mem?)
+                     (.setSync (and (boolean sync?) (not mem?)))))]
     ;; the batch references column family handles: build it under the guard too
     (guarded store
       (doseq [op ops]
@@ -518,6 +561,9 @@
   (^bytes seekKey [^bytes k])
   (^bytes nextKey [])
   (^void close []))
+
+(definterface ILease
+  (^boolean markDone []))
 
 (defn- check-status
   "Called when the iterator became invalid: an I/O error or corruption must not look
@@ -582,13 +628,17 @@
         (let [^RocksIterator it (.-it s)]
           (.next it)
           (if (.isValid it) (.key it) (do (check-status it) nil))))))
-  (close [_]
+  (close [this]
+    ;; give-back! may lock other (idle) slots while draining: never under the monitor
+    (when (.markDone this) (give-back! slot))
+    nil)
+  ILease
+  (markDone [_]
     (let [s slot]
       (locking s
-        (when-not done
-          (set! done (boolean true))
-          (give-back! s))
-        nil)))
+        (if done
+          false
+          (do (set! done (boolean true)) true)))))
   java.lang.AutoCloseable)
 
 (defn- prefix-mode?
