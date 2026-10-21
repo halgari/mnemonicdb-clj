@@ -7,19 +7,23 @@
             [mnemonic.db :as db]
             [mnemonic.index :as index]
             [mnemonic.rocks :as rocks]
+            [mnemonic.rocks-sync :as rocks-sync]
             [mnemonic.schema :as schema]
             [mnemonic.tx :as tx])
   (:import (java.io File)
            (mnemonic.datom Datom)
-           (java.util.concurrent CompletableFuture ExecutionException ExecutorService Executors
-                                 RejectedExecutionException ThreadFactory TimeUnit)
+           (java.util.concurrent CompletableFuture ConcurrentLinkedQueue ExecutionException
+                                 ExecutorService Executors RejectedExecutionException
+                                 ThreadFactory TimeUnit)
            (java.util.concurrent.atomic AtomicLong)))
 
 (set! *warn-on-reflection* true)
 
 ;; state: (atom {:db Base :meta meta :released? bool :stale? bool})
 ;; key: the normalized registry key, [:mem name] or [:file canonical-path]
-(defrecord Connection [uri key store state executor queues])
+;; pending: ConcurrentLinkedQueue of submitted-but-not-started transactions (group commit
+;; drains it); sync?: fsync before a transaction's future completes (file databases)
+(defrecord Connection [uri key store state executor queues pending sync?])
 
 (def ^:private mem-prefix "mnemonic:mem://")
 (def ^:private file-prefix "mnemonic:file://")
@@ -38,9 +42,23 @@
 (defn- canonical-path [^String p]
   (.getCanonicalPath (File. p)))
 
+;; "?sync=true|false" on a file URI (default true): see README "Durability"
+(defn- parse-sync [uri query]
+  (if (str/blank? query)
+    true
+    (let [kvs (into {} (map #(let [[k v] (str/split % #"=" 2)] [k v])) (str/split query #"&"))
+          bad (fn [] (fail :db.error/invalid-db-uri
+                           (str "Invalid database URI " uri " (supported option: sync=true|false)")))]
+      (when-not (every? #{"sync"} (keys kvs)) (bad))
+      (case (get kvs "sync")
+        "true" true
+        "false" false
+        (bad)))))
+
 (defn- parse-uri
-  "{:kind :mem :name n :key k} or {:kind :file :path p :key k}. File paths are
-  canonicalized so one database written two ways maps to one key."
+  "{:kind :mem :name n :key k} or {:kind :file :path p :key k :sync? b}. File paths are
+  canonicalized so one database written two ways maps to one key; a `?sync=false` query
+  is stripped from the path."
   [uri]
   (cond
     (not (string? uri)) (fail :db.error/invalid-db-uri (str "Invalid database URI " (pr-str uri)))
@@ -50,10 +68,13 @@
       {:kind :mem :name n :key [:mem n]})
     (str/starts-with? uri file-prefix)
     (let [p (subs uri (count file-prefix))
+          qi (str/index-of p "?")
+          query (when qi (subs p (inc (long qi))))
+          p (if qi (subs p 0 qi) p)
           p (if (re-matches #"/[A-Za-z]:.*" p) (subs p 1) p)]
       (when (str/blank? p) (fail :db.error/invalid-db-uri (str "Invalid database URI " uri)))
       (let [p (canonical-path p)]
-        {:kind :file :path p :key [:file p]}))
+        {:kind :file :path p :key [:file p] :sync? (parse-sync uri query)}))
     :else (fail :db.error/invalid-db-uri (str "Invalid database URI " uri))))
 
 (defn- file-db-exists? [path]
@@ -94,13 +115,14 @@
                  ", last t " basis-t ")")
             :cognitect.anomalies/fault {:meta meta :basis-t basis-t}))))
 
-(defn- make-connection [uri key store]
+(defn- make-connection [uri key store sync?]
   (when-not (bootstrap/read-meta store)
     (not-found uri))
   (let [d (db/base-db store)]
     (try (check-format! (db/db-meta d) (index/-basis-t d))
          (catch Throwable t (db/release-db d) (throw t)))
-    (->Connection uri key store (atom {:db d :meta (db/db-meta d) :released? false}) (executor) (atom #{}))))
+    (->Connection uri key store (atom {:db d :meta (db/db-meta d) :released? false}) (executor) (atom #{})
+                  (ConcurrentLinkedQueue.) (boolean sync?))))
 
 ;; ------------------------------------------------------------------ lifecycle
 
@@ -146,14 +168,14 @@
   [uri]
   (under-lock
    uri
-   (fn [{:keys [kind name path key]}]
+   (fn [{:keys [kind name path key sync?]}]
      (or (get-in @registry [:conns key])
          (let [store (case kind
                        :mem (or (get-in @registry [:mem name]) (not-found uri))
                        :file (if (file-db-exists? path)
                                (rocks/open-store {:path path})
                                (not-found uri)))
-               conn (try (make-connection uri key store)
+               conn (try (make-connection uri key store (if (= kind :file) sync? false))
                          (catch Throwable t
                            (when (= kind :file) (rocks/close-store store))
                            (throw t)))]
@@ -364,49 +386,154 @@
           (do (rebuild-db! conn) (recur (inc attempt)))
           [db r])))))
 
-(defn- do-transact
-  "Runs on the transactor thread. Once the batch is written the new meta is recorded
-  immediately, so a failure while building the new db cannot make the next tx reuse
-  ids; the db is then published incrementally from the prepare result (new snapshot,
-  basis-t, meta, and the schema reloaded only when the tx touched it). If that fails the
-  db is rebuilt lazily (:stale?)."
-  [^Connection conn tx-data]
-  (let [[db r] (prepare-tx conn tx-data)
-        store (:store conn)
-        _ (rocks/write! store (:ops r) {:sync? (file-uri? conn)})
-        _ (swap! (:state conn) assoc :meta (:meta r) :stale? true)
-        publish (fn []
-                  (let [d (db/successor-db store db (codec/tx->t (:tx r)) (:meta r)
-                                           (schema-touched? (:tx-data r)))]
-                    (swap! (:state conn) assoc :db d :stale? false)
-                    d))
-        ;; the tx is durable: retry the db build once instead of failing the caller
-        new-db (try (publish)
-                    (catch Throwable _
-                      (try (rebuild-db! conn)
-                           (catch Throwable t
-                             (throw (post-commit-error r t))))))
-        report {:db-before db :db-after new-db :tx-data (:tx-data r) :tempids (:tempids r)}]
-    (doseq [^java.util.Queue q @(:queues conn)]
-      (.add q report))
-    report))
+(defn- prepare-chain
+  "Prepares `tx-data` against `db`, the db built from the previous tx of the same group
+  (not yet published), with that tx's `meta`. A nil or released `db` is rebuilt from
+  the store, which already holds every tx written so far."
+  [^Connection conn db meta tx-data]
+  (loop [attempt 0 db db]
+    (when (:released? @(:state conn)) (throw (released-ex)))
+    (let [db (if (or (nil? db) (db/released? db)) (db/base-db (:store conn)) db)
+          r (try (tx/prepare db meta tx-data)
+                 (catch Throwable t
+                   (if (and (db-released-error? t) (< attempt 3)) ::retry (throw t))))]
+      (if (identical? r ::retry)
+        (recur (inc attempt) nil)
+        [db r]))))
+
+;; db/retire-pool! (perf round 2, piece R2-A) drops the idle pooled iterators of a db that
+;; was superseded, without invalidating it. Resolved lazily so this namespace works
+;; with or without that piece merged.
+(def ^:private retire-fn (delay (resolve 'mnemonic.db/retire-pool!)))
+
+(defn- retire! [db]
+  (when db
+    (when-let [f @retire-fn]
+      (try (f db) (catch Throwable _ nil)))))
+
+(defn- unknown-status-error ^Throwable [txid ^Throwable cause]
+  (ex-info (str "Transaction " txid " was written but the write-ahead log could not be synced: "
+                "its commit status is unknown")
+           {:db/error :db.error/commit-status-unknown
+            :cognitect.anomalies/category :cognitect.anomalies/fault
+            :tx txid}
+           cause))
+
+(defn- complete-entries!
+  "Completes the futures of `pend` ([f outcome txid written?] in submission order).
+  `sync-err` (or nil) is the failure of the group's fsync: it fails every tx that
+  was written, never one that was rejected before writing."
+  [^Connection conn ^java.util.ArrayList pend sync-err]
+  (doseq [[^CompletableFuture f outcome txid written?] pend]
+    (cond
+      (and written? sync-err) (.completeExceptionally f (unknown-status-error txid sync-err))
+      (instance? Throwable outcome) (.completeExceptionally f ^Throwable outcome)
+      :else (do (doseq [^java.util.Queue q @(:queues conn)]
+                  (.add q outcome))
+                (.complete f outcome)))))
+
+(defn- flush-group!
+  "Group commit point: fsyncs the WAL when anything was written (sync on), publishes the
+  newest db (or marks the state stale when no db could be built), then completes the
+  group's futures in submission order. Nothing completes before the fsync returns."
+  [^Connection conn ^java.util.ArrayList pend chain-db]
+  (when-not (.isEmpty pend)
+    (let [written? (boolean (some (fn [e] (nth e 3)) pend))
+          sync-err (when (and written? (:sync? conn))
+                     (try (rocks-sync/sync-wal! (:store conn)) nil
+                          (catch Throwable t t)))]
+      (when written?
+        (if chain-db
+          (swap! (:state conn) assoc :db chain-db :stale? false)
+          (swap! (:state conn) assoc :stale? true)))
+      (complete-entries! conn pend sync-err)
+      (.clear pend))))
+
+(defn- run-group!
+  "Runs on the transactor thread. Processes `entries` ([tx-data future] pairs) in order:
+  each tx is prepared against the db of the previous one (so it sees it, exactly as
+  with one-at-a-time transactions) and written as its own atomic WriteBatch, without
+  fsync. One fsync then covers the whole group before ANY of its futures completes
+  (with sync off every tx completes right after its write). A tx rejected in prepare
+  fails alone; the others are unaffected. If the fsync fails the written txs fail with
+  :db.error/commit-status-unknown. Once a batch is written the new meta is recorded
+  immediately, so a failure while building the new db cannot make the next tx reuse ids;
+  the db is then built incrementally from the prepare result, else rebuilt, else the
+  state is marked stale and rebuilt lazily."
+  [^Connection conn entries]
+  (let [store (:store conn)
+        sync? (:sync? conn)
+        pend (java.util.ArrayList.)
+        chain-db (volatile! nil)
+        chain-meta (volatile! nil)]
+    (doseq [[tx-data ^CompletableFuture f] entries]
+      (let [outcome
+            (try
+              (let [[db r] (if-let [m @chain-meta]
+                             (prepare-chain conn @chain-db m tx-data)
+                             (prepare-tx conn tx-data))]
+                (try
+                  (rocks/write! store (:ops r) {:sync? false})
+                  (catch Throwable t (retire! db) (throw t)))
+                (swap! (:state conn) assoc :meta (:meta r))
+                (vreset! chain-meta (:meta r))
+                (let [new-db (try (db/successor-db store db (codec/tx->t (:tx r)) (:meta r)
+                                                   (schema-touched? (:tx-data r)))
+                                  (catch Throwable _
+                                    ;; the tx is written: retry the db build once
+                                    (try (db/base-db store) (catch Throwable t t))))]
+                  (retire! db)
+                  (if (instance? Throwable new-db)
+                    (do (vreset! chain-db nil)
+                        [(post-commit-error r new-db) (:tx r) true])
+                    (do (vreset! chain-db new-db)
+                        [{:db-before db :db-after new-db :tx-data (:tx-data r)
+                          :tempids (:tempids r)}
+                         (:tx r) true]))))
+              (catch Throwable t [t nil false]))]
+        (.add pend [f (nth outcome 0) (nth outcome 1) (nth outcome 2)])
+        (when-not sync?
+          (flush-group! conn pend @chain-db))))
+    (flush-group! conn pend @chain-db)))
+
+(def ^:private ^:const max-group 256)
+
+(defn- drain!
+  "Executor task: takes up to `max-group` queued txs and runs them as one group."
+  [^Connection conn]
+  (let [^ConcurrentLinkedQueue q (:pending conn)
+        entries (loop [acc (transient []) n 0]
+                  (if (< n max-group)
+                    (if-let [e (.poll q)] (recur (conj! acc e) (inc n)) (persistent! acc))
+                    (persistent! acc)))]
+    (when (seq entries)
+      (.set writer-of conn)
+      (try (run-group! conn entries)
+           (catch Throwable t
+             ;; defensive: never leave a caller hanging; the state is rebuilt lazily
+             (swap! (:state conn) assoc :stale? true)
+             (doseq [[_ ^CompletableFuture f] entries]
+               (.completeExceptionally f t)))
+           (finally (.remove writer-of))))))
 
 (defn transact-async
   "Enqueues `tx-data`; returns a future of the tx report {:db-before :db-after :tx-data
   :tempids}. Failures complete the future exceptionally, so deref throws an
-  ExecutionException wrapping the ex-info."
+  ExecutionException wrapping the ex-info. For file databases with sync on (default) the
+  future completes only after the transaction is fsynced; transactions queued
+  together share one fsync (group commit)."
   [^Connection conn tx-data]
   (let [f (CompletableFuture.)
-        task ^Runnable (fn []
-                         (.set writer-of conn)
-                         (try (.complete f (do-transact conn tx-data))
-                              (catch Throwable t (.completeExceptionally f t))
-                              (finally (.remove writer-of))))]
+        entry [tx-data f]
+        ^ConcurrentLinkedQueue q (:pending conn)]
     (try
       (when (:released? @(:state conn)) (throw (released-ex)))
-      (.execute ^ExecutorService (:executor conn) task)
+      (.add q entry)
+      (.execute ^ExecutorService (:executor conn) ^Runnable (fn [] (drain! conn)))
       (catch RejectedExecutionException _
+        (.remove q entry)
         (.completeExceptionally f (released-ex)))
       (catch Throwable t
+        (.remove q entry)
         (.completeExceptionally f t)))
     f))

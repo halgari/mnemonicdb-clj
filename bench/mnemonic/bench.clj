@@ -28,6 +28,7 @@
     {:entities entities
      :batch (long (or (some-> (System/getenv "MNEMONIC_BENCH_BATCH") Long/parseLong) 1000))
      :small-tx (size "SMALLTX" 2000)
+     :durable-tx (size "DURABLE_TX" 800)
      :eavt-entities (min entities (size "EAVT_ENTITIES" 10000))
      :lookups (size "LOOKUPS" 100000)
      :pulls (size "PULLS" 10000)
@@ -146,6 +147,59 @@
            :checks-m {"email datoms" (scan-count (call b :datoms (db ctx) :aevt :p/email))
                       "age datoms" (scan-count (call b :datoms (db ctx) :aevt :p/age))}}))
       (finally (be/drop-db! ctx)))))
+
+(defn- durable-case
+  "`n` small txs, split over `threads` submitting threads that each deref their own
+  transact, on a REAL filesystem (target/bench-durable; /tmp is tmpfs here, which hides
+  fsync). `opts` is the URI query (\"\" = sync on, \"?sync=false\")."
+  [b n threads opts]
+  (let [root (doto (io/file "target" "bench-durable") (.mkdirs))
+        dir (str (.getCanonicalPath root) "/db-" (System/nanoTime))
+        uri (str "mnemonic:file://" dir opts)]
+    (call b :create-database uri)
+    (let [ctx {:uri uri :backend b :conn (call b :connect uri)}]
+      (try
+        (load-schema! ctx)
+        (dotimes [i 20] (tx! ctx (data/small-tx (+ 10000000 i))))
+        (let [per (quot n threads)
+              total-n (* per threads)
+              lat (long-array total-n)
+              start (java.util.concurrent.CountDownLatch. 1)
+              ws (vec (for [th (range threads)]
+                        (future
+                          (.await start)
+                          (dotimes [j per]
+                            (let [i (+ (* th per) j)
+                                  tx-data (data/small-tx (+ 20000000 i))
+                                  s (System/nanoTime)]
+                              (tx! ctx tx-data)
+                              (aset lat i (- (System/nanoTime) s)))))))
+              t0 (System/nanoTime)]
+          (.countDown start)
+          (run! deref ws)
+          (let [total (- (System/nanoTime) t0)
+                sorted (vec (sort (vec lat)))]
+            [(per-sec total-n total) (ms (u/percentile sorted 0.5)) (ms (u/percentile sorted 0.99))]))
+        (finally (be/drop-db! ctx))))))
+
+(defn durable-tx
+  "Durability cost on a real filesystem: sync on (default; group commit shares one fsync
+  between concurrent submitters) vs ?sync=false, with 1/4/16 submitting threads."
+  [b sz]
+  (if-not (= "mnemonic-file" (:name b))
+    {:metrics []}
+    (let [n (:durable-tx sz)
+          n-off (* 5 n)]
+      {:metrics
+       (vec (for [[label opts nn] (filter (fn [[label]] (let [o (System/getenv "MNEMONIC_BENCH_DURABLE_ONLY")]
+                                                           (or (nil? o) (= o label))))
+                                           [["sync" "" n] ["no-sync" "?sync=false" n-off]])
+                  threads [1 4 16]
+                  :let [[tps p50 p99] (durable-case b nn threads opts)]
+                  m [[(str label ", " threads " thr: tx/sec") tps :hi]
+                     [(str label ", " threads " thr: p50 ms") p50 :lo]
+                     [(str label ", " threads " thr: p99 ms") p99 :lo]]]
+              m))})))
 
 (defn datoms-scan [b sz]
   (let [{:keys [ctx eids]} (dataset! b sz)
@@ -480,6 +534,7 @@
 (def workloads
   [["bulk-load" bulk-load]
    ["small-tx" small-tx]
+   ["durable-tx" durable-tx]
    ["datoms-scan" datoms-scan]
    ["entity-lookup" entity-lookup]
    ["pull" pull]

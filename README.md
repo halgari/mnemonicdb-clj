@@ -28,6 +28,7 @@ through `org.rocksdb/rocksdbjni`. On recent JDKs add
 |---|---|
 | `mnemonic:mem://name` | in memory, gone when the process exits |
 | `mnemonic:file:///absolute/path` | RocksDB directory on disk |
+| `mnemonic:file:///absolute/path?sync=false` | same, without fsync per commit (see Durability) |
 
 ## Example
 
@@ -84,6 +85,31 @@ RocksDB snapshot early).
   stores are closed cleanly.
 - The on-disk format is versioned (currently 2). Connecting to a store written in
   another format fails with `:db.error/incompatible-format`.
+
+### Durability and group commit
+
+For file databases a transaction's future completes only after the transaction is
+fsynced to the write-ahead log, so a completed `@(m/transact ...)` survives power loss.
+The transactor does group commit: transactions that queue up while it works (for
+example from concurrent submitters, or `transact` calls not yet dereferenced) are
+prepared and written one after the other, each as its own atomic batch and each seeing
+the one before it, and then share a single fsync before any of their futures complete.
+Results, ordering and per-transaction errors are the same as one-at-a-time transacting;
+a transaction rejected while being prepared fails alone. A serial caller that waits for
+each future still pays one fsync per transaction (several ms on typical disks), so
+submit concurrently or without waiting to benefit. A new db value is published to
+readers only once its transaction is durable.
+
+If the fsync itself fails, the futures of the transactions in that group that were
+already written fail with `:db.error/commit-status-unknown` (category fault): they may
+or may not survive a restart.
+
+`?sync=false` on the file URI turns the fsync off: writes still reach the OS before
+the future completes, so data survives a process crash but not an OS crash or power
+loss, and transactions are several times to tens of times faster. The default is
+`?sync=true`. The option belongs to the connection: the first `connect` to a database
+(per process) decides, and the query string is not part of the database's identity.
+In-memory databases have no durability and ignore the question.
 
 ### Pull `:xform`
 
