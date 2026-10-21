@@ -154,6 +154,69 @@
   [raw-cursor ^bytes start index history?]
   (range-cursor raw-cursor start nil index history?))
 
+;; ------------------------------------------------------------------ segment cursor
+
+(defn seg-datom
+  "The Datom of entry `i` of a cached segment (mnemonic.segcache): decoded on first
+  access and stored back into the shared array `ds`. A racy but benign write: decoding is
+  deterministic and a Datom's fields are final, so another thread sees nil (and decodes
+  again) or a complete Datom."
+  ^Datom [^long code ^objects ks ^objects ds ^long i]
+  (let [d (aget ds i)]
+    (if (nil? d)
+      (let [^bytes k (aget ks i)
+            d (codec/decode-key-code code k (alength k))]
+        (aset ds i d)
+        d)
+      d)))
+
+;; Entries [i, end) of a cached segment: shared, immutable key arrays (`ks`), lazily
+;; decoded Datoms (`ds`) and, for history CFs, retracting txs (`rtx`). No native call and
+;; no allocation per entry once decoded; the Datom is the flyweight view.
+(deftype SegCursor [^long code ^objects ks ^objects ds ^longs rtx
+                    ^:unsynchronized-mutable ^long i
+                    ^:unsynchronized-mutable ^long end]
+  ICursor
+  (valid [_] (< i end))
+  (advance [_] (when (< i end) (set! i (inc i))) nil)
+  (key [_] (when (< i end) (aget ks i)))
+  (datom [_] (when (< i end) (seg-datom code ks ds i)))
+  (retractTx [_] (if (and rtx (< i end)) (aget rtx i) -1))
+  (close [_] (set! end i) nil)
+  IKeyView
+  (keyBuf [_] (when (< i end) (aget ks i)))
+  (keyLen [_] (if (< i end) (alength ^bytes (aget ks i)) -1))
+  IViewCursor
+  (view [_] (when (< i end) (seg-datom code ks ds i))))
+
+(defn- starts-with? [^bytes k ^bytes prefix]
+  (let [n (alength prefix)]
+    (and (>= (alength k) n) (Arrays/equals k 0 n prefix 0 n))))
+
+(defn seg-lower-bound
+  "Index of the first key of `ks` >= `x` (unsigned order)."
+  ^long [^objects ks ^bytes x]
+  (loop [lo 0 hi (alength ks)]
+    (if (< lo hi)
+      (let [mid (unsigned-bit-shift-right (+ lo hi) 1)]
+        (if (neg? (Arrays/compareUnsigned ^bytes (aget ks mid) x))
+          (recur (inc mid) hi)
+          (recur lo mid)))
+      lo)))
+
+(defn seg-cursor
+  "Cursor over the entries of segment arrays `ks`/`ds`/`rtx` (index `index`) that start
+  with `prefix` (every entry when `whole?`)."
+  [index ^objects ks ^objects ds ^longs rtx ^bytes prefix whole?]
+  (let [code (codec/index-code index)
+        n (alength ks)]
+    (if whole?
+      (SegCursor. code ks ds rtx 0 n)
+      (let [lo (seg-lower-bound ks prefix)
+            end (loop [j lo]
+                  (if (and (< j n) (starts-with? (aget ks j) prefix)) (recur (inc j)) j))]
+        (SegCursor. code ks ds rtx lo end)))))
+
 ;; ------------------------------------------------------------------ combinators
 
 (deftype EmptyCursor []

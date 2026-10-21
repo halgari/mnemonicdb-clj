@@ -39,6 +39,7 @@
   is not part of the on-disk key layout: SST files record the extractor they were built
   with and RocksDB ignores the filter of files built under a different one, so changing
   it needs no format bump (`extractor-version` documents the configuration)."
+  (:require [mnemonic.segcache :as segcache])
   (:import (java.lang.ref Cleaner)
            (java.nio.charset StandardCharsets)
            (java.util ArrayList Set)
@@ -134,7 +135,8 @@
 
 (def store-option-keys
   "Store options that can be given as URI query parameters (`cache-mb=512`)."
-  {"cache-mb" :cache-mb "write-buffer-mb" :write-buffer-mb "compression" :compression})
+  {"cache-mb" :cache-mb "write-buffer-mb" :write-buffer-mb "compression" :compression
+   "index-cache-mb" :index-cache-mb})
 
 (defn query-store-opts
   "Store options from a parsed URI query map {\"cache-mb\" \"512\" ...} (string keys);
@@ -149,12 +151,16 @@
                   v
                   (throw (ex-info (str "Invalid " k " option: " v)
                                   {:db/error :db.error/invalid-db-uri})))
-                (try (let [n (Long/parseLong ^String v)]
-                       (when-not (pos? n) (throw (NumberFormatException.)))
-                       n)
-                     (catch NumberFormatException _
-                       (throw (ex-info (str "Invalid " k " option: " v " (positive integer expected)")
-                                       {:db/error :db.error/invalid-db-uri}))))))
+                ;; index-cache-mb may be 0 (cache off)
+                (let [zero-ok? (= opt :index-cache-mb)]
+                  (try (let [n (Long/parseLong ^String v)]
+                         (when-not (if zero-ok? (>= n 0) (pos? n)) (throw (NumberFormatException.)))
+                         n)
+                       (catch NumberFormatException _
+                         (throw (ex-info (str "Invalid " k " option: " v
+                                              (if zero-ok? " (non-negative integer expected)"
+                                                  " (positive integer expected)"))
+                                         {:db/error :db.error/invalid-db-uri})))))))
        acc))
    {} kvs))
 
@@ -189,9 +195,10 @@
 ;; ------------------------------------------------------------------ store
 
 ;; guard: Guard (striped in-flight counters); closed: AtomicBoolean;
-;; cursors: concurrent set of live Slots; snaps: concurrent set of live Snaps
+;; cursors: concurrent set of live Slots; snaps: concurrent set of live Snaps;
+;; segcache: the store's heap index segment cache (mnemonic.segcache), nil when off
 (defrecord Store [^RocksDB db cfs env closeables guard closed cursors snaps
-                  ^AtomicLong written ^AtomicBoolean compacting])
+                  ^AtomicLong written ^AtomicBoolean compacting segcache])
 
 (deftype Guard [^AtomicLongArray counts])   ; 16 stripes, 8 longs apart (cache lines)
 
@@ -324,8 +331,10 @@
   `prefix-bloom? false` opens without prefix extractors (as stores created before they
   were introduced; also an A/B switch for benchmarks).
   `cache-mb` (shared block cache), `write-buffer-mb` (memtable budget) and `compression`
-  (\"none\" | \"lz4\" | \"lz4+zstd\") override the defaults above."
-  [{:keys [path mem? prefix-bloom? cache-mb write-buffer-mb compression]}]
+  (\"none\" | \"lz4\" | \"lz4+zstd\") override the defaults above. `index-cache-mb` is the
+  budget of the heap index segment cache (mnemonic.segcache; default: system property
+  mnemonic.index-cache-mb, 256; 0 = off)."
+  [{:keys [path mem? prefix-bloom? cache-mb write-buffer-mb compression index-cache-mb]}]
   (RocksDB/loadLibrary)
   ;; RocksMemEnv cannot resolve relative names (GetAbsolutePath fails), so virtual
   ;; names are rooted with a leading "/".
@@ -388,7 +397,8 @@
         (let [st (->Store db cfs env (vec (reverse (vec owned)))
                           (new-guard) (AtomicBoolean. false)
                           (ConcurrentHashMap/newKeySet) (ConcurrentHashMap/newKeySet)
-                          (AtomicLong. 0) (AtomicBoolean. false))]
+                          (AtomicLong. 0) (AtomicBoolean. false)
+                          (segcache/new-cache (or index-cache-mb (segcache/default-mb))))]
           (when (and auto-compact-l0? (not mem?)) (maybe-compact-l0-async! st))
           st))
       (catch Throwable t
@@ -655,11 +665,27 @@
               (.unref snap))))
         (wrap-rocks (.get db h k))))))
 
-(declare note-written! maybe-compact-l0-async!)
+(declare note-written! maybe-compact-l0-async! write-batch!)
 
 (defn write!
   "Atomically apply `ops`: seq of [:put cf k v] / [:delete cf k]."
   [^Store store ops {:keys [sync?]}]
+  (let [sc (.-segcache store)
+        ;; heap segment cache: stamp the touched granules BEFORE the write (mnemonic.segcache)
+        irregular? (when sc (segcache/before-write! sc ops))]
+    (try
+      (write-batch! store ops sync?)
+      (finally
+        (when irregular? (segcache/after-write! sc)))))
+  (when (and auto-compact-l0? (nil? (.-env store)))
+    (note-written! store (long (reduce (fn [^long n op]
+                                         (if (== 4 (count op))
+                                           (+ n (alength ^bytes (nth op 2)) (alength ^bytes (nth op 3)))
+                                           n))
+                                       0 ops))))
+  nil)
+
+(defn- write-batch! [^Store store ops sync?]
   (with-open [wb (WriteBatch.)
               ;; mem stores are not durable: no WAL (a synced write needs the WAL)
               wo (let [mem? (some? (.-env store))]
@@ -673,14 +699,7 @@
         (case (nth op 0)
           :put    (.put wb (cf-handle store (nth op 1)) ^bytes (nth op 2) ^bytes (nth op 3))
           :delete (.delete wb (cf-handle store (nth op 1)) ^bytes (nth op 2))))
-      (wrap-rocks (.write ^RocksDB (.-db store) wo wb))))
-  (when (and auto-compact-l0? (nil? (.-env store)))
-    (note-written! store (long (reduce (fn [^long n op]
-                                         (if (== 4 (count op))
-                                           (+ n (alength ^bytes (nth op 2)) (alength ^bytes (nth op 3)))
-                                           n))
-                                       0 ops))))
-  nil)
+      (wrap-rocks (.write ^RocksDB (.-db store) wo wb)))))
 
 (defn flush!
   "Flushes the memtables of every column family to SST files (waits)."
@@ -930,6 +949,7 @@
   :db.error/connection-released. Idempotent."
   [^Store store]
   (when (.compareAndSet ^AtomicBoolean (.-closed store) false true)
+    (segcache/clear! (.-segcache store))
     (await-quiescent! store)
     (doseq [^Slot s (vec (.-cursors store))]
       (try (force-close-slot! s) (catch Throwable _ nil)))

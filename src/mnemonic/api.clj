@@ -11,6 +11,7 @@
             [mnemonic.pull :as pullns]
             [mnemonic.query :as query*]
             [mnemonic.schema :as schema]
+            [mnemonic.segcache :as segcache]
             [mnemonic.tx :as tx]
             [mnemonic.tx-fns :as tx-fns])
   (:import (java.util UUID)
@@ -59,6 +60,18 @@
 (defn db
   "The latest db value of `connection`."
   [connection] (conn/current-db connection))
+
+(defn index-cache-stats
+  "MnemonicDB extension (not in datomic.api). Counters of the heap index segment cache of
+  the database behind `conn-or-db` (a connection or any db value): {:hits :misses :stale
+  :fills :big :evictions :entries :bytes :point-bytes :scan-bytes :budget-bytes}, or nil
+  when the cache is off (`index-cache-mb=0`). The counters are store-wide and cumulative;
+  :bytes is the estimated heap held. See README \"Tuning\"."
+  [conn-or-db]
+  (let [store (if (instance? mnemonic.conn.Connection conn-or-db)
+                (:store conn-or-db)
+                (.-store ^mnemonic.db.Base (index/-raw conn-or-db)))]
+    (segcache/stats (:segcache store))))
 
 (defn sync
   "A future of the latest db value. Writes are applied before transact returns, so

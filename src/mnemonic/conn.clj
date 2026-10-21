@@ -9,6 +9,7 @@
             [mnemonic.rocks :as rocks]
             [mnemonic.rocks-sync :as rocks-sync]
             [mnemonic.schema :as schema]
+            [mnemonic.segcache :as segcache]
             [mnemonic.tx :as tx])
   (:import (java.io File)
            (mnemonic.datom Datom)
@@ -228,7 +229,8 @@
                         (if (file-uri? conn)
                           (closing! (:key conn)
                                     (release* conn #(rocks/close-store (:store conn))))
-                          (release* conn nil))))]
+                          ;; mem: the store stays; drop its heap segment cache
+                          (release* conn #(segcache/clear! (:segcache (:store conn)))))))]
     (finish))
   nil)
 
@@ -566,6 +568,9 @@
                     (persistent! acc)))]
     (when (seq entries)
       (.set writer-of conn)
+      ;; the transactor neither probes nor fills the segment cache: what it reads it is
+      ;; usually about to change
+      (.set segcache/bypass true)
       (let [pend (java.util.ArrayList.)]
         (try (run-group! conn entries pend)
              (catch Throwable t
@@ -573,6 +578,7 @@
                (swap! (:state conn) assoc :stale? true)
                (fail-unfinished! entries pend t))
              (finally (.remove writer-of)
+                      (.remove segcache/bypass)
                       (.remove writer-chain)))))))
 
 (defn transact-async
