@@ -101,3 +101,13 @@
             (when (and (> (.get ix/open-cursors) before) (< i 100))
               (System/gc) (Thread/sleep 20) (recur (inc i))))
           (is (= before (.get ix/open-cursors))))))))
+
+(deftest filter-cursor-throwing-pred-closes-source-test
+  (with-store
+    (fn [store]
+      (put-eavt! store [1 2])
+      (let [before (.get ix/open-cursors)
+            src (ix/prefix-cursor (rocks/raw-cursor store :eavt nil) (byte-array 0) :eavt false)]
+        (is (thrown? RuntimeException
+                     (ix/filter-cursor src (fn [_] (throw (RuntimeException. "boom"))))))
+        (is (= before (.get ix/open-cursors)))))))

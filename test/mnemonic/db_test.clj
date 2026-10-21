@@ -2,9 +2,11 @@
   (:require [clojure.test :refer [deftest is testing]]
             [mnemonic.bootstrap :as bootstrap]
             [mnemonic.codec :as codec]
+            [mnemonic.datom :as datom]
             [mnemonic.db :as db]
             [mnemonic.index :as ix]
-            [mnemonic.rocks :as rocks]))
+            [mnemonic.rocks :as rocks]
+            [mnemonic.schema :as schema]))
 
 (def ^:private counter (atom 0))
 
@@ -92,3 +94,71 @@
         (when (zero? (mod i 1000)) (System/gc)))
       (System/gc)
       (is (= 272 (count (seq (ix/datoms-iterable (db/base-db store) :eavt empty-prefix))))))))
+
+(deftest user-schema-test
+  (with-db
+    (fn [store _]
+      (let [tx (codec/t->tx 1000)
+            ds [(datom/datom 73 10 :p/name tx true)
+                (datom/datom 73 40 23 tx true)
+                (datom/datom 73 41 35 tx true)
+                (datom/datom 73 42 38 tx true)
+                (datom/datom 74 10 :p/tags tx true)
+                (datom/datom 74 40 21 tx true)
+                (datom/datom 74 41 36 tx true)
+                (datom/datom 74 44 true tx true)]
+            refs #{40 41 42}]
+        (rocks/write! store
+                      (concat (mapcat #(bootstrap/datom-ops % refs) ds)
+                              [(bootstrap/log-op tx ds)])
+                      {})
+        (let [d2 (db/base-db store)
+              s (ix/-schema d2)
+              n (schema/attr s :p/name)
+              t (schema/attr s :p/tags)]
+          (is (= 1000 (ix/-basis-t d2)))
+          (is (= 73 (:id n)))
+          (is (= :db.type/string (:value-type n)))
+          (is (= :db.cardinality/one (:cardinality n)))
+          (is (= :db.unique/identity (:unique n)))
+          (is (schema/indexed? n))
+          (is (= 74 (schema/entid s :p/tags)))
+          (is (= :db.type/keyword (:value-type t)))
+          (is (= :db.cardinality/many (:cardinality t)))
+          (is (true? (:index? t)))
+          (is (nil? (:unique t)))
+          (is (schema/indexed? t)))))))
+
+(deftest history-cursor-test
+  (with-db
+    (fn [store _]
+      (let [assert-tx (codec/t->tx 1000)
+            retract-tx (codec/t->tx 1001)
+            k (codec/encode-key :eavt 500 10 "gone" assert-tx)
+            cur-k (codec/encode-key :eavt 500 10 "here" assert-tx)]
+        (rocks/write! store [[:put :eavt-h k (codec/long->bytes retract-tx)]
+                             [:put :eavt cur-k (byte-array 0)]]
+                      {})
+        (let [d (db/base-db store)
+              prefix (codec/encode-prefix :eavt [500])
+              h (ix/-seek-history d :eavt prefix)]
+          (is (.valid h))
+          (is (= (datom/datom 500 10 "gone" assert-tx true) (.datom h)))
+          (is (= retract-tx (.retractTx h)))
+          (.advance h)
+          (is (not (.valid h)))
+          (.close h)
+          (let [c (ix/-seek-current d :eavt prefix)]
+            (is (= -1 (.retractTx c)))
+            (.close c))
+          (let [m (ix/merge-cursors [(ix/-seek-current d :eavt prefix)
+                                     (ix/-seek-history d :eavt prefix)])]
+            (is (= ["gone" "here"] (loop [acc []]
+                                     (if (.valid m)
+                                       (let [dv (:v (.datom m))
+                                             rt (.retractTx m)]
+                                         (is (= (if (= dv "gone") retract-tx -1) rt))
+                                         (.advance m)
+                                         (recur (conj acc dv)))
+                                       acc))))
+            (.close m)))))))

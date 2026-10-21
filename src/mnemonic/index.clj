@@ -4,6 +4,7 @@
             [mnemonic.datom :as datom]
             [mnemonic.rocks :as rocks])
   (:import (clojure.lang ChunkBuffer ChunkedCons IReduceInit Reduced Seqable Sequential)
+           (java.lang.ref Reference)
            (java.util Arrays)
            (java.util.concurrent.atomic AtomicLong)
            (mnemonic.datom Datom)
@@ -184,10 +185,14 @@
 (defn filter-cursor
   "Cursor over `c` keeping only entries whose Datom satisfies `pred`."
   [^mnemonic.index.ICursor c pred]
-  (loop []
-    (when (and (.valid c) (not (pred (.datom c))))
-      (.advance c)
-      (recur)))
+  (try
+    (loop []
+      (when (and (.valid c) (not (pred (.datom c))))
+        (.advance c)
+        (recur)))
+    (catch Throwable t
+      (.close c)
+      (throw t)))
   (->FilterCursor c pred false))
 
 ;; ------------------------------------------------------------------ iterable
@@ -201,8 +206,9 @@
 
 (defn- cursor-seq
   "Lazy chunked seq over `cur`, closing it at exhaustion. `holder` is kept
-  reachable by the seq so the Cleaner closes `cur` if the seq is abandoned."
-  [^mnemonic.index.ICursor cur holder]
+  reachable by the seq so the Cleaner closes `cur` if the seq is abandoned; `db` is
+  kept reachable so its snapshot cannot be released under a live iteration."
+  [^mnemonic.index.ICursor cur holder db]
   (lazy-seq
    (try
      (let [buf (ChunkBuffer. chunk-size)]
@@ -215,10 +221,12 @@
          (when-not more? (.close cur))
          (when (pos? (.count buf))
            (ChunkedCons. (.chunk buf)
-                         (when more? (cursor-seq cur holder))))))
+                         (when more? (cursor-seq cur holder db))))))
      (catch Throwable t
        (.close cur)
-       (throw t)))))
+       (throw t))
+     (finally
+       (Reference/reachabilityFence db)))))
 
 (defn datoms-iterable
   "Iterable of immutable Datoms over `(-view db index prefix)`. Each seq / iterator /
@@ -233,7 +241,7 @@
       (let [^mnemonic.index.ICursor cur (-view db index prefix)
             holder (Object.)]
         (rocks/register-cleanup! holder #(.close cur))
-        (seq (cursor-seq cur holder))))
+        (seq (cursor-seq cur holder db))))
     IReduceInit
     (reduce [_ f init]
       (let [^mnemonic.index.ICursor cur (-view db index prefix)]
@@ -245,5 +253,7 @@
                   (.deref ^Reduced ret)
                   (do (.advance cur) (recur ret))))
               acc))
-          (finally (.close cur)))))
+          (finally
+            (.close cur)
+            (Reference/reachabilityFence db)))))
     Sequential))
