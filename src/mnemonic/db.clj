@@ -97,7 +97,7 @@
         acc))
     (finally (.close cur))))
 
-(defn- load-schema
+(defn load-schema
   "Only the schema-defining attributes are scanned (AEVT), not all of EAVT; retracted
   idents (AEVT history of :db/ident) become aliases."
   [store snap]
@@ -118,6 +118,23 @@
             basis (if tx (codec/tx->t tx) 0)
             sch (load-schema store snap)
             db (->Base store snap basis sch (bootstrap/read-meta store snap) releaser)]
+        (rocks/register-cleanup! db releaser)
+        db)
+      (catch Throwable t
+        (.run ^Releaser releaser)
+        (throw t)))))
+
+(defn successor-db
+  "Db value over a fresh snapshot of `store` taken right after the writer committed the
+  tx that moved `prev` to `basis-t` / `meta` (writer thread only). The schema object of
+  `prev` is reused unless `schema-changed?`, in which case it is reloaded from the new
+  snapshot. No log or meta reads."
+  [store ^Base prev basis-t meta schema-changed?]
+  (let [snap (rocks/snapshot store)
+        releaser (->Releaser snap)]
+    (try
+      (let [sch (if schema-changed? (load-schema store snap) (.-schema prev))
+            db (->Base store snap basis-t sch meta releaser)]
         (rocks/register-cleanup! db releaser)
         db)
       (catch Throwable t

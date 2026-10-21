@@ -218,12 +218,12 @@
 
 (deftest base-db-failure-after-write-test
   (let [real mnemonic.db/base-db
+        real-succ mnemonic.db/successor-db
         run (fn [c fail-n]
-              (let [calls (atom 0)]
-                (with-redefs [mnemonic.db/base-db (fn [store]
-                                                    (if (<= (swap! calls inc) fail-n)
-                                                      (throw (RuntimeException. "boom"))
-                                                      (real store)))]
+              (let [calls (atom 0)
+                    boom! #(when (<= (swap! calls inc) fail-n) (throw (RuntimeException. "boom")))]
+                (with-redefs [mnemonic.db/successor-db (fn [& args] (boom!) (apply real-succ args))
+                              mnemonic.db/base-db (fn [store] (boom!) (real store))]
                   (try @(m/transact c [{:db/id "a" :person/name "Al"}])
                        (catch ExecutionException e e)))))]
     (testing "one failed rebuild is retried; the tx succeeds"
