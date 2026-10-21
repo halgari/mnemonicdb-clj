@@ -3,13 +3,14 @@
             [mnemonic.rocks :as r])
   (:import (java.nio.file Files LinkOption Path)
            (java.nio.file.attribute FileAttribute)
-           (java.util Comparator)
-           (mnemonic.rocks IRawCursor)))
+           (java.util Comparator)))
 
 (defn- bs ^bytes [& xs] (byte-array (map unchecked-byte xs)))
 (defn- ub [^bytes b] (mapv #(bit-and (long %) 0xFF) b))
 
-(defn- scan [^IRawCursor cur]
+;; No IRawCursor hints here on purpose: mnemonic.reflection-test reloads
+;; mnemonic.rocks, which redefines the interface class under already-compiled tests.
+(defn- scan [cur]
   (loop [acc []]
     (if (.isValid cur)
       (let [k (ub (.key cur))]

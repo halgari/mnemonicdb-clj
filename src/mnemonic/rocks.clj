@@ -145,8 +145,9 @@
   java.lang.AutoCloseable)
 
 (defn raw-cursor
-  "New cursor over `cf`, reading from `snap` (may be nil). Caller must close it."
-  ^RawCursor [^Store store cf ^Snapshot snap]
+  "New cursor over `cf`, reading from `snap` (may be nil). Caller must close it.
+  Returns a RawCursor (hint call sites with ^mnemonic.rocks.IRawCursor)."
+  [^Store store cf ^Snapshot snap]
   (let [ro (ReadOptions.)]
     (try
       (when snap (.setSnapshot ro snap))
