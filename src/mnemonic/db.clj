@@ -43,7 +43,7 @@
 
 (defn- hit-cursor [store snap idx ^Seg s ^bytes prefix whole?]
   (check-open! store snap)
-  (index/seg-cursor idx (sc/seg-keys s) (sc/seg-datoms s) (sc/seg-rtx s) prefix whole?))
+  (index/seg-cursor idx (sc/seg-keys s) (sc/seg-datoms s) (sc/seg-rtx s) (sc/seg-mut? s) prefix whole?))
 
 (defn- long-array-of ^longs [^ArrayList xs]
   (let [n (.size xs) a (long-array n)]
@@ -74,12 +74,13 @@
                              (recur (inc i)))))
                (finally (.close cur)))]
     (if big?
-      (do (sc/store! c (sc/point-pool c) k rd w nil nil true)
+      (do (sc/store! c (sc/point-pool c) k rd w nil nil true false)
           (plain-cursor store snap cf idx hist? prefix))
       (let [ka (.toArray kl)
             ra (when rl (long-array-of rl))
-            s (sc/store! c (sc/point-pool c) k rd w ka ra false)]
-        (index/seg-cursor idx ka (if s (sc/seg-datoms s) (object-array (alength ka))) ra
+            mut? (index/mutable-keys? (codec/index-code idx) ka)
+            s (sc/store! c (sc/point-pool c) k rd w ka ra false mut?)]
+        (index/seg-cursor idx ka (if s (sc/seg-datoms s) (object-array (alength ka))) ra mut?
                           prefix (== n (alength g)))))))
 
 (defn- point-cursor [store snap ^Cache c ^IReader rd cf idx hist? ^bytes prefix cfc n]
@@ -104,7 +105,7 @@
   (and (in-attr? raw klen prefix) (== ch (sc/key-chunk (.kbuf raw)))))
 
 (definterface IChunks
-  (batch [^"[Ljava.lang.Object;" ks ^"[Ljava.lang.Object;" ds ^"[J" rtx ^long chunk ^long mode])
+  (batch [^"[Ljava.lang.Object;" ks ^"[Ljava.lang.Object;" ds ^"[J" rtx ^boolean mut ^long chunk ^long mode])
   (readRaw [^long klen ^long chunk k])
   (openAt [^long klen ^long kch known])
   (settle []))
@@ -118,6 +119,7 @@
                       ^:unsynchronized-mutable ^objects ks
                       ^:unsynchronized-mutable ^objects ds
                       ^:unsynchronized-mutable ^longs rtx
+                      ^:unsynchronized-mutable ^boolean mut
                       ^:unsynchronized-mutable ^long i
                       ^:unsynchronized-mutable ^long end
                       ^:unsynchronized-mutable ^long chunk
@@ -125,8 +127,8 @@
                       ^:unsynchronized-mutable ^long rlen
                       ^:unsynchronized-mutable ^boolean closed?]
   IChunks
-  (batch [_ ks* ds* rtx* ch m]
-    (set! ks ks*) (set! ds ds*) (set! rtx rtx*)
+  (batch [_ ks* ds* rtx* mut* ch m]
+    (set! ks ks*) (set! ds ds*) (set! rtx rtx*) (set! mut (boolean mut*))
     (set! i 0) (set! end (long (alength ks*)))
     (set! chunk ch) (set! mode m)
     nil)
@@ -145,10 +147,11 @@
           complete? (not (in-chunk? raw nxt prefix ch))
           ka (.toArray kl)
           ra (when rl (long-array-of rl))
+          mut? (index/mutable-keys? 1 ka)
           ^Seg s (when k
                    (if complete?
-                     (sc/store! c (sc/scan-pool c) k rd w ka ra false)
-                     (sc/store! c (sc/scan-pool c) k rd w nil nil true)))]
+                     (sc/store! c (sc/scan-pool c) k rd w ka ra false mut?)
+                     (sc/store! c (sc/scan-pool c) k rd w nil nil true false)))]
       (when s
         (set! filled (+ filled (sc/seg-weight-of s)))
         ;; an attribute larger than the scan budget would only churn the scan pool
@@ -157,7 +160,7 @@
           (set! fill? (boolean false))))
       (set! rlen (long nxt))
       (.batch this ka (if (and s complete?) (sc/seg-datoms s) (object-array (alength ka))) ra
-              ch (if complete? 1 2))))
+              mut? ch (if complete? 1 2))))
   (openAt [this klen kch known]
     ;; the raw cursor holds the next key to serve (klen bytes, -1 none); `known` is the
     ;; lookup result for chunk `kch` when that chunk was already probed
@@ -169,7 +172,7 @@
         (cond
           (nil? s) (.readRaw this klen ch (when fill? k))
           (sc/seg-big? s) (.readRaw this klen ch nil)
-          :else (.batch this (sc/seg-keys s) (sc/seg-datoms s) (sc/seg-rtx s) ch 1)))))
+          :else (.batch this (sc/seg-keys s) (sc/seg-datoms s) (sc/seg-rtx s) (sc/seg-mut? s) ch 1)))))
   (settle [this]
     (loop []
       (when (and (>= i end) (pos? mode))
@@ -180,7 +183,7 @@
               (let [k (sc/gkey cfc (sc/chunk-granule prefix nc) 16)
                     ^Seg s (sc/lookup c (sc/scan-pool c) k rd)]
                 (if (and s (not (sc/seg-big? s)) (pos? (sc/seg-size s)))
-                  (.batch this (sc/seg-keys s) (sc/seg-datoms s) (sc/seg-rtx s) nc 1)
+                  (.batch this (sc/seg-keys s) (sc/seg-datoms s) (sc/seg-rtx s) (sc/seg-mut? s) nc 1)
                   (.openAt this (.seekInto raw (sc/chunk-start prefix nc)) nc s)))))
           (if (in-chunk? raw rlen prefix chunk)
             (.readRaw this rlen chunk nil)
@@ -195,7 +198,7 @@
       (when (>= i end) (.settle this)))
     nil)
   (key [_] (when (< i end) (aget ks i)))
-  (datom [_] (when (< i end) (index/seg-datom 1 ks ds i)))
+  (datom [_] (when (< i end) (let [d (index/seg-datom 1 ks ds i)] (if mut (index/detach d) d))))
   (retractTx [_] (if (and rtx (< i end)) (aget rtx i) -1))
   (close [_]
     (when-not closed?
@@ -207,13 +210,13 @@
   (keyBuf [_] (when (< i end) (aget ks i)))
   (keyLen [_] (if (< i end) (alength ^bytes (aget ks i)) -1))
   mnemonic.index.IViewCursor
-  (view [_] (when (< i end) (index/seg-datom 1 ks ds i))))
+  (view [_] (when (< i end) (let [d (index/seg-datom 1 ks ds i)] (if mut (index/detach d) d)))))
 
 (defn- chunk-cursor [store snap ^Cache c rd cf cfc hist? ^bytes prefix ah]
   (let [^IRawCursor raw (open-raw store snap cf nil)]
     (try
       (let [cur (ChunkCursor. store snap c rd cfc hist? prefix raw (sc/chunk-cap c) ah 0 true
-                              (object-array 0) nil nil 0 0 -1 0 -1 false)]
+                              (object-array 0) nil nil false 0 0 -1 0 -1 false)]
         (.openAt cur (.seekInto raw prefix) -1 nil)
         (.settle cur)
         cur)

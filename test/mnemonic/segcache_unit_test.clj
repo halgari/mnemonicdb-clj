@@ -22,7 +22,7 @@
   [c e r ep]
   (let [k (sc/gkey 1 (e-prefix e) 8)]
     (sc/store! c (sc/point-pool c) k (reader r ep) (sc/stamp c (sc/gkey-hash k))
-               (object-array [(eavt-key e r)]) nil false)))
+               (object-array [(eavt-key e r)]) nil false false)))
 
 (defn- hit? [c e b ep]
   (some? (sc/lookup c (sc/point-pool c) (sc/gkey 1 (e-prefix e) 8) (reader b ep))))

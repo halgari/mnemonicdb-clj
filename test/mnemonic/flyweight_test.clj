@@ -2,7 +2,7 @@
   "Flyweight datom views (index/reduce-views) must agree with the copying path for every
   index, value type and key length (including keys longer than the initial 64-byte
   cursor buffer), and a view's toDatom copy must survive the cursor advancing."
-  (:require [clojure.test :refer [deftest is use-fixtures]]
+  (:require [clojure.test :refer [deftest is testing use-fixtures]]
             [mnemonic.api :as m]
             [mnemonic.conn :as conn]
             [mnemonic.index :as index])
@@ -109,6 +109,15 @@
         ^IDatomView v (index/view-of cur)]
     (is (some? (.value v)) "readable while the cursor is on it")
     (.close cur)
-    (is (thrown? IllegalStateException (.eid v)))
-    (is (thrown? IllegalStateException (.value v)))
+    (doseq [f [#(.eid v) #(.attr v) #(.value v) #(.valueLong v) #(.txid v) #(.isAdded v) #(.toDatom v)]]
+      (is (thrown? IllegalStateException (f)) "after close"))
+    (testing "after exhaustion"
+      (let [^mnemonic.index.ICursor cur
+            (index/prefix-cursor (mnemonic.rocks/raw-cursor (.-store b) :aevt (.-snap b))
+                                 (byte-array 0) :aevt false)
+            ^IDatomView v (index/view-of cur)]
+        (while (.valid cur) (.advance cur))
+        (doseq [f [#(.eid v) #(.value v) #(.isAdded v) #(.toDatom v)]]
+          (is (thrown? IllegalStateException (f))))
+        (.close cur)))
     (m/release c)))

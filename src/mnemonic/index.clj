@@ -127,8 +127,8 @@
   (value [_] (when (neg? klen) (stale-view)) (codec/key-value code (.kbuf raw) klen))
   (valueLong [_] (when (neg? klen) (stale-view)) (codec/key-value-long code (.kbuf raw) klen))
   (txid [_] (when (neg? klen) (stale-view)) (codec/key-tx (.kbuf raw) klen))
-  (isAdded [_] true)
-  (toDatom [this] (.datom this))
+  (isAdded [_] (when (neg? klen) (stale-view)) true)
+  (toDatom [this] (when (neg? klen) (stale-view)) (.datom this))
   (close [_]
     (when-not closed?
       (set! closed? (boolean true))
@@ -170,7 +170,24 @@
     (bytes? v) (aclone ^bytes v)
     :else v))
 
-(defn- detach
+(defn mutable-keys?
+  "True when some key of `ks` (index code `code`) holds a value that decodes to a mutable
+  object (instant 0x16, bytes 0x1c, or a tuple 0x1d that may hold one): its segment's
+  Datoms must be detached on the way out. Computed once per segment, at fill."
+  [^long code ^objects ks]
+  (and (not (== code 3))
+       (let [off (if (== code 2) 8 16)]
+         (loop [i 0]
+           (if (< i (alength ks))
+             (let [^bytes k (aget ks i)]
+               (if (and (> (alength k) off)
+                        (let [t (bit-and 0xff (long (aget k off)))]
+                          (or (== t 0x16) (== t 0x1c) (== t 0x1d))))
+                 true
+                 (recur (inc i))))
+             false)))))
+
+(defn detach
   "`d` itself, or a copy whose mutable value (java.util.Date, byte[], or a tuple holding
   one) is a fresh copy: the cached Datom is shared by every reader, and a caller that
   mutates the value it got must not change what later reads see (an uncached read
@@ -188,35 +205,35 @@
   "The Datom of entry `i` of a cached segment (mnemonic.segcache): decoded on first
   access and stored back into the shared array `ds`. A racy but benign write: decoding is
   deterministic and a Datom's fields are final, so another thread sees nil (and decodes
-  again) or a complete Datom. Mutable values are copied on the way out (`detach`)."
+  again) or a complete Datom. Callers detach the Datoms of segments holding mutable
+  values (`mutable-keys?`, `detach`)."
   ^Datom [^long code ^objects ks ^objects ds ^long i]
   (let [d (aget ds i)]
-    (detach
-     (if (nil? d)
-       (let [^bytes k (aget ks i)
-             d (codec/decode-key-code code k (alength k))]
-         (aset ds i d)
-         d)
-       d))))
+    (if (nil? d)
+      (let [^bytes k (aget ks i)
+            d (codec/decode-key-code code k (alength k))]
+        (aset ds i d)
+        d)
+      d)))
 
 ;; Entries [i, end) of a cached segment: shared, immutable key arrays (`ks`), lazily
 ;; decoded Datoms (`ds`) and, for history CFs, retracting txs (`rtx`). No native call and
 ;; no allocation per entry once decoded; the Datom is the flyweight view.
-(deftype SegCursor [^long code ^objects ks ^objects ds ^longs rtx
+(deftype SegCursor [^long code ^objects ks ^objects ds ^longs rtx ^boolean mut
                     ^:unsynchronized-mutable ^long i
                     ^:unsynchronized-mutable ^long end]
   ICursor
   (valid [_] (< i end))
   (advance [_] (when (< i end) (set! i (inc i))) nil)
   (key [_] (when (< i end) (aget ks i)))
-  (datom [_] (when (< i end) (seg-datom code ks ds i)))
+  (datom [_] (when (< i end) (let [d (seg-datom code ks ds i)] (if mut (detach d) d))))
   (retractTx [_] (if (and rtx (< i end)) (aget rtx i) -1))
   (close [_] (set! end i) nil)
   IKeyView
   (keyBuf [_] (when (< i end) (aget ks i)))
   (keyLen [_] (if (< i end) (alength ^bytes (aget ks i)) -1))
   IViewCursor
-  (view [_] (when (< i end) (seg-datom code ks ds i))))
+  (view [_] (when (< i end) (let [d (seg-datom code ks ds i)] (if mut (detach d) d)))))
 
 (defn- starts-with? [^bytes k ^bytes prefix]
   (let [n (alength prefix)]
@@ -235,16 +252,16 @@
 
 (defn seg-cursor
   "Cursor over the entries of segment arrays `ks`/`ds`/`rtx` (index `index`) that start
-  with `prefix` (every entry when `whole?`)."
-  [index ^objects ks ^objects ds ^longs rtx ^bytes prefix whole?]
+  with `prefix` (every entry when `whole?`); `mut?`: the segment holds mutable values."
+  [index ^objects ks ^objects ds ^longs rtx mut? ^bytes prefix whole?]
   (let [code (codec/index-code index)
         n (alength ks)]
     (if whole?
-      (SegCursor. code ks ds rtx 0 n)
+      (SegCursor. code ks ds rtx (boolean mut?) 0 n)
       (let [lo (seg-lower-bound ks prefix)
             end (loop [j lo]
                   (if (and (< j n) (starts-with? (aget ks j) prefix)) (recur (inc j)) j))]
-        (SegCursor. code ks ds rtx lo end)))))
+        (SegCursor. code ks ds rtx (boolean mut?) lo end)))))
 
 ;; ------------------------------------------------------------------ combinators
 

@@ -244,6 +244,7 @@
 ;; the lazy Datom slots in `ds` (racy but benign: decoding is deterministic and a Datom's
 ;; fields are final).
 (deftype Seg [gkey ^objects ks ^objects ds ^longs rtx ^long epoch ^boolean big ^long weight
+              ^boolean mut   ; holds mutable values (Date, byte[], tuples): detach on read
               ^:volatile-mutable ^long lo*
               ^:volatile-mutable ^long hi*
               ^:volatile-mutable prev*
@@ -265,6 +266,7 @@
 (defn seg-datoms ^objects [^Seg s] (.-ds s))
 (defn seg-rtx ^longs [^Seg s] (.-rtx s))
 (defn seg-big? [^Seg s] (.-big s))
+(defn seg-mut? [^Seg s] (.-mut s))
 (defn seg-size ^long [^Seg s] (alength ^objects (.-ks s)))
 (defn seg-weight-of ^long [^Seg s] (.-weight s))
 
@@ -605,8 +607,9 @@
   "Caches a segment of granule `k` (a key owning an exact copy of the granule bytes) read
   from the snapshot of the db `rd` (basis r, epoch), `w` being the granule's stamp read
   after that snapshot was taken. Dropped when w > r (the granule may have changed since). `ks`
-  keys, `rtx` retracting txs (history) or nil; `big?` marks a granule too large to cache."
-  [^Cache c ^Pool pool ^GKey k ^IReader rd w ks rtx big?]
+  keys, `rtx` retracting txs (history) or nil; `big?` marks a granule too large to cache;
+  `mut?`: some value is mutable (see mnemonic.index/mutable-keys?)."
+  [^Cache c ^Pool pool ^GKey k ^IReader rd w ks rtx big? mut?]
   (let [r (.basisT rd) ep (.epoch rd) w (long w) ^bytes g (.-g k)]
   (when (and (<= w r) (>= ep 0) (== (.-len k) (alength g))
              (not (.get ^java.util.concurrent.atomic.AtomicBoolean (.-closed c))))
@@ -614,7 +617,7 @@
       (when (<= weight (quot (.-budget pool) 4))
         (let [^objects ks ks ^longs rtx rtx
               n (Seg. k ks (when-not big? (object-array (alength ks))) rtx ep (boolean big?) weight
-                      w r nil false 1)
+                      (boolean mut?) w r nil false 1)
               ^Gen gen (.get ^AtomicReference (.-gen pool))
               delta (long-array 1)
               top? (boolean-array 1)
