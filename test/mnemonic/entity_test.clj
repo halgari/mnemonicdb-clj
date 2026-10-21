@@ -199,3 +199,19 @@
       (is (nil? (:p/age b)))
       (is (= :nf (get b :p/age :nf)))
       (is (not (contains? b :p/age))))))
+
+(deftest one-read-per-entity-test
+  ;; the first forward attribute read loads the whole entity (one EAVT [e] read)
+  (let [{:keys [db c ids]} (fixture)
+        a (m/entity db (ids "a"))]
+    (is (= 30 (:p/age a)))
+    (is (nil? (:p/boss a)) "absent attribute")
+    (is (nil? (:no/such a)) "unknown attribute")
+    (is (= #{"x" "y"} (:p/tags a)))
+    (is (= :kind/admin (:p/kind a)))
+    (is (= "Al" (:p/name a)))
+    (testing "renamed attribute: the old ident still resolves"
+      @(m/transact c [{:db/id :p/age :db/ident :p/years}])
+      (let [a2 (m/entity (m/db c) (ids "a"))]
+        (is (= 30 (:p/age a2)))
+        (is (= 30 (:p/years a2)))))))
