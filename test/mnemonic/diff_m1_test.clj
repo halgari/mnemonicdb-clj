@@ -190,6 +190,17 @@
      [[:foo/bar 1 2 3]]
      [[:db/add [:p/name "Al"] :p/boss [:p/name "Bo"]] [:db/retract [:p/name "Al"] :p/boss [:p/name "Bo"]]]
      ]]
+   ["errors: precedence and retract conflicts"
+    [base-schema
+     (people "Al" "Bo")
+     [[:db/retract [:p/name "Al"] :a/city "c0"] [:db/retract [:p/name "Al"] :a/city "c1"]]
+     [[:db/retract [:p/name "Al"] :p/age] [:db/retract [:p/name "Al"] :p/age 99]]
+     [[:db/retract [:p/name "Al"] :p/age] [:db/retract [:p/name "Al"] :p/age 10]]
+     [[:db/retract [:p/name "Al"] :p/tags "x"] [:db/retract [:p/name "Al"] :p/tags "y"]]
+     [{:db/id [:p/name "Bo"] :p/name "Bo"} {:db/id [:p/name "Al"] :p/name "Bo"}]
+     [{:db/id "a" :p/name "Al"} {:db/id "a" :p/name "Bo" :p/friends [:p/name "Cy"]}]
+     [[:db/add [:p/name "Al"] :p/email "dup"] [:db/add [:p/name "Bo"] :p/email "dup"]]
+     [[:db/add [:p/name "Al"] :p/age 1] [:db/add [:p/name "Al"] :p/age 1]]]]
    ["errors: schema"
     [base-schema
      [{:db/id "q" :db/ident :bad/attr :db/valueType :db.type/string :db.install/_attribute :db.part/db}]
@@ -286,6 +297,7 @@
   "Scenario name -> indexes of steps that are expected to fail (scenarios named
   \"errors: ...\" are exempt). Guards against both systems failing for the wrong reason."
   {"tx instants" #{2 3 4}
+   "errors: precedence and retract conflicts" #{}
    "partitions" #{3}
    "idents and enum upsert" #{6}
    "retract forms" #{9}

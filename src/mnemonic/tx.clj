@@ -66,7 +66,6 @@
 
 ;; ------------------------------------------------------------------ constants
 
-(def ^:private ^:const a-ident 10)
 (def ^:private ^:const a-install-partition 11)
 (def ^:private ^:const a-install-attribute 13)
 (def ^:private ^:const a-value-type 40)
@@ -331,12 +330,15 @@
 (defn- partition-id
   "Partition entity id for a tempid's `part`, validating that it is an installed partition."
   [ctx part]
-  (let [pid (cond (integer? part) (long part)
-                  (keyword? part) (get (:idents (:schema ctx)) part)
-                  :else nil)]
-    (if (and pid (seq (datoms-of (:db ctx) :eavt [part-db a-install-partition pid])))
-      pid
-      (fail :db.error/not-a-db-id (str "Invalid db/id: " (pr-str part)) {:part part}))))
+  (let [cache (:part-cache ctx)]
+    (or (some-> cache deref (get part))
+        (let [pid (cond (integer? part) (long part)
+                        (keyword? part) (get (:idents (:schema ctx)) part)
+                        :else nil)]
+          (if (and pid (seq (datoms-of (:db ctx) :eavt [part-db a-install-partition pid])))
+            (do (when cache (swap! cache assoc part pid))
+                pid)
+            (fail :db.error/not-a-db-id (str "Invalid db/id: " (pr-str part)) {:part part}))))))
 
 (defn- resolve-tempids
   "Binds every tempid: upserts via :db.unique/identity to a fixpoint, unifies tempids with
@@ -355,6 +357,14 @@
                    (.putIfAbsent seen e true))
                  (vec (keys seen)))
         _ (doseq [x tmps :when (tx-tmp? x)] (vswap! ptr assoc x tx))
+        ;; a tempid that never appears in entity position can never be bound
+        _ (let [e-set (set e-tmps)]
+            (doseq [^Tmp x tmps :when (not (contains? e-set x))
+                    :let [k (.-k x)]
+                    :when (not (tx-tmp? x))]
+              (fail :db.error/tempid-not-an-entity
+                    (str "tempid '" (if (instance? TempId k) (pr-str k) k) "' used only as value in transaction")
+                    {:tempid k})))
         lookup-cache (java.util.HashMap.)
         cached-lookup (fn [aid v]
                         (let [k [aid (vkey v)]]
@@ -510,16 +520,17 @@
     (doseq [k (keys adds)]
       (when (.containsKey rets k)
         (conflict! (.get adds k) (.get rets k))))
-    ;; card-one: two different asserted values
-    (let [seen (java.util.HashMap.)]
-      (doseq [^Datom d (vals adds)]
-        (let [^Attr attr (get (:attrs schema) (.-a d))]
-          (when (= :db.cardinality/one (:cardinality attr))
-            (let [k [(.-e d) (.-a d)]
-                  prev (.get seen k)]
-              (when (and prev (not (same-value? (.-v ^Datom prev) (.-v d))))
-                (conflict! prev d))
-              (.put seen k d))))))
+    ;; card-one: two different asserted values, or two different retracted values
+    (doseq [m [adds rets]]
+      (let [seen (java.util.HashMap.)]
+        (doseq [^Datom d (vals m)]
+          (let [^Attr attr (get (:attrs schema) (.-a d))]
+            (when (= :db.cardinality/one (:cardinality attr))
+              (let [k [(.-e d) (.-a d)]
+                    prev (.get seen k)]
+                (when (and prev (not (same-value? (.-v ^Datom prev) (.-v d))))
+                  (conflict! prev d))
+                (.put seen k d)))))))
     ;; compute the effective changes against db-before
     (let [retracted (LinkedHashMap.)   ; key -> [retract-datom old-datom]
           asserted (ArrayList.)
@@ -539,15 +550,18 @@
           (when-let [old (first (filter (fn [^Datom c] (same-value? (.-v c) (.-v r))) cur))]
             (retract! old))))
       {:asserts (vec asserted)
+       :adds (vec (vals adds))
        :retracts (vec (vals retracted))
        :retracted-keys (set (keys retracted))})))
 
 (defn- check-uniqueness!
-  "Unique attributes: no other entity may hold an asserted value, in db-before or in this tx."
-  [ctx asserts retracted-keys]
+  "Unique attributes. First, no two entities may add the same value within the tx (counting
+  redundant adds: datoms-conflict); then no other entity may already hold an asserted
+  value in db-before (unique-conflict)."
+  [ctx adds asserts retracted-keys]
   (let [{:keys [db schema]} ctx
         in-tx (java.util.HashMap.)]
-    (doseq [^Datom d asserts
+    (doseq [^Datom d adds
             :let [^Attr attr (get (:attrs schema) (.-a d))]
             :when (:unique attr)]
       (let [k [(.-a d) (vkey (.-v d))]
@@ -557,15 +571,18 @@
                 (str "Two datoms in the same transaction conflict\n"
                      (pr-str {:d1 (datom-vec schema prev) :d2 (datom-vec schema d)}))
                 {:d1 (datom-vec schema prev) :d2 (datom-vec schema d)}))
-        (.put in-tx k d)
-        (doseq [^Datom h (datoms-of db :avet [(.-a d) (.-v d)])]
-          (when (and (not= (.-e h) (.-e d))
-                     (not (contains? retracted-keys [(.-e h) (.-a h) (vkey (.-v h))])))
-            (fail :db.error/unique-conflict
-                  (str "Unique conflict: " (:ident attr) ", value: " (.-v d) " already held by: "
-                       (.-e h) " asserted for: " (.-e d))
-                  :cognitect.anomalies/conflict
-                  {:attribute (:ident attr) :value (.-v d) :held-by (.-e h) :asserted-for (.-e d)})))))))
+        (.put in-tx k d)))
+    (doseq [^Datom d asserts
+            :let [^Attr attr (get (:attrs schema) (.-a d))]
+            :when (:unique attr)]
+      (doseq [^Datom h (datoms-of db :avet [(.-a d) (.-v d)])]
+        (when (and (not= (.-e h) (.-e d))
+                   (not (contains? retracted-keys [(.-e h) (.-a h) (vkey (.-v h))])))
+          (fail :db.error/unique-conflict
+                (str "Unique conflict: " (:ident attr) ", value: " (.-v d) " already held by: "
+                     (.-e h) " asserted for: " (.-e d))
+                :cognitect.anomalies/conflict
+                {:attribute (:ident attr) :value (.-v d) :held-by (.-e h) :asserted-for (.-e d)}))))))
 
 (defn- schema-installs
   "Auto-install datoms for new attribute entities, plus validation of all installs."
@@ -600,7 +617,7 @@
             {:entity e}))))
 
 (defn- check-no-valuetype-change!
-  [ctx retracts]
+  [retracts]
   (doseq [[_ ^Datom old] retracts]
     (when (== (.-a old) a-value-type)
       (fail :db.error/unsupported "Changing :db/valueType of an attribute is not supported"
@@ -616,13 +633,13 @@
   (let [schema (index/-schema db-before)
         t (long (:next-t meta))
         tx (codec/t->tx t)
-        ctx {:db db-before :schema schema :meta meta :t t :tx tx}
+        ctx {:db db-before :schema schema :meta meta :t t :tx tx :part-cache (atom {})}
         raw (expand-forms ctx tx-data)
         ops (mapv #(resolve-op ctx %) raw)
         {:keys [ops tempids n-shared n-db db-eids]} (resolve-tempids ctx ops)
-        {:keys [asserts retracts retracted-keys]} (compute-datoms ctx ops db-eids)
-        _ (check-no-valuetype-change! ctx retracts)
-        _ (check-uniqueness! ctx asserts retracted-keys)
+        {:keys [asserts adds retracts retracted-keys]} (compute-datoms ctx ops db-eids)
+        _ (check-no-valuetype-change! retracts)
+        _ (check-uniqueness! ctx adds asserts retracted-keys)
         _ (check-db-partition! asserts db-eids)
         auto (schema-installs ctx asserts)
         ;; the tx's own instant
