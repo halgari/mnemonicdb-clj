@@ -46,10 +46,11 @@
            (java.util.concurrent.atomic AtomicBoolean AtomicInteger AtomicLong AtomicLongArray
                                         AtomicReferenceArray)
            (java.util.concurrent.locks LockSupport)
-           (org.rocksdb BlockBasedTableConfig BloomFilter ColumnFamilyDescriptor
-                        ColumnFamilyHandle ColumnFamilyOptions DBOptions Env FlushOptions
-                        Options ReadOptions RocksDB RocksDBException RocksIterator RocksMemEnv
-                        Snapshot WriteBatch WriteOptions)))
+           (org.rocksdb BlockBasedTableConfig BloomFilter Cache ColumnFamilyDescriptor
+                        ColumnFamilyHandle ColumnFamilyOptions CompressionType DBOptions Env
+                        FlushOptions IndexType LRUCache Options ReadOptions RocksDB RocksDBException
+                        RocksIterator RocksMemEnv Snapshot WriteBatch WriteBufferManager
+                        WriteOptions)))
 
 (set! *warn-on-reflection* true)
 
@@ -75,6 +76,68 @@
   "Prefix bloom filters on/off for newly opened stores (system property
   mnemonic.rocks.prefix-bloom, default on)."
   (prop-bool "mnemonic.rocks.prefix-bloom" true))
+
+(defn- prop-str [^String k default]
+  (or (System/getProperty k) default))
+
+;; --- storage configuration (file stores; no on-disk format impact)
+
+(def ^:private default-cache-mb
+  "Shared block cache of one file store, in MB (system property mnemonic.rocks.cache-mb;
+  per store `:cache-mb`, URI query `cache-mb`). One LRU cache serves all column families
+  and holds data, index and filter blocks (off-heap, not part of -Xmx)."
+  (prop-int "mnemonic.rocks.cache-mb" 256))
+
+(def ^:private default-write-buffer-mb
+  "Budget for all memtables of one file store, in MB (mnemonic.rocks.write-buffer-mb,
+  `:write-buffer-mb`, `write-buffer-mb`). Ten column families with 64 MB x 2 memtables
+  could otherwise take 1.2 GB of native memory during a bulk load."
+  (prop-int "mnemonic.rocks.write-buffer-mb" 128))
+
+(def ^:private default-compression
+  "none | lz4 | lz4+zstd (mnemonic.rocks.compression, `:compression`, `compression`).
+  Only affects files written from now on; every SST records its own codec."
+  (prop-str "mnemonic.rocks.compression" "lz4"))
+
+(def ^:private cache-index-filter?
+  (prop-bool "mnemonic.rocks.cache-index-filter" true))
+
+(def ^:private partitioned?
+  "Partitioned index and filter blocks (only used with cache-index-filter)."
+  (prop-bool "mnemonic.rocks.partitioned" false))
+
+(def ^:private wbm-charge-cache?
+  "Charge memtable memory to the block cache (one memory budget) instead of on top of it."
+  (prop-bool "mnemonic.rocks.wbm-charge-cache" false))
+
+(def ^:private flush-on-close?
+  (prop-bool "mnemonic.rocks.flush-on-close" true))
+
+(def store-option-keys
+  "Store options that can be given as URI query parameters (`cache-mb=512`)."
+  {"cache-mb" :cache-mb "write-buffer-mb" :write-buffer-mb "compression" :compression})
+
+(defn query-store-opts
+  "Store options from a parsed URI query map {\"cache-mb\" \"512\" ...} (string keys);
+  throws ex-info :db.error/invalid-uri for a bad value. Unknown keys are ignored."
+  [kvs]
+  (reduce-kv
+   (fn [acc k v]
+     (if-let [opt (get store-option-keys k)]
+       (assoc acc opt
+              (if (= opt :compression)
+                (if (#{"none" "lz4" "lz4+zstd"} v)
+                  v
+                  (throw (ex-info (str "Invalid " k " option: " v)
+                                  {:db/error :db.error/invalid-uri})))
+                (try (let [n (Long/parseLong ^String v)]
+                       (when-not (pos? n) (throw (NumberFormatException.)))
+                       n)
+                     (catch NumberFormatException _
+                       (throw (ex-info (str "Invalid " k " option: " v " (positive integer expected)")
+                                       {:db/error :db.error/invalid-uri}))))))
+       acc))
+   {} kvs))
 
 (def avet-prefix-len
   "Fixed prefix length of the AVET column families: attribute id (8) + value tag (1) +
@@ -216,12 +279,33 @@
   (when c
     (try (.close c) (catch Throwable _ nil))))
 
+(declare apply-compression! shard-bits)
+(defn- shard-bits
+  "Cache shards of at least 16 MB: filter blocks of a 64 MB SST are several MB and a block
+  larger than a shard cannot be cached (measured: bulk load 6x slower with 64 shards of
+  4 MB)."
+  ^long [^long cache-bytes]
+  (-> (- 63 (Long/numberOfLeadingZeros (max 1 (quot cache-bytes 16777216)))) (max 0) (min 6)))
+
+(defn- apply-compression!
+  "L0/L1 uncompressed (short-lived, rewritten soon), LZ4 above, ZSTD at the bottom
+  level for \"lz4+zstd\"."
+  [^ColumnFamilyOptions o codec]
+  (case codec
+    "none" (.setCompressionType o CompressionType/NO_COMPRESSION)
+    "lz4" (.setCompressionType o CompressionType/LZ4_COMPRESSION)
+    "lz4+zstd" (doto o
+                 (.setCompressionType CompressionType/LZ4_COMPRESSION)
+                 (.setBottommostCompressionType CompressionType/ZSTD_COMPRESSION))))
+
 (defn open-store
   "Open (creating if needed) a store with all column families.
   `mem? true` uses an in-memory RocksMemEnv and treats `path` as a virtual name.
   `prefix-bloom? false` opens without prefix extractors (as stores created before they
-  were introduced; also an A/B switch for benchmarks)."
-  [{:keys [path mem? prefix-bloom?]}]
+  were introduced; also an A/B switch for benchmarks).
+  `cache-mb` (shared block cache), `write-buffer-mb` (memtable budget) and `compression`
+  (\"none\" | \"lz4\" | \"lz4+zstd\") override the defaults above."
+  [{:keys [path mem? prefix-bloom? cache-mb write-buffer-mb compression]}]
   (RocksDB/loadLibrary)
   ;; RocksMemEnv cannot resolve relative names (GetAbsolutePath fails), so virtual
   ;; names are rooted with a leading "/".
@@ -231,26 +315,50 @@
         own   (fn [x] (.add owned x) x)]
     (try
       (let [env      (when mem? (own (RocksMemEnv. (Env/getDefault))))
+            cache-b  (* (long (or cache-mb (if mem? 32 default-cache-mb))) 1048576)
+            wbuf-b   (* (long (or write-buffer-mb (if mem? 32 default-write-buffer-mb))) 1048576)
+            codec    (or compression default-compression)
+            ;; created first, so closed last (after the db and every option object)
+            ^LRUCache cache (own (LRUCache. cache-b (int (prop-int "mnemonic.rocks.cache-shard-bits" (shard-bits cache-b))) false 0.3))
+            wbm      (own (WriteBufferManager. wbuf-b
+                                               ^Cache (if wbm-charge-cache? cache (own (LRUCache. 1048576)))
+                                               false))
             dbo      (own (doto (DBOptions.)
                             (.setCreateIfMissing true)
-                            (.setCreateMissingColumnFamilies true)))
+                            (.setCreateMissingColumnFamilies true)
+                            (.setWriteBufferManager ^WriteBufferManager wbm)
+                            (.setBytesPerSync 1048576)
+                            (.setWalBytesPerSync 1048576)
+                            (.setMaxBackgroundJobs 4)
+                            ;; bounds WAL replay: the oldest memtables are flushed first
+                            (.setMaxTotalWalSize (* 2 wbuf-b))))
             _        (when env (.setEnv ^DBOptions dbo ^Env env))
             bloom    (own (BloomFilter. 10.0 false))
-            table    (doto (BlockBasedTableConfig.)
-                       (.setFilterPolicy bloom)
-                       (.setWholeKeyFiltering true))
+            tcfg     (fn [whole-key?]
+                       (doto (BlockBasedTableConfig.)
+                         (.setBlockCache ^Cache cache)
+                         (.setFilterPolicy bloom)
+                         (.setWholeKeyFiltering (boolean whole-key?))
+                         (.setCacheIndexAndFilterBlocks cache-index-filter?)
+                         (.setCacheIndexAndFilterBlocksWithHighPriority true)
+                         (.setPinL0FilterAndIndexBlocksInCache true)
+                         (.setIndexType (if (and cache-index-filter? partitioned?) IndexType/kTwoLevelIndexSearch IndexType/kBinarySearch))
+                         (.setPartitionFilters (boolean (and cache-index-filter? partitioned?)))
+                         (.setPinTopLevelIndexAndFilter true)))
+            table    (tcfg true)
             ;; index CFs are only read by seek: whole-key filters would be dead weight
-            ptable   (doto (BlockBasedTableConfig.)
-                       (.setFilterPolicy bloom)
-                       (.setWholeKeyFiltering false))
-            cfo      (own (doto (ColumnFamilyOptions.)
-                            (.setTableFormatConfig table)))
+            ptable   (tcfg false)
+            new-cfo  (fn [^BlockBasedTableConfig tc]
+                       (let [^ColumnFamilyOptions o (own (doto (ColumnFamilyOptions.)
+                                                           (.setTableFormatConfig ^org.rocksdb.TableFormatConfig tc)))]
+                         (apply-compression! o codec)
+                         o))
+            cfo      (new-cfo table)
             cfo-for  (into {}
                            (map (fn [cf]
                                   [cf (if-let [n (and prefix? (get prefix-lens cf))]
-                                        (own (doto (ColumnFamilyOptions.)
-                                               (.setTableFormatConfig ptable)
-                                               (.useFixedLengthPrefixExtractor (int n))))
+                                        (doto ^ColumnFamilyOptions (new-cfo ptable)
+                                          (.useFixedLengthPrefixExtractor (int n)))
                                         cfo)]))
                            cf-names)
             descs    (mapv #(ColumnFamilyDescriptor. (cf-bytes %) ^ColumnFamilyOptions (cfo-for %)) cf-names)
@@ -681,6 +789,14 @@
         (try (.releaseSnapshot ^RocksDB (.-db store) ^Snapshot (.-native s))
              (catch Throwable _ nil))))
     (.clear ^Set (.-snaps store))
+    ;; Flush the memtables so the next open does not replay the WAL (replay of a large
+    ;; WAL dominated reopen time). No other native call can be in flight here (guard
+    ;; quiesced, cursors and snapshots closed). Failure is harmless: the WAL still holds
+    ;; the data and is replayed.
+    (when (and flush-on-close? (nil? (:env store)))
+      (try (with-open [fo (doto (FlushOptions.) (.setWaitForFlush true))]
+             (.flush ^RocksDB (.-db store) fo ^java.util.List (mapv #(get (:cfs store) %) cf-names)))
+           (catch Throwable _ nil)))
     (doseq [^ColumnFamilyHandle h (vals (:cfs store))] (close-quietly h))
     (close-quietly (.-db store))
     (doseq [c (:closeables store)] (close-quietly c)))
