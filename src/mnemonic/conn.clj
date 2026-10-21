@@ -42,30 +42,36 @@
 (defn- canonical-path [^String p]
   (.getCanonicalPath (File. p)))
 
-;; "?sync=true|false" on a file URI (default true): see README "Durability"
-(defn- parse-sync [uri query]
+;; Query options on a file (or mem) URI: "sync=true|false" (default true, see README
+;; "Durability") plus the store options of rocks/store-option-keys (cache-mb,
+;; write-buffer-mb, compression; see README "Tuning"). None is part of the database's identity.
+(defn- parse-query
+  "{:sync? b :store-opts m} from a URI query string."
+  [uri query]
   (if (str/blank? query)
-    true
+    {:sync? true :store-opts {}}
     (let [kvs (into {} (map #(let [[k v] (str/split % #"=" 2)] [k v])) (str/split query #"&"))
           bad (fn [] (fail :db.error/invalid-db-uri
-                           (str "Invalid database URI " uri " (supported option: sync=true|false)")))]
-      (when-not (every? #{"sync"} (keys kvs)) (bad))
-      (case (get kvs "sync")
-        "true" true
-        "false" false
-        (bad)))))
+                           (str "Invalid database URI " uri " (supported options: sync=true|false, "
+                                (str/join ", " (map #(str % "=...") (sort (keys rocks/store-option-keys)))) ")")))]
+      (when-not (every? #(or (= "sync" %) (contains? rocks/store-option-keys %)) (keys kvs)) (bad))
+      {:sync? (case (get kvs "sync" "true") "true" true "false" false (bad))
+       :store-opts (rocks/query-store-opts (dissoc kvs "sync"))})))
 
 (defn- parse-uri
-  "{:kind :mem :name n :key k} or {:kind :file :path p :key k :sync? b}. File paths are
-  canonicalized so one database written two ways maps to one key; a `?sync=false` query
-  is stripped from the path."
+  "{:kind :mem :name n :key k :store-opts m} or {:kind :file :path p :key k :sync? b
+  :store-opts m}. File paths are canonicalized so one database written two ways maps to one
+  key; the query string is stripped from the path and never part of the key."
   [uri]
   (cond
     (not (string? uri)) (fail :db.error/invalid-db-uri (str "Invalid database URI " (pr-str uri)))
     (str/starts-with? uri mem-prefix)
-    (let [n (subs uri (count mem-prefix))]
+    (let [n (subs uri (count mem-prefix))
+          qi (str/index-of n "?")
+          query (when qi (subs n (inc (long qi))))
+          n (if qi (subs n 0 qi) n)]
       (when (str/blank? n) (fail :db.error/invalid-db-uri (str "Invalid database URI " uri)))
-      {:kind :mem :name n :key [:mem n]})
+      {:kind :mem :name n :key [:mem n] :store-opts (:store-opts (parse-query uri query))})
     (str/starts-with? uri file-prefix)
     (let [p (subs uri (count file-prefix))
           qi (str/index-of p "?")
@@ -74,7 +80,7 @@
           p (if (re-matches #"/[A-Za-z]:.*" p) (subs p 1) p)]
       (when (str/blank? p) (fail :db.error/invalid-db-uri (str "Invalid database URI " uri)))
       (let [p (canonical-path p)]
-        {:kind :file :path p :key [:file p] :sync? (parse-sync uri query)}))
+        (assoc (parse-query uri query) :kind :file :path p :key [:file p])))
     :else (fail :db.error/invalid-db-uri (str "Invalid database URI " uri))))
 
 (defn- file-db-exists? [path]
@@ -146,11 +152,11 @@
   [uri]
   (under-lock
    uri
-   (fn [{:keys [kind name path key]}]
+   (fn [{:keys [kind name path key store-opts]}]
      (case kind
        :mem (if (contains? (:mem @registry) name)
               false
-              (let [store (rocks/open-store {:path name :mem? true})]
+              (let [store (rocks/open-store (assoc store-opts :path name :mem? true))]
                 (try (bootstrap/bootstrap! store)
                      (catch Throwable t (rocks/close-store store) (throw t)))
                 (swap! registry assoc-in [:mem name] store)
@@ -158,7 +164,7 @@
        :file (if (or (file-db-exists? path) (contains? (:conns @registry) key))
                false
                (do (.mkdirs (io/file path))
-                   (let [store (rocks/open-store {:path path})]
+                   (let [store (rocks/open-store (assoc store-opts :path path))]
                      (try (bootstrap/bootstrap! store)
                           (finally (rocks/close-store store))))
                    true))))))
@@ -168,12 +174,12 @@
   [uri]
   (under-lock
    uri
-   (fn [{:keys [kind name path key sync?]}]
+   (fn [{:keys [kind name path key sync? store-opts]}]
      (or (get-in @registry [:conns key])
          (let [store (case kind
                        :mem (or (get-in @registry [:mem name]) (not-found uri))
                        :file (if (file-db-exists? path)
-                               (rocks/open-store {:path path})
+                               (rocks/open-store (assoc store-opts :path path))
                                (not-found uri)))
                conn (try (make-connection uri key store (if (= kind :file) sync? false))
                          (catch Throwable t

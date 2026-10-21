@@ -29,6 +29,15 @@ through `org.rocksdb/rocksdbjni`. On recent JDKs add
 | `mnemonic:mem://name` | in memory, gone when the process exits |
 | `mnemonic:file:///absolute/path` | RocksDB directory on disk |
 | `mnemonic:file:///absolute/path?sync=false` | same, without fsync per commit (see Durability) |
+| `mnemonic:file:///absolute/path?cache-mb=512&compression=lz4` | same, with storage options (see Tuning) |
+
+Query parameters are `sync` (`true` or `false`) and the storage options `cache-mb`,
+`write-buffer-mb` and `compression` (`none`, `lz4` or `lz4+zstd`); combine them with `&`.
+An unknown key is rejected with `:db.error/invalid-db-uri`, a bad value with
+`:db.error/invalid-uri`. They belong to the connection, not the database's identity: the
+first `create-database` / `connect` per process decides. `mnemonic:mem://name` accepts the
+same storage options (`sync` is accepted and ignored); they apply when the database is
+created.
 
 ## Example
 
@@ -147,7 +156,7 @@ MNEMONIC_DIFF_TRIALS=5000 clojure -M:test -n mnemonic.diff-gen-test
 
 ### Storage (file databases)
 
-Settings are system properties (`-Dmnemonic.rocks.<name>=...`) read once at startup, or keys of the map passed to `mnemonic.rocks/open-store`. They change memory use and speed only; nothing here changes the on-disk key format, and existing databases open unchanged.
+Settings are system properties (`-Dmnemonic.rocks.<name>=...`) read once at startup, keys of the map passed to `mnemonic.rocks/open-store`, or, for `cache-mb`, `write-buffer-mb` and `compression`, query parameters of the database URI (`mnemonic:file:///data/db?cache-mb=1024&compression=lz4+zstd`; see "Database URIs"). They change memory use and speed only; nothing here changes the on-disk key format, and existing databases open unchanged.
 
 | property | default | meaning |
 |---|---|---|
