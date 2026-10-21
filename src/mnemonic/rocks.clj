@@ -729,9 +729,13 @@
      (with-open [o (doto (CompactRangeOptions.)
                      (.setBottommostLevelCompaction CompactRangeOptions$BottommostLevelCompaction/kSkip))]
        (let [counts (l0-file-counts store)]
-         (vec (for [[cf n] counts :when (>= (long n) (long min-files))]
-                (do (wrap-rocks (.compactRange ^RocksDB (.-db store) (cf-handle store cf) nil nil o))
-                    cf))))))))
+         ;; close-store waits for the guard: stop between column families once it started
+         (into [] (comp (filter (fn [[_ n]] (>= (long n) (long min-files))))
+                        (take-while (fn [_] (not (closed? store))))
+                        (map (fn [[cf _]]
+                               (wrap-rocks (.compactRange ^RocksDB (.-db store) (cf-handle store cf) nil nil o))
+                               cf)))
+               counts))))))
 
 (defn maybe-compact-l0-async!
   "Starts one background L0 compaction (single flight) when some column family has 2+ L0
@@ -818,9 +822,11 @@
 ;; `seeked` is false until the first positioning call: a recycled iterator still has the
 ;; position of its previous user and must look fresh (invalid).
 (defn- publish-kbuf!
-  "Stores a grown key buffer in the slot, so later leases of the slot start with it."
+  "Stores a grown key buffer in the slot, so later leases of the slot start with it.
+  Buffers above 64 KB (an outsized key) stay with the lease and are not pooled."
   [^Slot s ^bytes kb]
-  (aset ^objects (.-bufs s) 0 kb))
+  (when (<= (alength kb) 65536)
+    (aset ^objects (.-bufs s) 0 kb)))
 
 (defmacro ^:private key-into!
   "Inside (locking slot): copies the valid iterator's key into the `kb` field (growing
@@ -903,7 +909,10 @@
           (when (< n 8)
             (throw (ex-info "Unexpected value length" {:db/error :db.error/invalid-encoding
                                                         :cognitect.anomalies/category :cognitect.anomalies/fault})))
-          (.getLong (java.nio.ByteBuffer/wrap vb))))))
+          (loop [i 0 acc 0]
+            (if (< i 8)
+              (recur (inc i) (bit-or (bit-shift-left acc 8) (bit-and 0xFF (long (aget vb i)))))
+              acc))))))
   (close [this]
     ;; give-back! may lock other (idle) slots while draining: never under the monitor
     (when (.markDone this) (give-back! slot))
@@ -949,8 +958,13 @@
   :db.error/connection-released. Idempotent."
   [^Store store]
   (when (.compareAndSet ^AtomicBoolean (.-closed store) false true)
-    (segcache/clear! (.-segcache store))
+    ;; a running background L0 compaction holds the guard: make RocksDB abandon it
+    ;; instead of waiting for it to finish (the db is about to close anyway)
+    (when (.get ^AtomicBoolean (.-compacting store))
+      (try (.cancelAllBackgroundWork ^RocksDB (.-db store) false) (catch Throwable _ nil)))
     (await-quiescent! store)
+    ;; after quiescence (no fill can be in flight); closed: late fills are dropped
+    (segcache/close! (.-segcache store))
     (doseq [^Slot s (vec (.-cursors store))]
       (try (force-close-slot! s) (catch Throwable _ nil)))
     (.clear ^Set (.-cursors store))
