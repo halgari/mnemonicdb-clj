@@ -47,7 +47,8 @@
                                         AtomicReferenceArray)
            (java.util.concurrent.locks LockSupport)
            (org.rocksdb BlockBasedTableConfig BloomFilter Cache ColumnFamilyDescriptor
-                        ColumnFamilyHandle ColumnFamilyOptions CompressionType DBOptions Env
+                        ColumnFamilyHandle ColumnFamilyOptions CompactRangeOptions CompressionType DBOptions Env
+                        CompactRangeOptions$BottommostLevelCompaction PerfLevel
                         FlushOptions IndexType LRUCache Options ReadOptions RocksDB RocksDBException
                         RocksIterator RocksMemEnv Snapshot WriteBatch WriteBufferManager
                         WriteOptions)))
@@ -113,6 +114,24 @@
 (def ^:private flush-on-close?
   (prop-bool "mnemonic.rocks.flush-on-close" true))
 
+(def ^:private perf-off?
+  "RocksDB's per-thread perf counters (default level kEnableCount) cost 8-13 percent of a
+  scan or seek (a TLS lookup per counter bump through the dlopen'ed library). Disable them
+  on every thread that touches the store (system property mnemonic.rocks.perf-off)."
+  (prop-bool "mnemonic.rocks.perf-off" true))
+
+(def ^:private auto-compact-l0?
+  "Compact L0 away in the background when a store has 2 or more L0 files in a column
+  family (after writes, and at open). OFF by default: measured on the bench dataset it
+  moved nothing that matters (3 L0 files: lookup-ref -14 percent, total-order seeks and
+  scans unchanged) and made bloom misses 25 percent slower (cold-lookup). Enable with
+  -Dmnemonic.rocks.auto-compact-l0=true, or call `compact-l0!` after a bulk load."
+  (prop-bool "mnemonic.rocks.auto-compact-l0" false))
+
+(def ^:private compact-check-bytes
+  "Written bytes between L0 checks."
+  (* 16 1048576))
+
 (def store-option-keys
   "Store options that can be given as URI query parameters (`cache-mb=512`)."
   {"cache-mb" :cache-mb "write-buffer-mb" :write-buffer-mb "compression" :compression})
@@ -171,7 +190,8 @@
 
 ;; guard: Guard (striped in-flight counters); closed: AtomicBoolean;
 ;; cursors: concurrent set of live Slots; snaps: concurrent set of live Snaps
-(defrecord Store [^RocksDB db cfs env closeables guard closed cursors snaps])
+(defrecord Store [^RocksDB db cfs env closeables guard closed cursors snaps
+                  ^AtomicLong written ^AtomicBoolean compacting])
 
 (deftype Guard [^AtomicLongArray counts])   ; 16 stripes, 8 longs apart (cache lines)
 
@@ -279,7 +299,7 @@
   (when c
     (try (.close c) (catch Throwable _ nil))))
 
-(declare apply-compression! shard-bits)
+(declare apply-compression! shard-bits maybe-compact-l0-async!)
 (defn- shard-bits
   "Cache shards of at least 16 MB: filter blocks of a 64 MB SST are several MB and a block
   larger than a shard cannot be cached (measured: bulk load 6x slower with 64 shards of
@@ -365,9 +385,12 @@
             handles  (ArrayList.)
             db       (wrap-rocks (RocksDB/open dbo ^String path ^java.util.List descs handles))
             cfs      (zipmap cf-names (vec handles))]
-        (->Store db cfs env (vec (reverse (vec owned)))
-                 (new-guard) (AtomicBoolean. false)
-                 (ConcurrentHashMap/newKeySet) (ConcurrentHashMap/newKeySet)))
+        (let [st (->Store db cfs env (vec (reverse (vec owned)))
+                          (new-guard) (AtomicBoolean. false)
+                          (ConcurrentHashMap/newKeySet) (ConcurrentHashMap/newKeySet)
+                          (AtomicLong. 0) (AtomicBoolean. false))]
+          (when (and auto-compact-l0? (not mem?)) (maybe-compact-l0-async! st))
+          st))
       (catch Throwable t
         (doseq [c (reverse (vec owned))] (close-quietly c))
         (throw t))))))
@@ -388,6 +411,15 @@
   (or (get (:cfs store) cf)
       (throw (ex-info "Unknown column family" {:cf cf}))))
 
+(def ^:private ^ThreadLocal perf-done (ThreadLocal.))
+
+(defn- ensure-perf-off!
+  "Once per thread: perf level kDisable (thread-local in RocksDB). Inside the guard."
+  [^Store store]
+  (when (and perf-off? (nil? (.get perf-done)))
+    (.set perf-done Boolean/TRUE)
+    (.setPerfLevel ^RocksDB (.-db store) PerfLevel/DISABLE)))
+
 ;; ------------------------------------------------------------------ slots and snapshots
 
 (definterface ISnap
@@ -401,7 +433,8 @@
 ;; under the slot's monitor, which also serializes every native call on `it`.
 ;; `own-ro` is set for iterators without a snapshot (they own their ReadOptions).
 (deftype Slot [^Store store ^RocksIterator it ^ReadOptions own-ro snap
-               ^long cfi ^long mode ^AtomicInteger state])
+               ^long cfi ^long mode ^AtomicInteger state
+               ^objects bufs])   ; [key buffer, 8-byte value buffer]: reused by every lease
 
 ;; Idle slots of one (cf, mode, thread stripe): a tiny array stack guarded by its own
 ;; monitor (almost never contended: stripes are per thread). Never hold the pool monitor
@@ -579,7 +612,8 @@
           ro (or own-ro (if (== mode mode-prefix) (.-ro-p ^Snap snap) (.-ro-t ^Snap snap)))]
       (try
         (let [s (->Slot store (.newIterator ^RocksDB (.-db store) (cf-handle store cf) ^ReadOptions ro)
-                        own-ro snap cfi mode (AtomicInteger. 0))]
+                        own-ro snap cfi mode (AtomicInteger. 0)
+                        (object-array [(byte-array 64) (byte-array 8)]))]
           (.add ^Set (.-cursors store) s)
           s)
         (catch Throwable t
@@ -608,6 +642,7 @@
   "Point lookup. `snap` (a Snap) may be nil."
   ^bytes [^Store store cf snap ^bytes k]
   (guarded store
+    (ensure-perf-off! store)
     (let [^RocksDB db (.-db store)
           h (cf-handle store cf)]
       (if snap
@@ -620,6 +655,8 @@
               (.unref snap))))
         (wrap-rocks (.get db h k))))))
 
+(declare note-written! maybe-compact-l0-async!)
+
 (defn write!
   "Atomically apply `ops`: seq of [:put cf k v] / [:delete cf k]."
   [^Store store ops {:keys [sync?]}]
@@ -631,11 +668,18 @@
                      (.setSync (and (boolean sync?) (not mem?)))))]
     ;; the batch references column family handles: build it under the guard too
     (guarded store
+      (ensure-perf-off! store)
       (doseq [op ops]
         (case (nth op 0)
           :put    (.put wb (cf-handle store (nth op 1)) ^bytes (nth op 2) ^bytes (nth op 3))
           :delete (.delete wb (cf-handle store (nth op 1)) ^bytes (nth op 2))))
       (wrap-rocks (.write ^RocksDB (.-db store) wo wb))))
+  (when (and auto-compact-l0? (nil? (.-env store)))
+    (note-written! store (long (reduce (fn [^long n op]
+                                         (if (== 4 (count op))
+                                           (+ n (alength ^bytes (nth op 2)) (alength ^bytes (nth op 3)))
+                                           n))
+                                       0 ops))))
   nil)
 
 (defn flush!
@@ -645,6 +689,54 @@
     (with-open [fo (doto (FlushOptions.) (.setWaitForFlush true))]
       (wrap-rocks (.flush ^RocksDB (.-db store) fo ^java.util.List (mapv #(cf-handle store %) cf-names)))))
   nil)
+
+(defn l0-file-counts
+  "Number of L0 SST files per index column family."
+  [^Store store]
+  (guarded store
+    (into {}
+          (map (fn [cf]
+                 [cf (Long/parseLong (wrap-rocks (.getProperty ^RocksDB (.-db store) (cf-handle store cf)
+                                                                  "rocksdb.num-files-at-level0")))]))
+          (remove #{:default :log} cf-names))))
+
+(defn compact-l0!
+  "Compacts L0 into the next level for every column family with at least `min-files` (2)
+  L0 files; the bottommost level is left alone, so this is cheap after a bulk load.
+  Returns the vector of compacted column families."
+  ([store] (compact-l0! store 2))
+  ([^Store store min-files]
+   (guarded store
+     (with-open [o (doto (CompactRangeOptions.)
+                     (.setBottommostLevelCompaction CompactRangeOptions$BottommostLevelCompaction/kSkip))]
+       (let [counts (l0-file-counts store)]
+         (vec (for [[cf n] counts :when (>= (long n) (long min-files))]
+                (do (wrap-rocks (.compactRange ^RocksDB (.-db store) (cf-handle store cf) nil nil o))
+                    cf))))))))
+
+(defn maybe-compact-l0-async!
+  "Starts one background L0 compaction (single flight) when some column family has 2+ L0
+  files. close-store waits for a running one (it runs inside the store guard)."
+  [^Store store]
+  (when (and (not (closed? store)) (.compareAndSet ^AtomicBoolean (.-compacting store) false true))
+    (doto (Thread.
+           ^Runnable
+           (fn []
+             (try (compact-l0! store)
+                  (catch Throwable _ nil)
+                  (finally (.set ^AtomicBoolean (.-compacting store) false))))
+           "mnemonic-compact-l0")
+      (.setDaemon true)
+      (.start)))
+  nil)
+
+(defn note-written!
+  "Accounts `n` written bytes; every `compact-check-bytes` checks for L0 build-up."
+  [^Store store ^long n]
+  (let [w ^AtomicLong (.-written store)]
+    (when (>= (.addAndGet w n) (long compact-check-bytes))
+      (.set w 0)
+      (maybe-compact-l0-async! store))))
 
 (defn compact!
   "Full manual compaction of every column family."
@@ -668,6 +760,17 @@
   (^bytes value [])
   (^bytes seekKey [^bytes k])
   (^bytes nextKey [])
+  (^long seekInto [^bytes k]
+   "Seeks; copies the key into the cursor's reused buffer (see kbuf) and returns its
+   length, or -1 when the iterator is exhausted.")
+  (^long nextInto []
+   "Advances; like seekInto. The buffer is overwritten by the next call.")
+  (^bytes kbuf []
+   "The reused key buffer (valid bytes: the length returned by seekInto/nextInto; may be
+   replaced by a larger one on a later call).")
+  (^long valueLong []
+   "The current value read as a big-endian long (history CFs: retracting tx), without
+   allocating.")
   (^void close []))
 
 (definterface ILease
@@ -695,9 +798,30 @@
 ;; A lease on a Slot. All fields and the slot state are guarded by the slot's monitor.
 ;; `seeked` is false until the first positioning call: a recycled iterator still has the
 ;; position of its previous user and must look fresh (invalid).
+(defn- publish-kbuf!
+  "Stores a grown key buffer in the slot, so later leases of the slot start with it."
+  [^Slot s ^bytes kb]
+  (aset ^objects (.-bufs s) 0 kb))
+
+(defmacro ^:private key-into!
+  "Inside (locking slot): copies the valid iterator's key into the `kb` field (growing
+  it if needed) and returns its length; -1 when invalid (after a status check)."
+  [it]
+  `(let [^RocksIterator it# ~it]
+     (if (.isValid it#)
+       (let [n# (.key it# ~'kb)]
+         (if (> n# (alength ~'kb))
+           (do (set! ~'kb (byte-array (max n# (* 2 (alength ~'kb)))))
+               (publish-kbuf! ~'slot ~'kb)
+               (long (.key it# ~'kb)))
+           (long n#)))
+       (do (check-status it#) -1))))
+
 (deftype RawCursor [^Slot slot
                     ^:unsynchronized-mutable ^boolean done
-                    ^:unsynchronized-mutable ^boolean seeked]
+                    ^:unsynchronized-mutable ^boolean seeked
+                    ^:unsynchronized-mutable ^bytes kb
+                    ^bytes vb]
   IRawCursor
   (seek [_ k]
     (let [s slot]
@@ -736,6 +860,31 @@
         (let [^RocksIterator it (.-it s)]
           (.next it)
           (if (.isValid it) (.key it) (do (check-status it) nil))))))
+  (seekInto [_ k]
+    (let [s slot]
+      (locking s
+        (open! s done)
+        (set! seeked (boolean true))
+        (let [^RocksIterator it (.-it s)]
+          (.seek it ^bytes k)
+          (key-into! it)))))
+  (nextInto [_]
+    (let [s slot]
+      (locking s
+        (open! s done)
+        (let [^RocksIterator it (.-it s)]
+          (.next it)
+          (key-into! it)))))
+  (kbuf [_] kb)
+  (valueLong [_]
+    (let [s slot]
+      (locking s
+        (open! s done)
+        (let [n (.value ^RocksIterator (.-it s) vb)]
+          (when (< n 8)
+            (throw (ex-info "Unexpected value length" {:db/error :db.error/invalid-encoding
+                                                        :cognitect.anomalies/category :cognitect.anomalies/fault})))
+          (.getLong (java.nio.ByteBuffer/wrap vb))))))
   (close [this]
     ;; give-back! may lock other (idle) slots while draining: never under the monitor
     (when (.markDone this) (give-back! slot))
@@ -765,9 +914,12 @@
   Returns a RawCursor (hint call sites with ^mnemonic.rocks.IRawCursor)."
   (^mnemonic.rocks.RawCursor [store cf snap] (raw-cursor store cf snap nil))
   (^mnemonic.rocks.RawCursor [^Store store cf snap ^bytes prefix]
+   (when (and perf-off? (nil? (.get perf-done))) (guarded store (ensure-perf-off! store)))
    (let [mode (if (and prefix (prefix-mode? cf prefix)) mode-prefix mode-total)
          cfi (long (cf-index cf))]
-     (->RawCursor (borrow-slot store cf cfi mode snap) false false))))
+     (let [s (borrow-slot store cf cfi mode snap)
+         ^objects bufs (.-bufs s)]
+     (->RawCursor s false false (aget bufs 0) (aget bufs 1))))))
 
 ;; ------------------------------------------------------------------ close
 

@@ -16,7 +16,7 @@
   (:import (java.util UUID)
            (java.util.concurrent CompletableFuture)
            (mnemonic.datom Datom)
-           (mnemonic.index ICursor)
+           (mnemonic.index ICursor IKeyView IViewCursor)
            (mnemonic.schema Attr)))
 
 (set! *warn-on-reflection* true)
@@ -289,12 +289,19 @@
 
 (deftype UntilCursor [^ICursor c ^bytes stop]
   ICursor
-  (valid [_] (and (.valid c) (neg? (codec/compare-bytes (.key c) stop))))
+  (valid [_] (and (.valid c)
+                  (neg? (java.util.Arrays/compareUnsigned (index/key-buf c) 0 (unchecked-int (index/key-len c))
+                                                          stop 0 (alength stop)))))
   (advance [_] (.advance c))
   (key [_] (.key c))
   (datom [_] (.datom c))
   (retractTx [_] (.retractTx c))
-  (close [_] (.close c)))
+  (close [_] (.close c))
+  IViewCursor
+  (view [_] (index/view-of c))
+  IKeyView
+  (keyBuf [_] (index/key-buf c))
+  (keyLen [_] (index/key-len c)))
 
 (defn index-range
   "AVET datoms of `attrid` with start <= value < end (nil bounds are open)."

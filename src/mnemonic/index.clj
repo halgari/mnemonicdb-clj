@@ -7,7 +7,7 @@
            (java.lang.ref Reference)
            (java.util Arrays)
            (java.util.concurrent.atomic AtomicLong)
-           (mnemonic.datom Datom)
+           (mnemonic.datom Datom IDatomView)
            (mnemonic.rocks IRawCursor)))
 
 (set! *warn-on-reflection* true)
@@ -19,6 +19,35 @@
   (datom [])
   (^long retractTx [])
   (close []))
+
+(definterface IKeyView
+  (^bytes keyBuf [] "Buffer holding the current key in its first keyLen bytes; valid until advance. Never retain.")
+  (^long keyLen []))
+
+(definterface IViewCursor
+  (view [] "Flyweight IDatomView of the current entry, valid until the cursor advances."))
+
+(defn view-of
+  "Flyweight view of `c`'s current entry (a materialized Datom for cursors that cannot
+  decode in place). Valid until `c` advances; never retain."
+  ^IDatomView [^ICursor c]
+  (if (instance? IViewCursor c) (.view ^IViewCursor c) (.datom c)))
+
+(defn key-buf
+  "The current key of `c` without copying (see IKeyView); only valid until `c` advances."
+  ^bytes [^ICursor c]
+  (if (instance? IKeyView c) (.keyBuf ^IKeyView c) (.key c)))
+
+(defn key-len
+  "Length of the current key in `(key-buf c)`."
+  ^long [^ICursor c]
+  (if (instance? IKeyView c) (.keyLen ^IKeyView c) (alength ^bytes (.key c))))
+
+(defn compare-keys
+  "Unsigned lexicographic comparison of the current keys of two valid cursors."
+  ^long [^ICursor a ^ICursor b]
+  (long (Arrays/compareUnsigned (key-buf a) 0 (unchecked-int (key-len a))
+                                (key-buf b) 0 (unchecked-int (key-len b)))))
 
 (defprotocol IDb
   (-seek-current [db index prefix-bytes]
@@ -43,39 +72,62 @@
 
 ;; ------------------------------------------------------------------ range cursor
 
-(defn- starts-with? [^bytes k ^bytes prefix]
-  (let [n (alength prefix)]
-    (and (>= (alength k) n)
-         (Arrays/equals k 0 n prefix 0 n))))
+(defn- in-prefix-len
+  "`n` (a key length in `kb`, -1 = exhausted) when the key is within `prefix` (or
+  `prefix` is nil), else -1."
+  ^long [^long n ^bytes kb ^bytes prefix]
+  (if (and (>= n 0)
+           (or (nil? prefix)
+               (let [pl (alength prefix)]
+                 (and (>= n pl) (Arrays/equals kb 0 pl prefix 0 pl)))))
+    n
+    -1))
 
-(defn- in-prefix
-  "`k` when non-nil and (when `prefix` is non-nil) within the prefix, else nil."
-  ^bytes [^bytes k ^bytes prefix]
-  (when (and k (or (nil? prefix) (starts-with? k prefix)))
-    k))
-
-(deftype RangeCursor [^IRawCursor raw ^bytes prefix index history?
+;; The current key lives in the raw cursor's reused buffer (`klen` bytes, -1 = invalid).
+;; `key` materializes an exact-length copy lazily (callers may retain it); `datom` decodes
+;; straight from the buffer.
+(deftype RangeCursor [^IRawCursor raw ^bytes prefix index history? ^long code
+                      ^:unsynchronized-mutable ^long klen
                       ^:unsynchronized-mutable ^bytes k
                       ^:unsynchronized-mutable d
                       ^:unsynchronized-mutable ^boolean closed?]
   ICursor
-  (valid [_] (some? k))
+  (valid [_] (>= klen 0))
   (advance [_]
-    (when k
-      (set! k (in-prefix (.nextKey raw) prefix))
+    (when (>= klen 0)
+      (set! klen (in-prefix-len (.nextInto raw) (.kbuf raw) prefix))
+      (set! k nil)
       (set! d nil))
     nil)
-  (key [_] k)
+  (key [_]
+    (when (>= klen 0)
+      (or k (set! k (Arrays/copyOf (.kbuf raw) (unchecked-int klen))))))
+  IKeyView
+  (keyBuf [_] (when (>= klen 0) (or k (.kbuf raw))))
+  (keyLen [_] klen)
   (datom [_]
-    (when k
-      (or d (set! d (codec/decode-key index k)))))
+    (when (>= klen 0)
+      (or d (set! d (codec/decode-key-code code (.kbuf raw) klen)))))
   (retractTx [_]
-    (if (and k history?)
-      (codec/bytes->long (.value raw))
+    (if (and (>= klen 0) history?)
+      (.valueLong raw)
       -1))
+  IViewCursor
+  (view [this] (when (>= klen 0) this))
+  ;; The cursor is its own flyweight view: components decode in place from the raw
+  ;; cursor's key buffer (valid until advance).
+  IDatomView
+  (eid [_] (codec/key-e code (.kbuf raw) klen))
+  (attr [_] (codec/key-a code (.kbuf raw) klen))
+  (value [_] (codec/key-value code (.kbuf raw) klen))
+  (valueLong [_] (codec/key-value-long code (.kbuf raw) klen))
+  (txid [_] (codec/key-tx (.kbuf raw) klen))
+  (isAdded [_] true)
+  (toDatom [this] (.datom this))
   (close [_]
     (when-not closed?
       (set! closed? (boolean true))
+      (set! klen -1)
       (set! k nil)
       (set! d nil)
       (.decrementAndGet open-cursors)
@@ -85,7 +137,8 @@
 (defn- range-cursor [^IRawCursor raw ^bytes start ^bytes prefix index history?]
   (.incrementAndGet open-cursors)
   (try
-    (->RangeCursor raw prefix index history? (in-prefix (.seekKey raw start) prefix) nil false)
+    (->RangeCursor raw prefix index history? (codec/index-code index)
+                   (in-prefix-len (.seekInto raw start) (.kbuf raw) prefix) nil nil false)
     (catch Throwable t
       (.decrementAndGet open-cursors)
       (.close raw)
@@ -123,8 +176,7 @@
         (if (.valid c)
           (recur (inc i)
                  (if (or (neg? best)
-                         (neg? (codec/compare-bytes
-                                (.key c) (.key ^mnemonic.index.ICursor (aget cs best)))))
+                         (neg? (compare-keys c (aget cs best))))
                    i
                    best))
           (recur (inc i) best)))
@@ -141,8 +193,13 @@
       (set! cur (min-index cs)))
     nil)
   (key [_] (when (>= cur 0) (.key ^mnemonic.index.ICursor (aget cs cur))))
+  IKeyView
+  (keyBuf [_] (when (>= cur 0) (key-buf (aget cs cur))))
+  (keyLen [_] (if (>= cur 0) (key-len (aget cs cur)) -1))
   (datom [_] (when (>= cur 0) (.datom ^mnemonic.index.ICursor (aget cs cur))))
   (retractTx [_] (if (>= cur 0) (.retractTx ^mnemonic.index.ICursor (aget cs cur)) -1))
+  IViewCursor
+  (view [_] (when (>= cur 0) (view-of (aget cs cur))))
   (close [_]
     (when-not closed?
       (set! closed? (boolean true))
@@ -230,6 +287,19 @@
      (finally
        (Reference/reachabilityFence db)))))
 
+(definterface IViewReduce
+  (reduceViews [f init] "Like reduce, but `f` receives flyweight IDatomViews (valid only during the call)."))
+
+(defn reduce-views
+  "Reduce `coll` (a `datoms-iterable`, or any reducible of Datoms) with `f`, which receives
+  flyweight IDatomViews decoded in place from the cursor buffer: no Datom, key copy or
+  value is allocated unless `f` asks. A view is valid only during the call to `f`; call
+  `.toDatom` to keep one. Used by internal consumers; public seqs and `reduce` copy."
+  [coll f init]
+  (if (instance? IViewReduce coll)
+    (.reduceViews ^IViewReduce coll f init)
+    (reduce f init coll)))
+
 (defn datoms-iterable
   "Iterable of immutable Datoms over `(-view db index prefix)`. Each seq / iterator /
   reduce opens its own cursor."
@@ -244,6 +314,20 @@
             holder (Object.)]
         (rocks/register-cleanup! holder #(.close cur))
         (seq (cursor-seq cur holder db))))
+    IViewReduce
+    (reduceViews [_ f init]
+      (let [^mnemonic.index.ICursor cur (-view db index prefix)]
+        (try
+          (loop [acc init]
+            (if (.valid cur)
+              (let [ret (f acc (view-of cur))]
+                (if (reduced? ret)
+                  (.deref ^Reduced ret)
+                  (do (.advance cur) (recur ret))))
+              acc))
+          (finally
+            (.close cur)
+            (Reference/reachabilityFence db)))))
     IReduceInit
     (reduce [_ f init]
       (let [^mnemonic.index.ICursor cur (-view db index prefix)]

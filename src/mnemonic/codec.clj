@@ -554,20 +554,75 @@
     (System/arraycopy vb 0 arr 8 (alength vb))
     arr))
 
+;; ------------------------------------------------------------------ in-place access
+;; Flyweight datom views read components directly from the key bytes. Component offsets:
+;;   eavt  E@0 A@8  V@16..n-8   TX@n-8
+;;   aevt  A@0 E@8  V@16..n-8   TX@n-8
+;;   avet  A@0 V@8..n-16        E@n-16 TX@n-8
+;;   vaet  V@0 (raw ref) A@8 E@16 TX@24   (n = 32)
+
+(defn index-code
+  "Small int for an index keyword (0 eavt, 1 aevt, 2 avet, 3 vaet)."
+  ^long [index]
+  (case index :eavt 0 :aevt 1 :avet 2 :vaet 3 (unknown-index index)))
+
+(defn key-long-at
+  "The order-preserving long stored at `off` of `k`."
+  ^long [^bytes k ^long off]
+  (let [i (unchecked-int off)]
+    (bit-xor (bit-or (bit-shift-left (long (aget k i)) 56)
+                     (bit-shift-left (bit-and 0xFF (long (aget k (unchecked-add-int i 1)))) 48)
+                     (bit-shift-left (bit-and 0xFF (long (aget k (unchecked-add-int i 2)))) 40)
+                     (bit-shift-left (bit-and 0xFF (long (aget k (unchecked-add-int i 3)))) 32)
+                     (bit-shift-left (bit-and 0xFF (long (aget k (unchecked-add-int i 4)))) 24)
+                     (bit-shift-left (bit-and 0xFF (long (aget k (unchecked-add-int i 5)))) 16)
+                     (bit-shift-left (bit-and 0xFF (long (aget k (unchecked-add-int i 6)))) 8)
+                     (bit-and 0xFF (long (aget k (unchecked-add-int i 7)))))
+             Long/MIN_VALUE)))
+
+(defn key-e ^long [^long code ^bytes k ^long n]
+  (case code 0 (key-long-at k 0) 1 (key-long-at k 8) 2 (key-long-at k (- n 16)) (key-long-at k 16)))
+
+(defn key-a ^long [^long code ^bytes k ^long _n]
+  (case code 0 (key-long-at k 8) 1 (key-long-at k 0) 2 (key-long-at k 0) (key-long-at k 8)))
+
+(defn key-tx ^long [^bytes k ^long n] (key-long-at k (- n 8)))
+
+(defn key-value
+  "Decode the value component of the key (first `n` bytes of `k`)."
+  [^long code ^bytes k ^long n]
+  (case code
+    3 (key-long-at k 0)
+    (let [off (if (== code 2) 8 16)]
+      (if (== 0x11 (bit-and 0xFF (long (aget k off))))
+        (key-long-at k (inc off))
+        (decode-value (ByteBuffer/wrap k (unchecked-int off) (unchecked-int (- n off))))))))
+
+(defn key-value-long
+  "The value component as a primitive long (long-tagged value, or a VAET ref)."
+  ^long [^long code ^bytes k ^long _n]
+  (case code
+    3 (key-long-at k 0)
+    (let [off (if (== code 2) 8 16)]
+      (if (== 0x11 (bit-and 0xFF (long (aget k off))))
+        (key-long-at k (inc off))
+        (throw (ClassCastException. "datom value is not a long"))))))
+
+(defn decode-key-code
+  "Decode the index key held in the first `n` bytes of `k` (index code, see `index-code`)
+  into a Datom (added = true); components are read in place, no ByteBuffer."
+  ^Datom [^long code ^bytes k ^long n]
+  (Datom. (key-e code k n) (key-a code k n) (key-value code k n) (key-tx k n) true))
+
+(defn decode-key-len
+  "Decode the index key held in the first `n` bytes of `k` into a Datom (added = true)."
+  ^Datom [index ^bytes k ^long n]
+  (decode-key-code (index-code index) k n))
+
 (defn decode-key
   "Decode an index key into a Datom (added = true)."
   ^Datom [index ^bytes k]
-  (let [buf (ByteBuffer/wrap k)]
-    (case index
-      :eavt (let [e (read-long buf) a (read-long buf) v (decode-value buf) tx (read-long buf)]
-              (Datom. e a v tx true))
-      :aevt (let [a (read-long buf) e (read-long buf) v (decode-value buf) tx (read-long buf)]
-              (Datom. e a v tx true))
-      :avet (let [a (read-long buf) v (decode-value buf) e (read-long buf) tx (read-long buf)]
-              (Datom. e a v tx true))
-      :vaet (let [v (read-long buf) a (read-long buf) e (read-long buf) tx (read-long buf)]
-              (Datom. e a v tx true))
-      (unknown-index index))))
+  (decode-key-len index k (alength k)))
 
 ;; ------------------------------------------------------------------ log entries
 

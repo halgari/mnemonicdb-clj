@@ -306,8 +306,9 @@
           (if many?
             (when-let [ds (entity/datoms-by-prefix db :eavt prefix limit)]
               (collect-children db sch eid attr ds ast st spec false))
-            (when-let [^Datom d (entity/first-datom db :eavt prefix)]
-              (child-value db sch eid attr (.-v d) ast st spec))))))))
+            (let [v (entity/first-value db :eavt prefix)]
+              (when-not (identical? v ::entity/no-datom)
+                (child-value db sch eid attr v ast st spec)))))))))
 
 (defn- spec-value [db sch eid ast st ^AttrSpec spec]
   (let [raw (spec-raw db sch eid ast st spec)

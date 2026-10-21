@@ -8,7 +8,7 @@
   (:import (clojure.lang Associative IFn IHashEq ILookup IPersistentCollection MapEntry
                          Seqable Util)
            (mnemonic.codec IKeyBuf)
-           (mnemonic.datom Datom)
+           (mnemonic.datom Datom IDatomView)
            (mnemonic.db Base)
            (mnemonic.schema Attr)))
 
@@ -37,6 +37,14 @@
   [db index ^bytes prefix]
   (reduce (fn [_ ^Datom d] (when (.-added d) (reduced d)))
           nil (index/datoms-iterable db index prefix)))
+
+(defn first-value
+  "The value of the first asserted datom of `index` under `prefix`, decoded in place from
+  the cursor (no Datom is built); `::no-datom` when there is none."
+  [db index ^bytes prefix]
+  (index/reduce-views (index/datoms-iterable db index prefix)
+                      (fn [_ ^IDatomView d] (if (.isAdded d) (reduced (.value d)) ::no-datom))
+                      ::no-datom))
 
 (defn datoms-by-prefix
   "Vector of the asserted datoms of `index` under the encoded `prefix`, read through
@@ -159,6 +167,19 @@
     (ref-value db sch (long (.-v d)))
     (.-v d)))
 
+(defn- view-value
+  "Value of the (flyweight) datom view `d` of `attr`, as seen through an entity."
+  [db sch ^Attr attr ^IDatomView d]
+  (if (= :db.type/ref (:value-type attr))
+    (ref-value db sch (.valueLong d))
+    (.value d)))
+
+(defn- vreduce
+  "Reduce the datoms of `index` under `prefix` with flyweight views (valid during `f`
+  only; nothing here retains one)."
+  [db index prefix f init]
+  (index/reduce-views (index/datoms-iterable db index prefix) f init))
+
 (defn- load-attr
   "Value of forward attribute `k` of `eid`, or ::none."
   [db eid k]
@@ -166,15 +187,15 @@
     (if-let [^Attr attr (schema/attr sch k)]
       (let [prefix (ea-prefix eid (long (:id attr)))]
         (if (= :db.cardinality/many (:cardinality attr))
-          (if-let [ds (datoms-by-prefix db :eavt prefix nil)]
-            (loop [i 0 out (transient #{})]
-              (if (< i (count ds))
-                (recur (inc i) (conj! out (datom-value db sch attr (nth ds i))))
-                (persistent! out)))
-            none)
-          (if-let [d (first-datom db :eavt prefix)]
-            (datom-value db sch attr d)
-            none)))
+          (let [out (vreduce db :eavt prefix
+                             (fn [acc ^IDatomView d]
+                               (if (.isAdded d) (conj! acc (view-value db sch attr d)) acc))
+                             (transient #{}))]
+            (if (zero? (count out)) none (persistent! out)))
+          (vreduce db :eavt prefix
+                   (fn [_ ^IDatomView d]
+                     (if (.isAdded d) (reduced (view-value db sch attr d)) none))
+                   none)))
       none)))
 
 (defn- load-reverse
@@ -185,34 +206,48 @@
     (if (and attr (= :db.type/ref (:value-type attr)))
       (let [prefix (ea-prefix eid (long (:id attr)))]
         (if (:component? attr)
-          (if-let [^Datom d (first-datom db :vaet prefix)]
-            (new-entity db (.-e d))
-            none)
-          (if-let [ds (datoms-by-prefix db :vaet prefix nil)]
-            (loop [i 0 out (transient #{})]
-              (if (< i (count ds))
-                (recur (inc i) (conj! out (new-entity db (.-e ^Datom (nth ds i)))))
-                (persistent! out)))
-            none)))
+          (vreduce db :vaet prefix
+                   (fn [_ ^IDatomView d]
+                     (if (.isAdded d) (reduced (new-entity db (.eid d))) none))
+                   none)
+          (let [out (vreduce db :vaet prefix
+                             (fn [acc ^IDatomView d]
+                               (if (.isAdded d) (conj! acc (new-entity db (.eid d))) acc))
+                             (transient #{}))]
+            (if (zero? (count out)) none (persistent! out)))))
       none)))
 
 (defn- load-all
   "Ordered [[kw value] ...] of every forward attribute of `eid` (attribute id order)."
   [db eid]
   (let [sch (index/-schema db)
-        ds (datoms-by-prefix db :eavt (e-prefix eid) nil)]
-    (keep-attr-groups
-     ds
-     (fn [a i j]
-       (let [^Attr attr (get (:attrs sch) a)]
-         (when attr
-           [(:ident attr)
-            (if (= :db.cardinality/many (:cardinality attr))
-              (loop [k (long i) out (transient #{})]
-                (if (< k (long j))
-                  (recur (inc k) (conj! out (datom-value db sch attr (nth ds k))))
-                  (persistent! out)))
-              (datom-value db sch attr (nth ds i)))]))))))
+        ;; one pass over the entity's datoms: [attr-id value] for every known attribute
+        ps (persistent!
+            (vreduce db :eavt (e-prefix eid)
+                     (fn [acc ^IDatomView d]
+                       (if (.isAdded d)
+                         (let [a (.attr d)]
+                           (if-let [^Attr attr (get (:attrs sch) a)]
+                             (conj! acc (MapEntry/create a (view-value db sch attr d)))
+                             acc))
+                         acc))
+                     (transient [])))
+        n (count ps)]
+    (loop [i 0 out (transient [])]
+      (if (< i n)
+        (let [a (long (key (nth ps i)))
+              j (loop [j (inc i)]
+                  (if (and (< j n) (== a (long (key (nth ps j))))) (recur (inc j)) j))
+              ^Attr attr (get (:attrs sch) a)
+              r [(:ident attr)
+                 (if (= :db.cardinality/many (:cardinality attr))
+                   (loop [k (long i) acc (transient #{})]
+                     (if (< k (long j))
+                       (recur (inc k) (conj! acc (val (nth ps k))))
+                       (persistent! acc)))
+                   (val (nth ps i)))]]
+          (recur (long j) (conj! out r)))
+        (persistent! out)))))
 
 (defn- same-db? [a b]
   (or (identical? a b)

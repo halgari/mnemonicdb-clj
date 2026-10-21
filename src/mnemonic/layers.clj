@@ -206,14 +206,16 @@
 
 ;; ------------------------------------------------------------------ time views
 
+(defn- key-tx-len
+  "The tx of the index key in the first `n` bytes of `k`: its trailing 8 bytes
+  (big-endian, sign bit flipped)."
+  ^long [^bytes k ^long n]
+  (bit-xor (.getLong (java.nio.ByteBuffer/wrap k) (unchecked-int (- n 8))) Long/MIN_VALUE))
+
 (defn- key-tx
   "The tx of an index key: its trailing 8 bytes (big-endian, sign bit flipped)."
   ^long [^bytes k]
-  (let [n (alength k)]
-    (loop [i (- n 8) acc 0]
-      (if (< i n)
-        (recur (inc i) (bit-or (bit-shift-left acc 8) (bit-and 0xFF (long (aget k i)))))
-        (bit-xor acc Long/MIN_VALUE)))))
+  (key-tx-len k (alength k)))
 
 (defn- key-with-tx
   "Copy of index key `k` with its trailing tx replaced by `tx`."
@@ -227,7 +229,7 @@
 
 (defmacro ^:private visible-entry?
   [c lo hi]
-  `(let [tx# (key-tx (.key ~c))
+  `(let [tx# (key-tx-len (index/key-buf ~c) (index/key-len ~c))
          rtx# (.retractTx ~c)]
      (and (> tx# ~lo) (<= tx# ~hi) (or (neg? rtx#) (< ~hi rtx#)))))
 
@@ -270,10 +272,10 @@
 (deftype Event [^bytes key ^Datom d ^long tx ^boolean added])
 
 (defn- same-group?
-  "Keys equal except for the trailing 8-byte tx."
-  [^bytes a ^bytes b]
+  "Keys equal except for the trailing 8-byte tx (`b`: the first `bn` bytes)."
+  [^bytes a ^bytes b ^long bn]
   (let [n (alength a)]
-    (and (== n (alength b))
+    (and (== n bn)
          (Arrays/equals a 0 (- n 8) b 0 (- n 8)))))
 
 (defn- event-before?
@@ -307,14 +309,14 @@
       (object-array 0)
       (let [k0 (.key src)
             n (loop [n 0]
-                (if (and (.valid src) (same-group? k0 (.key src)))
-                  (let [k (.key src)
-                        tx (key-tx k)
+                (if (and (.valid src) (same-group? k0 (index/key-buf src) (index/key-len src)))
+                  (let [tx (key-tx-len (index/key-buf src) (index/key-len src))
                         rtx (.retractTx src)
                         a? (and (> tx lo) (<= tx hi))
                         r? (and (>= rtx 0) (> rtx lo) (<= rtx hi))]
                     (if (or a? r?)
-                      (let [^Datom d (.datom src)
+                      (let [k (.key src)
+                            ^Datom d (.datom src)
                             evs (let [^objects evs (aget scratch 0)]
                                   (if (<= (+ n 2) (alength evs))
                                     evs

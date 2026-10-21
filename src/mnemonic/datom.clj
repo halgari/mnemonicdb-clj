@@ -31,7 +31,29 @@
          h# (unchecked-add-int (unchecked-multiply-int 31 h#) (if ~added 1231 1237))]
      (clojure.lang.Murmur3/mixCollHash h# 5)))
 
+;; A read-only view of one datom. A `Datom` is its own (immutable) view; the flyweight
+;; views handed out by cursors (`mnemonic.index/reduce-views`) decode straight from the
+;; cursor's key buffer and are valid only until the cursor advances. Never retain one:
+;; call `toDatom` when a datom must escape.
+(definterface IDatomView
+  (^long eid [])
+  (^long attr [])
+  (value [] "The value (decoded on demand).")
+  (^long valueLong [] "The value, which must be a long/ref (no boxing).")
+  (^long txid [])
+  (^boolean isAdded [])
+  (toDatom [] "An immutable Datom (self for a Datom)."))
+
 (deftype Datom [^long e ^long a v ^long tx ^boolean added]
+  IDatomView
+  (eid [_] e)
+  (attr [_] a)
+  (value [_] v)
+  (valueLong [_] (long v))
+  (txid [_] tx)
+  (isAdded [_] added)
+  (toDatom [this] this)
+
   clojure.lang.ILookup
   (valAt [this k] (.valAt this k nil))
   (valAt [_ k nf]

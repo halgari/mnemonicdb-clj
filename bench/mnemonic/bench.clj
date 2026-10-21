@@ -8,6 +8,7 @@
   MNEMONIC_BENCH_<ENTITIES|BATCH|SMALLTX|EAVT_ENTITIES|LOOKUPS|PULLS|LOOKUP_REFS|TREE|IN_VALUES|
   HIST_ENTITIES|HIST_UPDATES|HIST_BATCH|QUERY_MS>. See docs/benchmarks.md."
   (:require [clojure.java.io :as io]
+            mnemonic.index
             [clojure.string :as str]
             [datomic.api :as d]
             [mnemonic.api :as m]
@@ -201,6 +202,13 @@
                      [(str label ", " threads " thr: p99 ms") p99 :lo]]]
               m))})))
 
+(defn- fly-count
+  "Like scan-count, but over flyweight views (internal path)."
+  ^long [datoms]
+  (mnemonic.index/reduce-views datoms
+                               (fn [^long n ^mnemonic.datom.IDatomView d] (if (nil? (.value d)) n (inc n)))
+                               0))
+
 (defn datoms-scan [b sz]
   (let [{:keys [ctx eids]} (dataset! b sz)
         db* (db ctx)
@@ -209,12 +217,18 @@
         eavt (fn [] (reduce (fn [^long n eid] (+ n (scan-count (call b :datoms db* :eavt eid)))) 0 sample))
         opts {:warm-ms 2000 :run-ms 3000 :min-iters 3}
         a (u/run-for aevt opts)
-        e (u/run-for eavt opts)]
-    {:metrics [["AEVT :p/age datoms/sec" (/ (:result a) (/ (:mean-ms a) 1000.0)) :hi]
-               ["AEVT scan ms" (:mean-ms a) :lo]
-               ["EAVT datoms/sec" (/ (:result e) (/ (:mean-ms e) 1000.0)) :hi]
-               ["EAVT scan ms" (:mean-ms e) :lo]]
-     :checks-m {"AEVT count" (:result a) "EAVT count" (:result e)}}))
+        e (u/run-for eavt opts)
+        fly? (and (= :mnemonic (:kind b)) (System/getProperty "bench.fly"))
+        fa (when fly? (u/run-for #(fly-count (call b :datoms db* :aevt :p/age)) opts))
+        fe (when fly? (u/run-for (fn [] (reduce (fn [^long n eid] (+ n (fly-count (call b :datoms db* :eavt eid)))) 0 sample)) opts))]
+    {:metrics (cond-> [["AEVT :p/age datoms/sec" (/ (:result a) (/ (:mean-ms a) 1000.0)) :hi]
+                       ["AEVT scan ms" (:mean-ms a) :lo]
+                       ["EAVT datoms/sec" (/ (:result e) (/ (:mean-ms e) 1000.0)) :hi]
+                       ["EAVT scan ms" (:mean-ms e) :lo]]
+                fly? (into [["AEVT fly datoms/sec" (/ (:result fa) (/ (:mean-ms fa) 1000.0)) :hi]
+                            ["EAVT fly datoms/sec" (/ (:result fe) (/ (:mean-ms fe) 1000.0)) :hi]]))
+     :checks-m (cond-> {"AEVT count" (:result a) "EAVT count" (:result e)}
+                 fly? (assoc "AEVT fly count" (:result fa) "EAVT fly count" (:result fe)))}))
 
 (defn- random-eids [eids n seed]
   (let [r (Random. (long seed)) cnt (count eids)]
