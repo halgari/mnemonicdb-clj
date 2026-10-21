@@ -352,3 +352,49 @@ Factor = how many times slower than Datomic mem (below 1 = faster). mnemonic-mem
 Durable writes (file db on a real filesystem, round 2): fsync on — 309 tx/s with 1 submitting thread, 628 with 4, 2,445 with 16 (group commit); `?sync=false` — 25.6k / 32.9k / 33.9k tx/s.
 
 Scans and as-of/history scans are near the JNI floor (raw RocksIterator next+isValid ≈ 90–120 ns/entry); see the round-1 second opinions for measurements.
+
+## Round 2.5: storage configuration and startup
+
+File db on a real filesystem (`target/r25`, btrfs, not tmpfs), 1.2M entities (3 attributes each plus tags/status/created, 409 MB of SST files, larger than the 256 MB default cache), loaded in 1000-entity transactions, then flushed and fully compacted. One fresh JVM per measurement (`bench/mnemonic/r25.clj`: `build`, `measure`, `wal`, `reconnect`, `durable`; `r25_startup.clj` for start-to-first-answer). Before = the round 2 defaults (commit 4efb69b: no explicit cache, one 8 MB cache per table config, 64 MB x 2 memtables per column family); after = this round's defaults. Other agents used the machine at the same time, so differences under about 5 percent are noise. Three before runs, two after runs.
+
+| row | before | after | change |
+|---|---:|---:|---:|
+| bulk-load entities/s | 34.2k, 34.3k | 33.6k | same |
+| flush + full compaction | 6.4 s | 6.0 s | same |
+| db size | 408.7 MB | 408.9 MB | same (LZ4 was already the default) |
+| entity + 3 attrs, 300k random eids /s | 183k, 192k, 193k | 184k, 190k | same |
+| lookup-ref + entity, warm /s | 120k, 132k, 135k | 135k, 147k | +10% |
+| lookup-ref + entity, first pass after connect /s | 103k, 131k, 130k | 120k, 113k | same (noise) |
+| entid miss /s (bloom only) | 994k, 1027k, 996k | 800k, 847k | -17% |
+| pull nested /s | 84.8k, 88.5k, 88.2k | 87.9k, 88.6k | same |
+| query b (3-way join) ms | 4.41, 4.40, 4.09 | 2.56, 2.61 | -39% |
+| query c (join + range) ms | 50.6, 48.8, 47.8 | 37.9, 38.2 | -22% |
+| query f (:in 1000 values) ms | 1.62, 1.82, 1.66 | 1.69, 1.77 | same |
+| durable small tx, 1 thread, sync on /s | 293, 289 | 236, 292 | same |
+| durable small tx, 16 threads /s | 2455, 2244 | 2273, 2266 | same |
+| connect, 100k-entity db (cold JVM / warm) | 98 / 23 ms | 98 / 23 ms | same |
+| reopen after a 100k-entity `?sync=false` load | 1662 ms (127 MB WAL replayed) | 39 ms (0 bytes WAL) | -98% |
+| close after that load | 1.9 ms | 290 ms (flushes the memtables) | +288 ms |
+
+What moved: the shared 256 MB cache helps the multi-pattern queries (b, c) that revisit the same index blocks, and warm point lookups; single random entity lookups were already at the page cache + LZ4 floor on this machine, so they do not change. Putting filters through the cache costs misses about 17 percent (below). The big difference is restart time: close now flushes, so reopening never replays a large WAL.
+
+Cache size (same db, `-Dmnemonic.rocks.cache-mb`): 32 MB: entity 161k/s, query c 49 ms; 256 MB: 187k/s, 38 ms; 1024 MB: 204k/s, 37.5 ms.
+
+Variants that were measured and not adopted:
+
+- **Cached index/filter blocks, default shard count (64 shards of 4 MB):** bulk load fell from 34k to 5.7k entities/s. A filter block of a 64 MB SST is several MB and a block larger than a cache shard is never kept, so every lookup re-read it. Shards are now at least 16 MB (`shard-bits`); bulk load is back to 34k/s.
+- **Partitioned index and filters** (`-Dmnemonic.rocks.partitioned=true`): fixes the above differently, but costs about 20 percent on point lookups (entity 157k/s, misses 775k/s). Off by default.
+- **Not caching index/filter blocks** (`-Dmnemonic.rocks.cache-index-filter=false`): fastest on this size (entity 195k/s, misses 0.95-1.0M/s, warm lookup-ref 144-150k/s) but index and filter memory is outside any budget and grows with the db (about 9 percent of the SST size here: 35 MB at 409 MB). Default stays bounded; set the property to false for databases that are small relative to RAM.
+- **Compression** (`-Dmnemonic.rocks.compression`): `none` 1211 MB, `lz4` (default, and what RocksDB already used) 409 MB, `lz4+zstd` (LZ4 above, ZSTD on the bottom level) 244 MB. ZSTD costs 5-8 percent on point lookups (entity 169-175k/s, warm 121-126k/s) and nothing on queries or bulk load; use it when disk is the constraint. `none` reads like LZ4 but is three times the size.
+- **Memtable budget charged to the block cache** (`-Dmnemonic.rocks.wbm-charge-cache=true`): not needed, off.
+
+Startup (JVM start to first answer, 100k-entity file db, JDK 27; `bench/mnemonic/r25_startup.clj`, wall clock of the whole process):
+
+| setup | wall | `require mnemonic.api` | connect |
+|---|---:|---:|---:|
+| source, as shipped | 1.29-1.40 s | 830-900 ms | 105 ms |
+| AOT-compiled classes in a jar | 0.41-0.43 s | 84 ms | 100 ms |
+| + AppCDS dynamic archive | 0.26-0.30 s | 35-43 ms | 100 ms |
+| + JDK AOT cache (JEP 483) | 0.22-0.23 s | 25-28 ms | 90 ms |
+
+The cold 100 ms connect is the native library extraction and load (62 ms) plus class initialisation; a warm connect (second one in the same JVM) is 22 ms, of which opening RocksDB with 10 column families is 19 ms and loading the schema 0.5-2 ms, so schema caching was not worth adding. See README "Tuning" for how to build the AOT jar and the CDS/AOT archives in an application.

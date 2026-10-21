@@ -136,3 +136,40 @@ set `MNEMONIC_DIFF_TRIALS` to run more:
 MNEMONIC_DIFF_TRIALS=5000 clojure -M:test -n mnemonic.diff-gen-test
 ```
 
+
+## Tuning
+
+### Storage (file databases)
+
+Settings are system properties (`-Dmnemonic.rocks.<name>=...`) read once at startup, or keys of the map passed to `mnemonic.rocks/open-store`. They change memory use and speed only; nothing here changes the on-disk key format, and existing databases open unchanged.
+
+| property | default | meaning |
+|---|---|---|
+| `cache-mb` | 256 | One LRU block cache shared by all column families of a database (off-heap, not part of `-Xmx`). It holds data, index and filter blocks; level-0 index/filter blocks are pinned. Size it to the hot part of the database: on a 409 MB database, 32 MB gave 161k entity lookups/s, 256 MB 187k/s, 1024 MB 204k/s. |
+| `write-buffer-mb` | 128 | Total memtable budget for the database (ten column families would otherwise use up to 64 MB x 2 each). The WAL is capped at twice this, so a restart never replays more than that. |
+| `compression` | `lz4` | `none`, `lz4`, or `lz4+zstd` (ZSTD on the bottom level: 40 percent smaller files, 5-8 percent slower point lookups). Applies to files written from now on; mixed files read fine. |
+| `cache-index-filter` | true | Keep index and filter blocks inside the cache budget. `false` is about 10-17 percent faster on point lookups and misses but their memory (about 9 percent of the db size) is unbounded. |
+
+`bytes_per_sync` and `wal_bytes_per_sync` are set to 1 MB so background writeback does not pile up before a commit's fsync. Closing a connection flushes the memtables (a close after a large `?sync=false` load takes a few hundred milliseconds), so the next connect does not replay the WAL: a 100k-entity database that took 1.7 s to reopen after an unclean-looking load now reopens in 40 ms.
+
+For write throughput see "Durability and group commit": batch several changes into one transaction, or submit from several threads with `transact-async`.
+
+### Startup
+
+`require`-ing the library from source takes about 0.9 s (Clojure compiling its namespaces); the whole JVM-start-to-first-answer is about 1.3 s. For an application, AOT-compile it and optionally add a class-data archive:
+
+```
+# 1. AOT-compile your entry namespace (compiles mnemonic.* transitively) and jar the classes
+clojure -M -e "(compile 'my.app.main)"            # with -Dclojure.compile.path=classes, "classes" on the classpath
+(cd classes && jar cf ../app-aot.jar .)
+
+# 2. optional: record a class-data archive on a training run (jars only, no directories on -cp)
+java -XX:ArchiveClassesAtExit=app.jsa -cp app-aot.jar:deps/* clojure.main -m my.app.main --exit-after-startup
+java -XX:SharedArchiveFile=app.jsa     -cp app-aot.jar:deps/* clojure.main -m my.app.main
+
+# JDK 24+: one-step AOT cache (class loading + linking), a bit faster again
+java -XX:AOTCacheOutput=app.aot -cp app-aot.jar:deps/* clojure.main -m my.app.main --exit-after-startup
+java -XX:AOTCache=app.aot       -cp app-aot.jar:deps/* clojure.main -m my.app.main
+```
+
+Measured on JDK 27 with a 100k-entity database (JVM start to first answer): 1.3 s from source, 0.42 s AOT-compiled, 0.27 s with the CDS archive, 0.23 s with the AOT cache. The archives must be rebuilt when the jars change. Add `--enable-native-access=ALL-UNNAMED` to silence the RocksDB native-access warning.
