@@ -1,39 +1,114 @@
-(set! *warn-on-reflection* true)
-
 (ns mnemonic.rocks
   "Thin RocksDB wrapper: byte arrays only, no knowledge of datoms.
 
   Every native call goes through this namespace and is guarded so that no public path
   can touch a closed or freed RocksDB object (which crashes the JVM):
 
-  - Store-level calls (new iterator, get, write, snapshot create/free) run under the
-    read side of the store's ReentrantReadWriteLock and check the `closed` flag first.
-    `close-store` takes the write side to set `closed` (waiting for in-flight calls),
-    then closes every registered cursor and frees every registered snapshot, and only
-    then closes the native db. After that every call throws
-    :db.error/connection-released.
-  - Cursors (RawCursor) serialize their own native calls on their monitor and check a
-    closed flag first; close-store closes them under that same monitor. Cursors are
-    registered with the store while open.
-  - Snapshots (Snap) are reference counted: every open cursor holds a reference.
-    `release-snapshot` marks the snapshot released (new cursors then throw
-    :db.error/db-released) and the native snapshot is freed once no cursor uses it."
+  - Store-level calls (new iterator, get, write, snapshot create/free) run inside the
+    store guard: a striped in-flight counter (`Guard`) plus the `closed` flag. A caller
+    increments its stripe, re-checks `closed` and only then touches native state;
+    `close-store` sets `closed` first and then waits until every stripe is zero. By
+    sequential consistency of the atomics either the caller sees `closed` (and backs
+    out) or the closer sees the caller's increment (and waits), so no native call can
+    start once `close-store` has passed its wait. Unlike the previous
+    ReentrantReadWriteLock this is a single uncontended atomic add on a per-thread
+    stripe, not a CAS on one word shared by all readers.
+    After that every call throws :db.error/connection-released.
+  - Iterators live in `Slot`s. A slot serializes its own native calls on its monitor and
+    checks its state first; close-store force-closes every registered slot under that
+    same monitor before the native db is closed. A Slot is leased to a caller as a
+    `RawCursor`; closing the cursor returns the slot to its snapshot's pool (see below)
+    or destroys it.
+  - Snapshots (Snap) are reference counted: every live slot (leased or idle in the pool)
+    holds a reference. `release-snapshot` marks the snapshot released (new cursors then
+    throw :db.error/db-released), drains the idle pool, and the native snapshot is freed
+    once no slot uses it.
+
+  Iterator pool: creating a RocksDB iterator costs about as much as the seek it serves
+  (superversion ref, merging iterator over memtable + L0 files, JNI), so snapshot-bound
+  iterators are recycled: each Snap keeps small per-(column family, mode, thread stripe)
+  stacks of idle slots sharing the snapshot's two ReadOptions. Idle slots pin their
+  superversion; the pool is bounded (`pool-cap` per stack) and drained on release.
+
+  Prefix bloom filters: the four index column families (and their history twins) use a
+  fixed-length prefix extractor ([E A] / [A E] / [V A] = 16 bytes; AVET: see
+  `avet-prefix-len`) and a prefix-only bloom filter. A cursor whose seek key is at least
+  one prefix long and that stays within its seek key (prefix cursors) is opened in
+  `prefix mode` (RocksDB default ReadOptions: the bloom filter skips SSTs that cannot
+  contain the prefix); every other cursor is opened with total_order_seek. The extractor
+  is not part of the on-disk key layout: SST files record the extractor they were built
+  with and RocksDB ignores the filter of files built under a different one, so changing
+  it needs no format bump (`extractor-version` documents the configuration)."
   (:import (java.lang.ref Cleaner)
            (java.nio.charset StandardCharsets)
            (java.util ArrayList Set)
-           (java.util.concurrent ConcurrentHashMap)
-           (java.util.concurrent.atomic AtomicBoolean AtomicLong)
-           (java.util.concurrent.locks Lock ReentrantReadWriteLock)
+           (java.util.concurrent ConcurrentHashMap ConcurrentLinkedDeque)
+           (java.util.concurrent.atomic AtomicBoolean AtomicInteger AtomicLong AtomicLongArray
+                                        AtomicReferenceArray)
+           (java.util.concurrent.locks LockSupport)
            (org.rocksdb BlockBasedTableConfig BloomFilter ColumnFamilyDescriptor
-                        ColumnFamilyHandle ColumnFamilyOptions DBOptions Env
+                        ColumnFamilyHandle ColumnFamilyOptions DBOptions Env FlushOptions
                         Options ReadOptions RocksDB RocksDBException RocksIterator RocksMemEnv
                         Snapshot WriteBatch WriteOptions)))
+
+(set! *warn-on-reflection* true)
 
 (def cf-names
   [:default :eavt :aevt :avet :vaet :eavt-h :aevt-h :avet-h :vaet-h :log])
 
-;; guard: ReentrantReadWriteLock; closed: AtomicBoolean; cursors / snaps: concurrent sets
+(def ^:private cf-index (zipmap cf-names (range)))
+
+;; ------------------------------------------------------------------ tuning knobs
+
+(defn- prop-bool [^String k default]
+  (let [v (System/getProperty k)]
+    (if (nil? v) default (not= "false" v))))
+
+(defn- prop-int [^String k default]
+  (if-let [v (System/getProperty k)] (Long/parseLong v) default))
+
+(def ^:private pool-enabled?
+  "Iterator pool on/off (system property mnemonic.rocks.pool, default on)."
+  (prop-bool "mnemonic.rocks.pool" true))
+
+(def ^:private prefix-bloom-default?
+  "Prefix bloom filters on/off for newly opened stores (system property
+  mnemonic.rocks.prefix-bloom, default on)."
+  (prop-bool "mnemonic.rocks.prefix-bloom" true))
+
+(def avet-prefix-len
+  "Fixed prefix length of the AVET column families: attribute id (8) + value tag (1) +
+  the leading value bytes. Seeks shorter than this use a total-order iterator."
+  (long (prop-int "mnemonic.rocks.avet-prefix" 17)))
+
+(def extractor-version
+  "Version of the prefix extractor configuration (lengths per column family). The
+  extractor does not affect key layout or format compatibility; bump it with the lengths."
+  1)
+
+(def prefix-lens
+  "Fixed prefix extractor length per column family that has one."
+  {:eavt 16 :aevt 16 :vaet 16 :avet avet-prefix-len
+   :eavt-h 16 :aevt-h 16 :vaet-h 16 :avet-h avet-prefix-len})
+
+(def ^:private ^:const pool-stripes 8)
+(def ^:private ^:const pool-cap
+  "Idle iterators kept per (column family, mode, thread stripe)."
+  4)
+(def ^:private ^:const n-pools (* (count cf-names) 2 pool-stripes))
+
+(def ^:private ^:const mode-prefix 0)
+(def ^:private ^:const mode-total 1)
+
+;; ------------------------------------------------------------------ store
+
+;; guard: Guard (striped in-flight counters); closed: AtomicBoolean;
+;; cursors: concurrent set of live Slots; snaps: concurrent set of live Snaps
 (defrecord Store [^RocksDB db cfs env closeables guard closed cursors snaps])
+
+(deftype Guard [^AtomicLongArray counts])   ; 16 stripes, 8 longs apart (cache lines)
+
+(defn- new-guard ^Guard [] (->Guard (AtomicLongArray. (* 16 8))))
 
 (defonce ^:private ^Cleaner cleaner (Cleaner/create))
 
@@ -80,17 +155,55 @@
   [^Store store]
   (.get ^AtomicBoolean (.-closed store)))
 
+(defn- thread-id ^long []
+  (.threadId (Thread/currentThread)))
+
+(defn- guard-slot ^long []
+  (bit-shift-left (bit-and (thread-id) 15) 3))
+
 (defmacro ^:private guarded
-  "Runs body under the read side of the store guard; throws connection-released when
-  the store is closed."
+  "Runs body inside the store guard (see the ns docstring); throws connection-released
+  when the store is closed."
   [store & body]
   `(let [^Store s# ~store
-         ^Lock l# (.readLock ^ReentrantReadWriteLock (.-guard s#))]
-     (.lock l#)
+         ^AtomicLongArray c# (.-counts ^Guard (.-guard s#))
+         i# (guard-slot)]
+     (when (.get ^AtomicBoolean (.-closed s#)) (throw (connection-released-ex)))
+     (.incrementAndGet c# i#)
      (try
        (when (.get ^AtomicBoolean (.-closed s#)) (throw (connection-released-ex)))
        ~@body
-       (finally (.unlock l#)))))
+       (finally (.decrementAndGet c# i#)))))
+
+(defmacro ^:private guarded-or-skip
+  "Like `guarded`, but evaluates to nil instead of throwing when the store is closed."
+  [store & body]
+  `(let [^Store s# ~store
+         ^AtomicLongArray c# (.-counts ^Guard (.-guard s#))
+         i# (guard-slot)]
+     (when-not (.get ^AtomicBoolean (.-closed s#))
+       (.incrementAndGet c# i#)
+       (try
+         (when-not (.get ^AtomicBoolean (.-closed s#))
+           ~@body)
+         (finally (.decrementAndGet c# i#))))))
+
+(defn- await-quiescent!
+  "Blocks until no thread is inside the guard. Called after `closed` was set, so new
+  entrants back out immediately."
+  [^Store store]
+  (let [^AtomicLongArray c (.-counts ^Guard (.-guard store))
+        n (.length c)]
+    (loop [spins 0]
+      (let [busy? (loop [i 0]
+                    (cond (>= i n) false
+                          (pos? (.get c i)) true
+                          :else (recur (inc i))))]
+        (when busy?
+          (if (< spins 2000)
+            (Thread/onSpinWait)
+            (LockSupport/parkNanos 100000))
+          (recur (inc spins)))))))
 
 (defn- cf-bytes ^bytes [kw]
   (.getBytes ^String (name kw) StandardCharsets/UTF_8))
@@ -101,12 +214,15 @@
 
 (defn open-store
   "Open (creating if needed) a store with all column families.
-  `mem? true` uses an in-memory RocksMemEnv and treats `path` as a virtual name."
-  [{:keys [path mem?]}]
+  `mem? true` uses an in-memory RocksMemEnv and treats `path` as a virtual name.
+  `prefix-bloom? false` opens without prefix extractors (as stores created before they
+  were introduced; also an A/B switch for benchmarks)."
+  [{:keys [path mem? prefix-bloom?]}]
   (RocksDB/loadLibrary)
   ;; RocksMemEnv cannot resolve relative names (GetAbsolutePath fails), so virtual
   ;; names are rooted with a leading "/".
-  (let [path (if (and mem? (not (.startsWith ^String path "/"))) (str "/" path) path)]
+  (let [path (if (and mem? (not (.startsWith ^String path "/"))) (str "/" path) path)
+        prefix? (if (nil? prefix-bloom?) prefix-bloom-default? (boolean prefix-bloom?))]
   (let [owned (ArrayList.)                       ; closed after db, in reverse order
         own   (fn [x] (.add owned x) x)]
     (try
@@ -115,17 +231,30 @@
                             (.setCreateIfMissing true)
                             (.setCreateMissingColumnFamilies true)))
             _        (when env (.setEnv ^DBOptions dbo ^Env env))
-            table    (BlockBasedTableConfig.)
-            _        (.setFilterPolicy table (own (BloomFilter. 10.0 false)))
-            _        (.setWholeKeyFiltering table true)
+            bloom    (own (BloomFilter. 10.0 false))
+            table    (doto (BlockBasedTableConfig.)
+                       (.setFilterPolicy bloom)
+                       (.setWholeKeyFiltering true))
+            ;; index CFs are only read by seek: whole-key filters would be dead weight
+            ptable   (doto (BlockBasedTableConfig.)
+                       (.setFilterPolicy bloom)
+                       (.setWholeKeyFiltering false))
             cfo      (own (doto (ColumnFamilyOptions.)
                             (.setTableFormatConfig table)))
-            descs    (mapv #(ColumnFamilyDescriptor. (cf-bytes %) cfo) cf-names)
+            cfo-for  (into {}
+                           (map (fn [cf]
+                                  [cf (if-let [n (and prefix? (get prefix-lens cf))]
+                                        (own (doto (ColumnFamilyOptions.)
+                                               (.setTableFormatConfig ptable)
+                                               (.useFixedLengthPrefixExtractor (int n))))
+                                        cfo)]))
+                           cf-names)
+            descs    (mapv #(ColumnFamilyDescriptor. (cf-bytes %) ^ColumnFamilyOptions (cfo-for %)) cf-names)
             handles  (ArrayList.)
             db       (wrap-rocks (RocksDB/open dbo ^String path ^java.util.List descs handles))
             cfs      (zipmap cf-names (vec handles))]
         (->Store db cfs env (vec (reverse (vec owned)))
-                 (ReentrantReadWriteLock.) (AtomicBoolean. false)
+                 (new-guard) (AtomicBoolean. false)
                  (ConcurrentHashMap/newKeySet) (ConcurrentHashMap/newKeySet)))
       (catch Throwable t
         (doseq [c (reverse (vec owned))] (close-quietly c))
@@ -147,7 +276,7 @@
   (or (get (:cfs store) cf)
       (throw (ex-info "Unknown column family" {:cf cf}))))
 
-;; ------------------------------------------------------------------ snapshots
+;; ------------------------------------------------------------------ slots and snapshots
 
 (definterface ISnap
   (^org.rocksdb.Snapshot acquire [])
@@ -156,8 +285,21 @@
   (^boolean isReleased [])
   (^void free []))
 
+;; A native iterator. state: 0 open, 1 destroyed, 2 closed by close-store. Changed only
+;; under the slot's monitor, which also serializes every native call on `it`.
+;; `own-ro` is set for iterators without a snapshot (they own their ReadOptions).
+(deftype Slot [^Store store ^RocksIterator it ^ReadOptions own-ro snap
+               ^long cfi ^long mode ^AtomicInteger state])
+
+(deftype Pool [^ConcurrentLinkedDeque q ^AtomicInteger n])
+
+(declare drain-pools!)
+
 (deftype Snap [^Store store ^Snapshot native ^AtomicBoolean freed
-               ^AtomicLong state]   ; bit 0: released; bits 1..: open cursor count
+               ^AtomicLong state   ; bit 0: released; bits 1..: live slot count
+               ^ReadOptions ro-p   ; snapshot read options, prefix mode (RocksDB default)
+               ^ReadOptions ro-t   ; same, total_order_seek
+               ^AtomicReferenceArray pools]
   ISnap
   (acquire [_]
     (loop []
@@ -174,36 +316,140 @@
       (let [s (.get state)]
         (when (zero? (bit-and s 1))
           (if (.compareAndSet state s (bit-or s 1))
-            (when (zero? s) (.free this))
+            (if (zero? s) (.free this) (drain-pools! this))
             (recur))))))
   (isReleased [_] (== 1 (bit-and (.get state) 1)))
   (free [this]
-    ;; Never under the snap monitor (lock order: store guard -> snap monitor).
-    (let [^Lock l (.readLock ^ReentrantReadWriteLock (.-guard store))]
-      (.lock l)
-      (try
-        ;; After close-store started, close-store frees every registered snapshot.
-        (when (and (not (closed? store)) (.compareAndSet freed false true))
-          (.remove ^Set (.-snaps store) this)
-          (.releaseSnapshot ^RocksDB (.-db store) native))
-        (finally (.unlock l))))))
+    ;; After close-store started, close-store frees every registered snapshot.
+    (guarded-or-skip store
+      (when (.compareAndSet freed false true)
+        (.remove ^Set (.-snaps store) this)
+        (.close ro-p)
+        (.close ro-t)
+        (.releaseSnapshot ^RocksDB (.-db store) native)))))
 
 (defn snapshot
   "A reference-counted snapshot of `store` (see `release-snapshot`)."
   ^mnemonic.rocks.Snap [^Store store]
   (guarded store
-    (let [s (->Snap store (.getSnapshot ^RocksDB (.-db store)) (AtomicBoolean. false) (AtomicLong. 0))]
+    (let [native (.getSnapshot ^RocksDB (.-db store))
+          s (->Snap store native (AtomicBoolean. false) (AtomicLong. 0)
+                    (doto (ReadOptions.) (.setSnapshot native))
+                    (doto (ReadOptions.) (.setSnapshot native) (.setTotalOrderSeek true))
+                    (AtomicReferenceArray. (int n-pools)))]
       (.add ^Set (.-snaps store) s)
       s)))
 
 (defn release-snapshot
-  "Marks `snap` released: new reads through it throw :db.error/db-released; the native
-  snapshot is freed once no open cursor uses it. Idempotent, safe after close-store."
+  "Marks `snap` released: new reads through it throw :db.error/db-released; idle pooled
+  iterators are closed and the native snapshot is freed once no open cursor uses it.
+  Idempotent, safe after close-store."
   [_store ^Snap snap]
   (.markReleased snap)
   nil)
 
 (defn snapshot-released? [^Snap snap] (.isReleased snap))
+
+;; ------------------------------------------------------------------ slot lifecycle
+
+(defn- destroy-slot!
+  "Closes the native iterator of `s` (unless close-store did) and drops its snapshot ref."
+  [^Slot s]
+  (let [done? (locking s
+                (when (.compareAndSet ^AtomicInteger (.-state s) 0 1)
+                  (.close ^RocksIterator (.-it s))
+                  (when-let [ro (.-own-ro s)] (.close ^ReadOptions ro))
+                  true))]
+    (when done?
+      (.remove ^Set (.-cursors ^Store (.-store s)) s)
+      (when-let [sn (.-snap s)] (.unref ^ISnap sn)))
+    nil))
+
+(defn- force-close-slot!
+  "close-store: close the native iterator without touching the snapshot."
+  [^Slot s]
+  (locking s
+    (when (.compareAndSet ^AtomicInteger (.-state s) 0 2)
+      (.close ^RocksIterator (.-it s))
+      (when-let [ro (.-own-ro s)] (.close ^ReadOptions ro))))
+  nil)
+
+(defn- pool-of
+  "The idle-slot stack for (cfi, mode) of the calling thread's stripe, created lazily."
+  ^Pool [^Snap snap ^long cfi ^long mode]
+  (let [^AtomicReferenceArray pools (.-pools snap)
+        i (int (+ (* (+ (* cfi 2) mode) pool-stripes) (bit-and (thread-id) (dec pool-stripes))))]
+    (or (.get pools i)
+        (let [p (Pool. (ConcurrentLinkedDeque.) (AtomicInteger. 0))]
+          (if (.compareAndSet pools i nil p) p (.get pools i))))))
+
+(defn- drain-pools!
+  "Destroys every idle slot of `snap` (the snapshot was released)."
+  [^Snap snap]
+  (let [^AtomicReferenceArray pools (.-pools snap)]
+    (dotimes [i (.length pools)]
+      (when-let [^Pool p (.get pools i)]
+        (loop []
+          (when-let [s (.pollFirst ^ConcurrentLinkedDeque (.-q p))]
+            (.decrementAndGet ^AtomicInteger (.-n p))
+            (destroy-slot! s)
+            (recur))))))
+  nil)
+
+(defn- give-back!
+  "A leased slot is no longer used: pool it, or destroy it when it cannot be reused."
+  [^Slot s]
+  (let [snap (.-snap s)]
+    (if (and snap pool-enabled?
+             (zero? (.get ^AtomicInteger (.-state s)))
+             (not (.isReleased ^ISnap snap))
+             (not (closed? (.-store s))))
+      (let [^Pool p (pool-of snap (.-cfi s) (.-mode s))]
+        (if (< (.incrementAndGet ^AtomicInteger (.-n p)) (inc pool-cap))
+          (do (.addFirst ^ConcurrentLinkedDeque (.-q p) s)
+              ;; the snapshot may have been released after the check above, with its
+              ;; drain already past this stack: drain again (release sets the flag
+              ;; before draining, we push before re-reading it)
+              (when (.isReleased ^ISnap snap) (drain-pools! snap)))
+          (do (.decrementAndGet ^AtomicInteger (.-n p))
+              (destroy-slot! s))))
+      (destroy-slot! s))))
+
+(defn- new-slot
+  ^Slot [^Store store cf cfi mode snap]
+  (guarded store
+    (let [mode (long mode)
+          _ (when snap (.acquire ^ISnap snap))        ; throws db-released
+          own-ro (when-not snap
+                   (let [ro (ReadOptions.)]
+                     (when (== mode mode-total) (.setTotalOrderSeek ro true))
+                     ro))
+          ro (or own-ro (if (== mode mode-prefix) (.-ro-p ^Snap snap) (.-ro-t ^Snap snap)))]
+      (try
+        (let [s (->Slot store (.newIterator ^RocksDB (.-db store) (cf-handle store cf) ^ReadOptions ro)
+                        own-ro snap cfi mode (AtomicInteger. 0))]
+          (.add ^Set (.-cursors store) s)
+          s)
+        (catch Throwable t
+          (when own-ro (.close ^ReadOptions own-ro))
+          (when snap (.unref ^ISnap snap))
+          (throw t))))))
+
+(defn- borrow-slot
+  ^Slot [^Store store cf cfi mode snap]
+  (if (and snap pool-enabled?)
+    (do
+      (when (closed? store) (throw (connection-released-ex)))
+      (when (.isReleased ^ISnap snap) (throw (db-released-ex)))
+      (let [^Pool p (pool-of snap (long cfi) (long mode))]
+        (loop []
+          (if-let [^Slot s (.pollFirst ^ConcurrentLinkedDeque (.-q p))]
+            (do (.decrementAndGet ^AtomicInteger (.-n p))
+                (if (zero? (.get ^AtomicInteger (.-state s)))
+                  s
+                  (recur)))
+            (new-slot store cf cfi mode snap)))))
+    (new-slot store cf cfi mode snap)))
 
 ;; ------------------------------------------------------------------ point ops
 
@@ -215,12 +461,11 @@
           h (cf-handle store cf)]
       (if snap
         (let [^Snap snap snap
-              native (.acquire snap)]
+              _ (.acquire snap)]
           (try
-            (with-open [ro (doto (ReadOptions.) (.setSnapshot native))]
-              (wrap-rocks (.get db h ro k)))
+            (wrap-rocks (.get db h ^ReadOptions (.-ro-t snap) k))
             (finally
-              ;; unref may free, which takes the read lock again (reentrant)
+              ;; unref may free, which re-enters the guard (nests)
               (.unref snap))))
         (wrap-rocks (.get db h k))))))
 
@@ -238,6 +483,22 @@
       (wrap-rocks (.write ^RocksDB (.-db store) wo wb))))
   nil)
 
+(defn flush!
+  "Flushes the memtables of every column family to SST files (waits)."
+  [^Store store]
+  (guarded store
+    (with-open [fo (doto (FlushOptions.) (.setWaitForFlush true))]
+      (wrap-rocks (.flush ^RocksDB (.-db store) fo ^java.util.List (mapv #(cf-handle store %) cf-names)))))
+  nil)
+
+(defn compact!
+  "Full manual compaction of every column family."
+  [^Store store]
+  (guarded store
+    (doseq [cf cf-names]
+      (wrap-rocks (.compactRange ^RocksDB (.-db store) (cf-handle store cf)))))
+  nil)
+
 ;; ------------------------------------------------------------------ cursors
 
 (definterface IRawCursor
@@ -252,8 +513,7 @@
   (^bytes value [])
   (^bytes seekKey [^bytes k])
   (^bytes nextKey [])
-  (^void close [])
-  (^void forceClose []))
+  (^void close []))
 
 (defn- check-status
   "Called when the iterator became invalid: an I/O error or corruption must not look
@@ -262,71 +522,90 @@
   (wrap-rocks (.status it)))
 
 (defn- throw-closed [state]
-  (if (= state :store-closed)
+  (if (== (long state) 2)
     (throw (connection-released-ex))
     (throw (ex-info "Cursor is closed" {:db/error :db.error/cursor-closed
                                         :cognitect.anomalies/category :cognitect.anomalies/incorrect}))))
 
-(deftype RawCursor [^Store store ^RocksIterator it ^ReadOptions ro snap
-                    ^:unsynchronized-mutable state]   ; nil open, :closed, :store-closed
+(defmacro ^:private open!
+  "Inside (locking slot): throws unless this lease and its slot are open."
+  [slot done]
+  `(let [st# (.get ^AtomicInteger (.-state ~slot))]
+     (when (or ~done (not (zero? st#)))
+       (throw-closed (if ~done 1 st#)))))
+
+;; A lease on a Slot. All fields and the slot state are guarded by the slot's monitor.
+;; `seeked` is false until the first positioning call: a recycled iterator still has the
+;; position of its previous user and must look fresh (invalid).
+(deftype RawCursor [^Slot slot
+                    ^:unsynchronized-mutable ^boolean done
+                    ^:unsynchronized-mutable ^boolean seeked]
   IRawCursor
-  (seek [this k] (locking this (when state (throw-closed state)) (.seek it ^bytes k) nil))
-  (seekToFirst [this] (locking this (when state (throw-closed state)) (.seekToFirst it) nil))
-  (seekToLast [this] (locking this (when state (throw-closed state)) (.seekToLast it) nil))
-  (seekForPrev [this k] (locking this (when state (throw-closed state)) (.seekForPrev it ^bytes k) nil))
-  (isValid [this]
-    (locking this
-      (when state (throw-closed state))
-      (or (.isValid it) (do (check-status it) false))))
-  (next [this] (locking this (when state (throw-closed state)) (.next it) nil))
-  (prev [this] (locking this (when state (throw-closed state)) (.prev it) nil))
-  (key [this] (locking this (when state (throw-closed state)) (.key it)))
-  (value [this] (locking this (when state (throw-closed state)) (.value it)))
-  (seekKey [this k]
-    (locking this
-      (when state (throw-closed state))
-      (.seek it ^bytes k)
-      (if (.isValid it) (.key it) (do (check-status it) nil))))
-  (nextKey [this]
-    (locking this
-      (when state (throw-closed state))
-      (.next it)
-      (if (.isValid it) (.key it) (do (check-status it) nil))))
-  (close [this]
-    (locking this
-      (when (nil? state)
-        (set! state :closed)
-        (.close it)
-        (.close ro)
-        (.remove ^Set (.-cursors store) this)
-        ;; may free the snapshot (store read lock; lock order: cursor -> store guard)
-        (when snap (.unref ^Snap snap)))
-      nil))
-  (forceClose [this]
-    (locking this
-      (when (nil? state)
-        (set! state :store-closed)
-        (.close it)
-        (.close ro))
-      nil))
+  (seek [_ k]
+    (let [s slot]
+      (locking s (open! s done) (set! seeked (boolean true)) (.seek ^RocksIterator (.-it s) ^bytes k) nil)))
+  (seekToFirst [_]
+    (let [s slot]
+      (locking s (open! s done) (set! seeked (boolean true)) (.seekToFirst ^RocksIterator (.-it s)) nil)))
+  (seekToLast [_]
+    (let [s slot]
+      (locking s (open! s done) (set! seeked (boolean true)) (.seekToLast ^RocksIterator (.-it s)) nil)))
+  (seekForPrev [_ k]
+    (let [s slot]
+      (locking s (open! s done) (set! seeked (boolean true)) (.seekForPrev ^RocksIterator (.-it s) ^bytes k) nil)))
+  (isValid [_]
+    (let [s slot]
+      (locking s
+        (open! s done)
+        (let [^RocksIterator it (.-it s)]
+          (and seeked (or (.isValid it) (do (check-status it) false)))))))
+  (next [_] (let [s slot] (locking s (open! s done) (.next ^RocksIterator (.-it s)) nil)))
+  (prev [_] (let [s slot] (locking s (open! s done) (.prev ^RocksIterator (.-it s)) nil)))
+  (key [_] (let [s slot] (locking s (open! s done) (.key ^RocksIterator (.-it s)))))
+  (value [_] (let [s slot] (locking s (open! s done) (.value ^RocksIterator (.-it s)))))
+  (seekKey [_ k]
+    (let [s slot]
+      (locking s
+        (open! s done)
+        (set! seeked (boolean true))
+        (let [^RocksIterator it (.-it s)]
+          (.seek it ^bytes k)
+          (if (.isValid it) (.key it) (do (check-status it) nil))))))
+  (nextKey [_]
+    (let [s slot]
+      (locking s
+        (open! s done)
+        (let [^RocksIterator it (.-it s)]
+          (.next it)
+          (if (.isValid it) (.key it) (do (check-status it) nil))))))
+  (close [_]
+    (let [s slot]
+      (locking s
+        (when-not done
+          (set! done (boolean true))
+          (give-back! s))
+        nil)))
   java.lang.AutoCloseable)
+
+(defn- prefix-mode?
+  "True when a cursor over `cf` whose seek key is `prefix` (and that never leaves it) may
+  use the prefix bloom filter: the seek key spans at least one extractor prefix."
+  [cf ^bytes prefix]
+  (and prefix
+       (when-let [n (get prefix-lens cf)]
+         (>= (alength prefix) (long n)))))
 
 (defn raw-cursor
   "New cursor over `cf`, reading from `snap` (a Snap, may be nil). Caller must close it.
+  `prefix` (optional): the key prefix the caller will seek to and never read beyond
+  (a prefix cursor); lets RocksDB use the prefix bloom filter when it is at least as
+  long as the column family's extractor prefix. Without it the cursor is total-order.
   Returns a RawCursor (hint call sites with ^mnemonic.rocks.IRawCursor)."
-  ^mnemonic.rocks.RawCursor [^Store store cf snap]
-  (guarded store
-    (let [native (when snap (.acquire ^Snap snap))
-          ro (ReadOptions.)]
-      (try
-        (when native (.setSnapshot ro native))
-        (let [c (->RawCursor store (.newIterator ^RocksDB (.-db store) (cf-handle store cf) ro) ro snap nil)]
-          (.add ^Set (.-cursors store) c)
-          c)
-        (catch Throwable t
-          (.close ro)
-          (when snap (.unref ^Snap snap))
-          (throw t))))))
+  (^mnemonic.rocks.RawCursor [store cf snap] (raw-cursor store cf snap nil))
+  (^mnemonic.rocks.RawCursor [^Store store cf snap ^bytes prefix]
+   (let [mode (if (and prefix (prefix-mode? cf prefix)) mode-prefix mode-total)
+         cfi (long (cf-index cf))]
+     (->RawCursor (borrow-slot store cf cfi mode snap) false false))))
 
 ;; ------------------------------------------------------------------ close
 
@@ -336,20 +615,19 @@
   operation on the store, its cursors and its snapshots throws
   :db.error/connection-released. Idempotent."
   [^Store store]
-  (let [^Lock wl (.writeLock ^ReentrantReadWriteLock (.-guard store))
-        first? (do (.lock wl)
-                   (try (.compareAndSet ^AtomicBoolean (.-closed store) false true)
-                        (finally (.unlock wl))))]
-    (when first?
-      (doseq [^IRawCursor c (vec (.-cursors store))]
-        (try (.forceClose c) (catch Throwable _ nil)))
-      (.clear ^Set (.-cursors store))
-      (doseq [^Snap s (vec (.-snaps store))]
-        (when (.compareAndSet ^AtomicBoolean (.-freed s) false true)
-          (try (.releaseSnapshot ^RocksDB (.-db store) ^Snapshot (.-native s))
-               (catch Throwable _ nil))))
-      (.clear ^Set (.-snaps store))
-      (doseq [^ColumnFamilyHandle h (vals (:cfs store))] (close-quietly h))
-      (close-quietly (.-db store))
-      (doseq [c (:closeables store)] (close-quietly c))))
+  (when (.compareAndSet ^AtomicBoolean (.-closed store) false true)
+    (await-quiescent! store)
+    (doseq [^Slot s (vec (.-cursors store))]
+      (try (force-close-slot! s) (catch Throwable _ nil)))
+    (.clear ^Set (.-cursors store))
+    (doseq [^Snap s (vec (.-snaps store))]
+      (when (.compareAndSet ^AtomicBoolean (.-freed s) false true)
+        (close-quietly (.-ro-p s))
+        (close-quietly (.-ro-t s))
+        (try (.releaseSnapshot ^RocksDB (.-db store) ^Snapshot (.-native s))
+             (catch Throwable _ nil))))
+    (.clear ^Set (.-snaps store))
+    (doseq [^ColumnFamilyHandle h (vals (:cfs store))] (close-quietly h))
+    (close-quietly (.-db store))
+    (doseq [c (:closeables store)] (close-quietly c)))
   nil)

@@ -200,9 +200,11 @@
 (def ^:private ^:const chunk-size 512)
 
 (defn copy-datom
-  "Immutable copy of a (possibly flyweight) datom."
+  "Datoms produced by cursors are immutable (`codec/decode-key` allocates a fresh Datom
+  per key), so no copy is needed: returns `d`. Kept for callers outside this namespace.
+  If a cursor ever hands out a reused/mutable Datom, copying must come back here."
   ^Datom [^Datom d]
-  (datom/datom (.-e d) (.-a d) (.-v d) (.-tx d) (.-added d)))
+  d)
 
 (defn- cursor-seq
   "Lazy chunked seq over `cur`, closing it at exhaustion. `holder` is kept
@@ -214,7 +216,7 @@
      (let [buf (ChunkBuffer. chunk-size)]
        (loop [n 0]
          (when (and (< n chunk-size) (.valid cur))
-           (.add buf (copy-datom (.datom cur)))
+           (.add buf (.datom cur))
            (.advance cur)
            (recur (inc n))))
        (let [more? (.valid cur)]
@@ -248,7 +250,7 @@
         (try
           (loop [acc init]
             (if (.valid cur)
-              (let [ret (f acc (copy-datom (.datom cur)))]
+              (let [ret (f acc (.datom cur))]
                 (if (reduced? ret)
                   (.deref ^Reduced ret)
                   (do (.advance cur) (recur ret))))
