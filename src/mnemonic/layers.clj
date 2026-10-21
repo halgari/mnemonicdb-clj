@@ -47,17 +47,6 @@
 
 (def ^:private deleted ::deleted)
 
-(defn- prefix-end
-  "Smallest key greater than every key starting with `p`, or nil when unbounded."
-  [^bytes p]
-  (loop [i (dec (alength p))]
-    (cond
-      (neg? i) nil
-      (== 255 (bit-and (aget p i) 0xff)) (recur (dec i))
-      :else (let [r (Arrays/copyOf p (int (inc i)))]
-              (aset r i (unchecked-byte (inc (bit-and (aget r i) 0xff))))
-              r))))
-
 (defn- next-entry [^Iterator it]
   (when (.hasNext it) (.next it)))
 
@@ -123,7 +112,7 @@
 (defn- overlay-cursor
   [^ICursor inner ^TreeMap tm idx hist? ^bytes start ^bytes prefix]
   (let [from (or start prefix)
-        end (when prefix (prefix-end prefix))
+        end (when prefix (codec/prefix-end prefix))
         ^NavigableMap slice (if end
                               (.subMap tm from true end false)
                               (.tailMap tm from true))

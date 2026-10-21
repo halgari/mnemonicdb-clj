@@ -229,11 +229,12 @@
   [^Store store ops {:keys [sync?]}]
   (with-open [wb (WriteBatch.)
               wo (doto (WriteOptions.) (.setSync (boolean sync?)))]
-    (doseq [op ops]
-      (case (nth op 0)
-        :put    (.put wb (cf-handle store (nth op 1)) ^bytes (nth op 2) ^bytes (nth op 3))
-        :delete (.delete wb (cf-handle store (nth op 1)) ^bytes (nth op 2))))
+    ;; the batch references column family handles: build it under the guard too
     (guarded store
+      (doseq [op ops]
+        (case (nth op 0)
+          :put    (.put wb (cf-handle store (nth op 1)) ^bytes (nth op 2) ^bytes (nth op 3))
+          :delete (.delete wb (cf-handle store (nth op 1)) ^bytes (nth op 2))))
       (wrap-rocks (.write ^RocksDB (.-db store) wo wb))))
   nil)
 

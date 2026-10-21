@@ -315,6 +315,58 @@
 (defn pull [db* pattern eid] (pullns/pull db* pattern eid))
 (defn pull-many [db* pattern eids] (pullns/pull-many db* pattern eids))
 
+(defn- invalid-pull [msg data]
+  (throw (tx/error :db.error/invalid-pull msg data)))
+
+(defn index-pull
+  "Walks :avet (pulling each datom's :e) or :aevt (pulling each datom's :v) from the
+  position `start` (a vector in index order; at least the attribute), limited to the
+  datoms of that attribute, and returns a lazy seq of `(pull db selector eid)`. With
+  `:reverse true`, walks backwards from `start` (the datoms are collected first)."
+  [db* {:keys [index selector start reverse]}]
+  (when (or (nil? selector) (nil? index) (nil? (first start)))
+    (throw (tx/error :db.error/nil-input "selector, index, and start attribute must be specified"
+                     {})))
+  (when-not (contains? #{:avet :aevt} index)
+    (invalid-pull (str (if (keyword? index) (name index) (pr-str index))
+                       " is an invalid index, must be :avet or :aevt")
+                  {:index index}))
+  (when (index/-history? db*)
+    (invalid-pull "Can't pull from history" {}))
+  (let [^Attr a (tx/resolve-attr (index/-schema db*) (first start))
+        aid (long (:id a))
+        many? (= :db.cardinality/many (:cardinality a))]
+    (case index
+      :avet (do (when (and (== 1 (count start)) many?)
+                  (invalid-pull (str (:ident a) " is not card-one, as required for :avet when start has only A specified")
+                                {:attribute (:ident a)}))
+                (when-not (schema/indexed? a) (not-indexed a)))
+      :aevt (do (when-not many?
+                  (invalid-pull (str (:ident a) " is not card-many, as required for :aevt")
+                                {:attribute (:ident a)}))
+                (when-not (= :db.type/ref (:value-type a))
+                  (invalid-pull (str (:ident a) " is not a ref, as required for :aevt")
+                                {:attribute (:ident a)}))))
+    (let [comps (or (resolve-components db* index start) [aid])
+          attr-prefix (codec/encode-prefix index [aid])
+          start-key (codec/encode-prefix index comps)
+          in-attr (fn [^Datom d] (== aid (.-a d)))
+          ds (if reverse
+               (let [stop (codec/prefix-end start-key)]
+                 (->> (seq (index/datoms-iterable (view-db db* index/-view) index attr-prefix))
+                      (take-while (fn [^Datom d]
+                                    (or (nil? stop)
+                                        (neg? (codec/compare-bytes
+                                               (codec/encode-key index (.-e d) (.-a d) (.-v d) (.-tx d))
+                                               stop)))))
+                      vec
+                      rseq))
+               (take-while in-attr
+                           (seq (index/datoms-iterable (view-db db* index/-seek-view) index start-key))))
+          ast (pullns/parse-pattern selector)
+          eid-of (if (= index :avet) (fn [^Datom d] (.-e d)) (fn [^Datom d] (.-v d)))]
+      (map #(pullns/pull-from-ast db* ast (eid-of %)) ds))))
+
 (defn q [query & inputs] (apply query*/q query inputs))
 (defn query [query-map] (query*/query query-map))
 (defn qseq [query & inputs] (apply query*/qseq query inputs))
