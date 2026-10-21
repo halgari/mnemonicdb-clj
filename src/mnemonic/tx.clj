@@ -600,6 +600,8 @@
                                (pr-str {:d1 (datom-vec schema d1) :d2 (datom-vec schema d2)}))
                           {:d1 (datom-vec schema d1) :d2 (datom-vec schema d2)}))
         existing-of (fn [e aid] (datoms-of db :eavt [e aid]))
+        ;; the current datom [e a v] (exact key lookup; never scans the other values)
+        existing-value (fn [e aid v] (first (datoms-of db :eavt [e aid v])))
         ;; expand :retract-attr against db-before
         ops (into []
                   (mapcat (fn [[kind e ^Attr attr v :as op]]
@@ -639,16 +641,18 @@
                        (when-not (.containsKey retracted k)
                          (.put retracted k [(datom/datom (.-e old) (.-a old) (.-v old) tx false) old]))))]
       (doseq [^Datom d (vals adds)]
-        (let [^Attr attr (get (:attrs schema) (.-a d))
-              cur (existing-of (.-e d) (.-a d))]
-          (when-not (some (fn [^Datom c] (same-value? (.-v c) (.-v d))) cur)
-            (when (= :db.cardinality/one (:cardinality attr))
-              (doseq [c cur] (retract! c)))
-            (.add asserted d))))
+        (let [^Attr attr (get (:attrs schema) (.-a d))]
+          (if (= :db.cardinality/one (:cardinality attr))
+            ;; card-one: [e a] holds at most one current value, which a new value replaces
+            (let [cur (existing-of (.-e d) (.-a d))]
+              (when-not (some (fn [^Datom c] (same-value? (.-v c) (.-v d))) cur)
+                (doseq [c cur] (retract! c))
+                (.add asserted d)))
+            (when-not (existing-value (.-e d) (.-a d) (.-v d))
+              (.add asserted d)))))
       (doseq [^Datom r (vals rets)]
-        (let [cur (existing-of (.-e r) (.-a r))]
-          (when-let [old (first (filter (fn [^Datom c] (same-value? (.-v c) (.-v r))) cur))]
-            (retract! old))))
+        (when-let [old (existing-value (.-e r) (.-a r) (.-v r))]
+          (retract! old)))
       {:asserts (vec asserted)
        :adds (vec (vals adds))
        :retracts (vec (vals retracted))

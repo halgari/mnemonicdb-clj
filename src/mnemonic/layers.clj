@@ -346,15 +346,26 @@
 
 (def ^:private t-base (codec/t->tx 0))
 
+(defn- first-tx-at-or-after
+  "The first :db/txInstant datom of `db*` whose instant is >= `date` (AVET seek; ties in
+  tx order), or nil."
+  ^Datom [db* ^Date date]
+  (let [^ICursor c (index/-seek-view db* :avet (codec/encode-prefix :avet [50 date]))]
+    (try
+      (when (.valid c)
+        (let [^Datom d (.datom c)]
+          (when (== 50 (.-a d)) (index/copy-datom d))))
+      (finally (.close c)))))
+
 (defn- date->t
-  "Latest t whose :db/txInstant is not after `date` (0 when none)."
+  "Datomic's conversion of a Date to a t: T is the first transaction whose
+  :db/txInstant is >= `date`; the t is T's when its instant equals `date`, else T's t
+  minus one; when there is no such transaction, the db's next t."
   [db* ^Date date]
-  (reduce (fn [^long acc ^Datom d]
-            (if (and (.-added d) (not (.after ^Date (.-v d) date)))
-              (max acc (codec/tx->t (.-e d)))
-              acc))
-          0
-          (index/datoms-iterable db* :aevt (codec/encode-prefix :aevt [50]))))
+  (if-let [^Datom d (first-tx-at-or-after db* date)]
+    (let [t (codec/tx->t (.-e d))]
+      (if (== (.getTime ^Date (.-v d)) (.getTime date)) t (dec t)))
+    (long (:next-t (db/db-meta (index/-raw db*))))))
 
 (defn- ->t
   "t from a t, a tx id or a Date."

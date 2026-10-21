@@ -1,0 +1,2 @@
+;; Test resource: found on the classpath as mnemonic/extensions.edn (see pull-test).
+{:xforms [mnemonic.pull-test/shout]}

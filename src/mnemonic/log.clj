@@ -4,7 +4,9 @@
   (:require [mnemonic.bootstrap :as bootstrap]
             [mnemonic.codec :as codec]
             [mnemonic.rocks :as rocks])
-  (:import (java.util.concurrent LinkedBlockingQueue)
+  (:import (java.util Date)
+           (java.util.concurrent LinkedBlockingQueue)
+           (mnemonic.datom Datom)
            (mnemonic.rocks IRawCursor)))
 
 (set! *warn-on-reflection* true)
@@ -26,12 +28,28 @@
 
 (def ^:private t-base (codec/t->tx 0))
 
+(defn- first-tx-at-or-after
+  "Tx id of the first transaction whose :db/txInstant is >= `date` (AVET seek on the
+  live store), or Long/MAX_VALUE when there is none."
+  ^long [store ^Date date]
+  (with-open [^IRawCursor c (rocks/raw-cursor store :avet nil)]
+    (if-let [k (.seekKey c (codec/encode-prefix :avet [50 date]))]
+      (let [^Datom d (codec/decode-key :avet k)]
+        (if (== 50 (.-a d)) (.-e d) Long/MAX_VALUE))
+      Long/MAX_VALUE)))
+
 (defn- ->tx
-  "A t or a tx id -> tx id; nil stays nil."
-  [x]
-  (when (some? x)
-    (let [x (long x)]
-      (if (>= x t-base) x (codec/t->tx x)))))
+  "A t, a tx id or a Date -> tx id; nil stays nil. A Date maps to the first transaction
+  whose :db/txInstant is >= the date (as in Datomic)."
+  [store x]
+  (cond
+    (nil? x) nil
+    (instance? Date x) (first-tx-at-or-after store x)
+    (integer? x) (let [x (long x)]
+                   (if (>= x t-base) x (codec/t->tx x)))
+    :else (throw (ex-info (str "Invalid tx-range bound " (pr-str x) ": expected a t, tx id or Date")
+                          {:db/error :db.error/invalid-t
+                           :cognitect.anomalies/category :cognitect.anomalies/incorrect}))))
 
 (defn- read-chunk
   "Up to `chunk` [tx bytes] pairs with start <= tx < end (end may be nil)."
@@ -50,20 +68,22 @@
 
 (defn- range-seq [store ^long start end]
   (lazy-seq
-   (let [entries (read-chunk store start end)]
-     (when (seq entries)
-       (concat (map (fn [[tx bs]] {:t (codec/tx->t tx) :data (codec/decode-log-entry tx bs)})
-                    entries)
-               (when (== chunk (count entries))
-                 (range-seq store (inc (long (first (peek entries)))) end)))))))
+   (when (or (nil? end) (< start (long end)))
+     (let [entries (read-chunk store start end)]
+       (when (seq entries)
+         (concat (map (fn [[tx bs]] {:t (codec/tx->t tx) :data (codec/decode-log-entry tx bs)})
+                      entries)
+                 (when (== chunk (count entries))
+                   (range-seq store (inc (long (first (peek entries)))) end))))))))
 
 (defn tx-range
   "Seq of {:t t :data [Datom ...]} for transactions with start <= t < end. `start` and
-  `end` are t values, tx ids, or nil (open)."
+  `end` are t values, tx ids, java.util.Dates, or nil (open)."
   [^Log lg start end]
-  (range-seq (:store lg)
-             (max first-user-tx (or (->tx start) first-user-tx))
-             (->tx end)))
+  (let [store (:store lg)]
+    (range-seq store
+               (max first-user-tx (or (->tx store start) first-user-tx))
+               (->tx store end))))
 
 (defn tx-report-queue
   "The connection's tx-report queue (created on first call, the same queue after)."
