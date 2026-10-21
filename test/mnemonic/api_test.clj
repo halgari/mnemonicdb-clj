@@ -157,13 +157,6 @@
         (is (instance? java.util.UUID u))
         (is (< (Math/abs (- (m/squuid-time-millis u) (System/currentTimeMillis))) 5000))))))
 
-(deftest stubs-test
-  (let [c (fresh)
-        db (m/db c)
-        kind (fn [f] (try (f) nil (catch clojure.lang.ExceptionInfo e (:db/error (ex-data e)))))]
-    (doseq [f [#(m/function {})]]
-      (is (= :db.error/unsupported (kind f))))))
-
 (deftest file-db-reopen-test
   (let [dir (str (Files/createTempDirectory "mnemonic-api-test" (make-array FileAttribute 0)))
         u (str "mnemonic:file://" dir "/db")]

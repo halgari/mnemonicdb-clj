@@ -15,6 +15,13 @@ Intentional differences between MnemonicDB and the Datomic Peer API, with ration
 | Transact | Changing `:db/valueType` of an existing attribute follows Datomic's schema-alteration rules | `:db.error/unsupported` until schema alteration is implemented | Schema alteration is milestone M6 |
 | Transact | `d/transact` returns a `datomic.promise` future | Returns a `CompletableFuture`; deref throws `ExecutionException` wrapping the `ex-info` exactly as Datomic | Same observable behavior |
 | API | `d/datoms` with an unknown index throws `IllegalArgumentException` | `ex-info` with `:db.error/invalid-index` | Consistent error shape |
+| Transact | `:db/fn` values are `datomic.function.Function` objects | `m/function` returns a callable record; the stored datom value is the EDN text of its map (`:lang :imports :requires :params :code`), so reads return a string | The value codec has no function type |
+| Transact | Excision attributes (`:db/excise`, `:db.excise/*`) are accepted | Rejected with `:db.error/unsupported` | Excision is out of scope |
+| Transact | Every alteration of an attribute adds a fresh `[0 :db.alter/attribute a]` datom | Added only if the attribute has none yet | Avoids two current datoms with the same e/a/v |
+| Index | After `:db/index` or `:db/unique` is removed, `d/datoms :avet` still lists the attribute until reindexing | Stops listing it immediately | AVET visibility follows the current schema |
+| Transact | Entity preds (`:db/ensure`) get the real db-after | db-after is an overlay over db-before: schema changes made in the same tx are not visible to the pred, and `history` is unsupported on it | No With layer in the transactor |
+| Transact | `(d/invoke db :db.fn/retractEntity ...)` returns ops with numeric operation ids | Returns `[:db/retract e a v]` vectors | Same effect when transacted |
+| Transact | Stored tx functions are cached per definition | Cache is keyed by the function text (not `[eid tx]`) so it is safe across databases | Same eval-once behavior |
 | Values | `-0.0` and `0.0` are equal | Distinct keys; `-0.0` sorts before `0.0` | Byte-order encoding of IEEE bits |
 | Transactions | Negative longs may be used as raw entity ids | Rejected | Avoid ambiguous ids |
 | Transactions | Reverse refs (`:ns/_attr`) on non-ref attrs | Rejected with an error | Clear error |

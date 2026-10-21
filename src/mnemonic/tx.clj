@@ -52,7 +52,9 @@
   ([part] (->TempId part (.decrementAndGet tempid-counter)))
   ([part n] (->TempId part (long n))))
 
-(defn- anon-tempid [] (tempid :db.part/user))
+(defn- anon-tempid
+  "Tempid of an entity map without :db/id; its nil partition lets schema maps land in :db.part/db."
+  [] (->TempId nil (.decrementAndGet tempid-counter)))
 
 ;; Internal wrapper distinguishing tempids from plain values after resolution.
 (defrecord Tmp [k])
@@ -66,6 +68,13 @@
 
 ;; ------------------------------------------------------------------ constants
 
+(def ^:private ^:const a-ident 10)
+(def ^:private ^:const a-alter-attribute 19)
+(def ^:private ^:const a-ensure 68)
+(def ^:private ^:const a-attr-preds 71)
+(def ^:private ^:const a-tuple-type 65)
+(def ^:private ^:const a-tuple-types 66)
+(def ^:private ^:const a-tuple-attrs 67)
 (def ^:private ^:const a-install-partition 11)
 (def ^:private ^:const a-install-attribute 13)
 (def ^:private ^:const a-value-type 40)
@@ -80,17 +89,17 @@
 
 ;; ------------------------------------------------------------------ db reads
 
-(defn- datoms-of
+(defn datoms-of
   "Vector of datoms of `idx` whose key starts with `comps`, read through `db`."
   [db idx comps]
   (into [] (index/datoms-iterable db idx (codec/encode-prefix idx comps))))
 
-(defn- vkey
+(defn vkey
   "Equality key for a value, consistent with the storage encoding."
   [v]
   (ByteBuffer/wrap (codec/value->bytes v)))
 
-(defn- same-value? [a b]
+(defn same-value? [a b]
   (Arrays/equals ^bytes (codec/value->bytes a) ^bytes (codec/value->bytes b)))
 
 (defn- lookup-eid
@@ -115,6 +124,52 @@
 
 (defn- type-label [vt]
   (keyword (name vt)))
+
+(defn resolve-callable
+  "The fn var named by `sym`: qualified symbols load their namespace on demand, unqualified
+  symbols resolve in clojure.core. Nil when the var does not exist; a var that is not
+  a function is :db.error/not-a-data-function."
+  [sym]
+  (when-some [v (if (qualified-symbol? sym)
+                  (requiring-resolve sym)
+                  (ns-resolve (the-ns 'clojure.core) sym))]
+    (if (fn? @v)
+      v
+      (fail :db.error/not-a-data-function (str "Not a function: " sym) {:function sym}))))
+
+(def ^:private scalar-types
+  #{:db.type/ref :db.type/keyword :db.type/long :db.type/string :db.type/boolean
+    :db.type/instant :db.type/double :db.type/float :db.type/bigint :db.type/bigdec
+    :db.type/uuid :db.type/uri :db.type/bytes :db.type/symbol})
+
+(declare coerce-value)
+
+(defn- coerce-tuple
+  "Validates a tuple value. Composite (:db/tupleAttrs) tuples are maintained by the
+  transactor, so only their shape is checked; the others are checked element by element
+  (nil elements are allowed)."
+  [^Attr attr v]
+  (let [invalid (fn [] (fail :db.error/invalid-tuple-value "Invalid tuple value"
+                             {:value v :attribute (:ident attr)}))
+        n (when (vector? v) (count v))
+        elem (fn [vt x]
+               (cond
+                 (nil? x) nil
+                 (= vt :db.type/ref) (if (integer? x) (long x) (invalid))
+                 :else (try (coerce-value (assoc attr :value-type vt :tuple-attrs nil :tuple-type nil
+                                                 :tuple-types nil)
+                                          x)
+                            (catch clojure.lang.ExceptionInfo _ (invalid)))))]
+    (when-not n (invalid))
+    (cond
+      (:tuple-attrs attr) (if (== n (count (:tuple-attrs attr))) v (invalid))
+      (:tuple-types attr) (if (== n (count (:tuple-types attr)))
+                            (mapv elem (:tuple-types attr) v)
+                            (invalid))
+      (:tuple-type attr) (if (<= (if (contains? #{66 67} (:id attr)) 2 1) n 8)
+                           (mapv #(elem (:tuple-type attr) %) v)
+                           (invalid))
+      :else (invalid))))
 
 (defn coerce-value
   "Check and normalize `v` for non-ref attribute `attr` (throws wrong-type-for-attribute)."
@@ -150,7 +205,8 @@
                                                  {:value v}))
                              :else (bad))
       :db.type/symbol (if (symbol? v) v (bad))
-      :db.type/tuple (if (vector? v) v (bad))
+      :db.type/tuple (coerce-tuple attr v)
+      :db.type/fn (or ((requiring-resolve 'mnemonic.tx-fns/->stored) v) (bad))
       (fail :db.error/unsupported (str "Unsupported value type " vt) {:attribute (:ident attr)}))))
 
 (declare resolve-ref)
@@ -190,7 +246,7 @@
       (fail :db.error/invalid-entity-id (str "Invalid entity id: " eid) {:entity eid}))
     eid))
 
-(defn- resolve-ref
+(defn resolve-ref
   "Entity reference -> long entity id, or a Tmp for tempids. `validate?` checks that a
   literal id could have been allocated (entity position only)."
   [ctx x validate?]
@@ -222,9 +278,17 @@
   to expand nested tx-data."
   (fn [op-kw _ctx _op] op-kw))
 
-(defmethod expand-op :default [op-kw _ctx op]
-  (fail :db.error/not-a-data-function (str "Unable to resolve data function: " (pr-str op-kw))
-        {:function op-kw}))
+;; :db/cas, :db/retractEntity and transaction function calls are implemented in
+;; mnemonic.tx-fns, which requires this namespace; they are reached through a var resolved
+;; at call time so neither namespace needs the other at load time.
+(defn- expand-via-fns [head ctx op]
+  ((requiring-resolve 'mnemonic.tx-fns/expand-call) head ctx op))
+
+(defmethod expand-op :default [head ctx op] (expand-via-fns head ctx op))
+(defmethod expand-op :db/cas [head ctx op] (expand-via-fns head ctx op))
+(defmethod expand-op :db.fn/cas [head ctx op] (expand-via-fns head ctx op))
+(defmethod expand-op :db/retractEntity [head ctx op] (expand-via-fns head ctx op))
+(defmethod expand-op :db.fn/retractEntity [head ctx op] (expand-via-fns head ctx op))
 
 (defn- check-arity [op n]
   (when-not (= n (count op))
@@ -253,7 +317,7 @@
         vs (if (and many? (or (sequential? v) (set? v))) v [v])]
     (doseq [x vs]
       (cond
-        (map? x)
+        (and (map? x) (not (record? x)))
         (do (when-not (= :db.type/ref (:value-type attr))
               (fail :db.error/wrong-type-for-attribute
                     (str "Value " x " is not a valid " (type-label (:value-type attr))
@@ -330,7 +394,8 @@
 (defn- partition-id
   "Partition entity id for a tempid's `part`, validating that it is an installed partition."
   [ctx part]
-  (let [cache (:part-cache ctx)]
+  (let [part (if (nil? part) :db.part/user part)
+        cache (:part-cache ctx)]
     (or (some-> cache deref (get part))
         (let [pid (cond (integer? part) (long part)
                         (keyword? part) (get (:idents (:schema ctx)) part)
@@ -416,7 +481,7 @@
           db-eids (volatile! #{})
           allocate! (fn [root]
                       (let [ms (get members root [root])
-                            explicit (some (fn [^Tmp m] (when (instance? TempId (.-k m)) (:part (.-k m)))) ms)
+                            explicit (some (fn [^Tmp m] (when (instance? TempId (.-k m)) (:part (.-k m)))) ms) ; nil part: anonymous
                             pid (cond explicit (partition-id ctx explicit)
                                       (contains? schema-roots root) part-db
                                       :else part-user)
@@ -584,14 +649,55 @@
                 :cognitect.anomalies/conflict
                 {:attribute (:ident attr) :value (.-v d) :held-by (.-e h) :asserted-for (.-e d)}))))))
 
+(defn- check-tuple-install!
+  "Validates the tuple specification (:db/tupleAttrs, :db/tupleType, :db/tupleTypes) of
+  the attributes `es` installed by this transaction."
+  [ctx asserts es]
+  (let [schema (:schema ctx)
+        ids (:ids schema)
+        by-e (group-by (fn [^Datom d] (.-e d)) asserts)
+        prop (fn [e aid] (some (fn [^Datom d] (when (== (.-a d) aid) (.-v d))) (get by-e e)))
+        tx-attrs (into {} (keep (fn [e]
+                                  (when-some [ident (prop e a-ident)]
+                                    [ident {:vt (get ids (prop e a-value-type))
+                                            :card (get ids (prop e a-cardinality))}])))
+                       (keys by-e))
+        attr-info (fn [kw] (if-let [^Attr a (schema/attr schema kw)]
+                             {:vt (:value-type a) :card (:cardinality a)}
+                             (get tx-attrs kw)))]
+    (doseq [e es]
+      (let [vt (get ids (prop e a-value-type))
+            ta (prop e a-tuple-attrs)
+            tt (prop e a-tuple-type)
+            tts (prop e a-tuple-types)
+            bad! (fn [kind]
+                   (fail :db.error/invalid-install-attribute (str "First error: " kind)
+                         {:db/errors [{:db/error kind :entity e}]}))]
+        (cond
+          (not= vt :db.type/tuple) (when (or ta tt tts) (bad! :db.error/type-on-non-tuple))
+          :else
+          (do
+            (when-not (== 1 (count (filter some? [ta tt tts]))) (bad! :db.error/invalid-tuple-kind))
+            (when (and tt (not (contains? scalar-types tt))) (bad! :db.error/invalid-tuple-type))
+            (when (and tts (not (every? #(contains? scalar-types %) tts))) (bad! :db.error/invalid-tuple-types))
+            (when ta
+              (when (= :db.cardinality/many (get ids (prop e a-cardinality)))
+                (bad! :db.error/tuple-of-attrs-must-be-card-one))
+              (doseq [kw ta]
+                (let [info (attr-info kw)]
+                  (when (or (nil? info) (= :db.cardinality/many (:card info)) (= :db.type/tuple (:vt info)))
+                    (bad! :db.error/invalid-tuple-attrs)))))))))))
+
 (defn- schema-installs
-  "Auto-install datoms for new attribute entities, plus validation of all installs."
-  [ctx asserts]
+  "Auto-install datoms for new attribute entities (and `:db.alter/attribute` datoms for the
+  altered attributes `alter-eids`), plus validation of all installs."
+  [ctx asserts alter-eids]
   (let [{:keys [db tx]} ctx
         explicit-installs (into #{} (comp (filter #(== a-install-attribute (.-a ^Datom %)))
                                           (map #(.-v ^Datom %)))
                                 asserts)
         new-attr-es (distinct (keep (fn [^Datom d] (when (== (.-a d) a-value-type) (.-e d))) asserts))
+        _ (check-tuple-install! ctx asserts new-attr-es)
         auto (vec (for [e new-attr-es
                         :when (and (not (contains? explicit-installs e))
                                    (empty? (datoms-of db :eavt [part-db a-install-attribute e])))]
@@ -599,12 +705,15 @@
         installs (into explicit-installs (map #(.-v ^Datom %)) auto)
         has-attr? (fn [e aid]
                     (or (some (fn [^Datom d] (and (== (.-e d) e) (== (.-a d) aid))) asserts)
-                        (seq (datoms-of db :eavt [e aid]))))]
+                        (seq (datoms-of db :eavt [e aid]))))
+        alters (vec (for [e alter-eids
+                          :when (empty? (datoms-of db :eavt [part-db a-alter-attribute e]))]
+                      (datom/datom part-db a-alter-attribute e tx true)))]
     (doseq [e installs]
       (when-not (and (has-attr? e a-value-type) (has-attr? e a-cardinality))
         (fail :db.error/invalid-install-attribute
               "First error: :db.error/schema-attribute-missing" {:entity e})))
-    auto))
+    (into auto alters)))
 
 (defn- check-db-partition!
   "New entities in :db.part/db must be schema components."
@@ -616,12 +725,292 @@
                  (pr-str {:datoms (filterv #(== (.-e ^Datom %) e) asserts)}))
             {:entity e}))))
 
-(defn- check-no-valuetype-change!
-  [retracts]
+;; ------------------------------------------------------------------ excision, ensure, alter ops
+
+(defn- reject-excision!
+  [ops]
+  (doseq [[_ _ ^Attr attr] ops]
+    (when (<= 15 (long (:id attr)) 18)
+      (fail :db.error/unsupported (str "Excision is not supported: " (:ident attr))
+            :cognitect.anomalies/unsupported {:attribute (:ident attr)}))))
+
+(defn- split-ops
+  "Removes the ops that are not datoms of their own: :db/ensure (collected as [e spec]),
+  explicit :db.alter/attribute (derived by the transactor) and composite tuples
+  (maintained by the transactor)."
+  [ops]
+  (reduce (fn [acc [kind e ^Attr attr v :as op]]
+            (cond
+              (== (:id attr) a-ensure) (cond-> acc (= kind :add) (update :ensures conj [e v]))
+              (== (:id attr) a-alter-attribute) acc
+              (:tuple-attrs attr) (update acc :dropped conj e)
+              :else (update acc :ops conj op)))
+          {:ops [] :ensures [] :dropped #{}} ops))
+
+;; ------------------------------------------------------------------ composite tuples
+
+(defonce ^:private composite-cache
+  ;; A few recent [schema index] pairs, matched by identity (hashing a schema is costly),
+  ;; so several connections do not evict each other's entry.
+  (atom []))
+
+(defn- build-composite-index [schema]
+  (reduce (fn [m ^Attr a]
+            (reduce (fn [m kw]
+                      (if-some [cid (get (:idents schema) kw)]
+                        (update m cid (fnil conj []) a)
+                        m))
+                    m (distinct (:tuple-attrs a))))
+          {} (filter :tuple-attrs (vals (:attrs schema)))))
+
+(defn- composite-index
+  "Component attribute id -> composite Attrs built from it."
+  [schema]
+  (if-some [[_ idx] (some #(when (identical? (first %) schema) %) @composite-cache)]
+    idx
+    (let [idx (build-composite-index schema)]
+      (swap! composite-cache #(conj (if (>= (count %) 8) (subvec % 1) %) [schema idx]))
+      idx)))
+
+(defn- composite-ops
+  "Ops maintaining composite tuples after `res` (the effective changes of `ops`). Returns
+  {:ops [changes] :checks [[:add e attr tuple] every non-empty computed tuple]}."
+  [ctx ops res]
+  (let [{:keys [db schema]} ctx
+        cidx (composite-index schema)]
+    (if (empty? cidx)
+      {:ops [] :checks []}
+      (let [touched (LinkedHashMap.)
+            asserted (into {} (map (fn [^Datom d] [[(.-e d) (.-a d)] d])) (:asserts res))
+            retracted-keys (:retracted-keys res)
+            final-datom (fn [e aid]
+                          (or (get asserted [e aid])
+                              (first (remove (fn [^Datom c] (contains? retracted-keys [e aid (vkey (.-v c))]))
+                                             (datoms-of db :eavt [e aid])))))]
+        (doseq [[_ e ^Attr attr] ops, ^Attr c (get cidx (:id attr))]
+          (.putIfAbsent touched [e (:id c)] c))
+        (reduce (fn [acc [[e caid] ^Attr c]]
+                  (let [vals (mapv (fn [kw] (when-some [^Datom d (final-datom e (get (:idents schema) kw))]
+                                              (.-v d)))
+                                   (:tuple-attrs c))
+                        new (when (some some? vals) vals)
+                        ^Datom old (first (datoms-of db :eavt [e caid]))]
+                    (cond-> acc
+                      new (update :checks conj [:add e c new])
+                      (and old (or (nil? new) (not (same-value? (.-v old) new))))
+                      (update :ops conj [:retract e c (.-v old)])
+                      (and new (or (nil? old) (not (same-value? (.-v old) new))))
+                      (update :ops conj [:add e c new]))))
+                {:ops [] :checks []}
+                (map (fn [[k v]] [k v]) touched))))))
+
+;; ------------------------------------------------------------------ attribute predicates
+
+(defn- check-attr-preds!
+  [ctx ops]
+  (when (some #(= :add (first %)) ops)
+    (let [preds (reduce (fn [m ^Datom d] (update m (.-e d) (fnil conj []) (.-v d)))
+                        {} (datoms-of (:db ctx) :aevt [a-attr-preds]))]
+      (when (seq preds)
+        (doseq [[kind e ^Attr attr v] ops
+                :when (= kind :add)
+                sym (get preds (:id attr))]
+          (let [f (or (resolve-callable sym)
+                      (fail :db.error/not-a-data-function (str "Unable to resolve data function: " sym)
+                            {:function sym}))
+                r (f v)]
+            (when-not (true? r)
+              (fail :db.error/attr-pred
+                    (str "Entity " e " attribute " (:ident attr) " value " v " failed pred " sym)
+                    {:db.error/pred-return r}))))))))
+
+;; ------------------------------------------------------------------ schema alteration
+
+(defn- check-boot-datoms!
+  [schema retracts]
   (doseq [[_ ^Datom old] retracts]
-    (when (== (.-a old) a-value-type)
-      (fail :db.error/unsupported "Changing :db/valueType of an attribute is not supported"
-            {:entity (.-e old)}))))
+    (when (< (codec/tx->t (.-tx old)) 1000)
+      (let [dv (datom-vec schema (datom/datom (.-e old) (.-a old) (.-v old) (.-tx old) false))]
+        (fail :db.error/datom-cannot-be-altered (str "Boot datoms cannot be altered: " (pr-str dv))
+              {:datom dv})))))
+
+(def ^:private alter-watched #{40 41 42 43 44 45 51 65 66 67 71})
+(def ^:private alter-triggers #{41 42 43 44 45 51 71})
+
+(defn- check-alterations!
+  "Applies Datomic's schema alteration rules to changes of existing attributes. Returns the
+  ids of the attributes that need a :db.alter/attribute datom."
+  [ctx ops res]
+  (let [{:keys [db schema]} ctx
+        attrs (:attrs schema)
+        ids (:ids schema)
+        watched? (fn [e aid] (and (contains? attrs e) (contains? alter-watched aid)))
+        adds (into {} (keep (fn [^Datom d] (when (watched? (.-e d) (.-a d)) [[(.-e d) (.-a d)] d])))
+                   (:asserts res))
+        rets (reduce (fn [m [_ ^Datom old]]
+                       (if (watched? (.-e old) (.-a old))
+                         (update m [(.-e old) (.-a old)] (fnil conj []) old)
+                         m))
+                     {} (:retracts res))
+        explicit (into #{} (keep (fn [[kind e ^Attr attr]]
+                                   (when (and (#{:retract :retract-attr} kind) (integer? e)
+                                              (contains? attrs e) (contains? alter-triggers (:id attr)))
+                                     e)))
+                       ops)
+        es (distinct (concat (map first (keys adds)) (map first (keys rets)) explicit))
+        errors (volatile! [])]
+    (doseq [e es]
+      (let [^Attr attr (get attrs e)
+            ident (:ident attr)
+            added (fn [aid] (get adds [e aid]))
+            retd (fn [aid] (get rets [e aid]))
+            ->id (fn [^Datom d] (when d (let [v (.-v d)] (get ids v v))))
+            err! (fn [m] (vswap! errors conj (merge {:db/error :db.error/unsupported-alter-schema :entity ident} m)))
+            data (fn [] (datoms-of db :aevt [e]))]
+        (when (or (added 40) (retd 40))
+          (err! {:attribute :db/valueType :from (:value-type attr) :to (or (->id (added 40)) :disabled)}))
+        (when (or (added 41) (retd 41))
+          (let [new (->id (added 41))]
+            (cond
+              (nil? new) (err! {:attribute :db/cardinality :from (:cardinality attr) :to :disabled})
+              (and (= new :db.cardinality/one) (= (:cardinality attr) :db.cardinality/many))
+              (let [by-e (group-by (fn [^Datom d] (.-e d)) (data))]
+                (when-some [ds (first (filter #(> (count %) 1) (vals by-e)))]
+                  (vswap! errors conj {:db/error :db.error/cardinality-violation :datoms (vec ds)}))))))
+        (doseq [[aid kw old] [[a-tuple-type :db/tupleType (:tuple-type attr)]
+                              [a-tuple-types :db/tupleTypes (:tuple-types attr)]
+                              [a-tuple-attrs :db/tupleAttrs (:tuple-attrs attr)]]]
+          (when (or (added aid) (retd aid))
+            (err! {:attribute kw :from (or old :disabled)
+                   :to (if-some [^Datom d (added aid)] (.-v d) :disabled)})))
+        (when-some [^Datom d (added 51)]
+          (when (and (true? (.-v d)) (not (true? (:fulltext? attr))))
+            (err! {:attribute :db/fulltext :from (if (nil? (:fulltext? attr)) :disabled (:fulltext? attr)) :to true})))
+        (when-some [^Datom d (added 42)]
+          (when (nil? (:unique attr))
+            (let [ds (data)
+                  index? (if-some [^Datom i (added 44)]
+                           (.-v i)
+                           (if (retd 44) false (:index? attr)))]
+              (if (and (seq ds) (not index?))
+                (vswap! errors conj {:db/error :db.error/unique-without-index :attribute ident})
+                (let [seen (java.util.HashMap.)]
+                  (doseq [^Datom x ds]
+                    (let [k (vkey (.-v x))
+                          prev (.put seen k x)]
+                      (when prev
+                        (vswap! errors conj {:db/error :db.error/unique-violation :datoms [prev x]})))))))))))
+    (when (seq @errors)
+      (fail :db.error/invalid-alter-attribute (str "Error: " (pr-str (first @errors)))
+            {:db/errors (seq @errors)}))
+    (filterv (fn [e] (or (contains? explicit e)
+                         (some (fn [aid] (or (contains? adds [e aid]) (contains? rets [e aid])))
+                               alter-triggers)))
+             es)))
+
+;; ------------------------------------------------------------------ db-after (entity specs)
+
+(defn- bytes-start-with? [^bytes k ^bytes prefix]
+  (let [n (alength prefix)]
+    (and (>= (alength k) n) (Arrays/equals k 0 n prefix 0 n))))
+
+(defn- lower-bound ^long [^objects ks ^bytes start]
+  (loop [lo 0 hi (alength ks)]
+    (if (< lo hi)
+      (let [mid (quot (+ lo hi) 2)]
+        (if (neg? (long (codec/compare-bytes (aget ks mid) start)))
+          (recur (inc mid) hi)
+          (recur lo mid)))
+      lo)))
+
+(deftype OverlayCursor [^objects ks ^objects ds ^bytes prefix ^:unsynchronized-mutable ^long i]
+  mnemonic.index.ICursor
+  (valid [_] (boolean (and (< i (alength ks))
+                           (or (nil? prefix) (bytes-start-with? (aget ks i) prefix)))))
+  (advance [this] (when (.valid this) (set! i (inc i))) nil)
+  (key [this] (when (.valid this) (aget ks i)))
+  (datom [this] (when (.valid this) (aget ds i)))
+  (retractTx [_] -1)
+  (close [_] nil))
+
+(defn- dkey [idx ^Datom d]
+  (ByteBuffer/wrap (codec/encode-key idx (.-e d) (.-a d) (.-v d) (.-tx d))))
+
+(deftype TxDb [base ^long basis schema overlays retracted]
+  index/IDb
+  (-seek-current [this idx prefix] (index/-view this idx prefix))
+  (-seek-history [_ _ _]
+    (throw (error :db.error/unsupported "History is not available on a transaction's db-after"
+                  :cognitect.anomalies/unsupported nil)))
+  (-view [_ idx prefix]
+    (let [[ks ds] (get overlays idx)
+          oc (->OverlayCursor ks ds prefix (lower-bound ks prefix))
+          bc (index/-view base idx prefix)
+          rs (get retracted idx)
+          bc (if (seq rs) (index/filter-cursor bc (fn [d] (not (contains? rs (dkey idx d))))) bc)]
+      (index/merge-cursors [oc bc])))
+  (-seek-view [_ idx start]
+    (let [[ks ds] (get overlays idx)
+          oc (->OverlayCursor ks ds nil (lower-bound ks start))
+          bc (index/-seek-view base idx start)
+          rs (get retracted idx)
+          bc (if (seq rs) (index/filter-cursor bc (fn [d] (not (contains? rs (dkey idx d))))) bc)]
+      (index/merge-cursors [oc bc])))
+  (-basis-t [_] basis)
+  (-schema [_] schema)
+  (-as-of-t [_] nil)
+  (-since-t [_] nil)
+  (-history? [_] false)
+  (-filter-pred [_] nil)
+  (-raw [this] this))
+
+(defn- make-tx-db
+  "A db value of `db` with the effects of one transaction applied."
+  [db schema t asserted retracts]
+  (let [overlays (into {}
+                       (for [idx [:eavt :aevt :avet :vaet]]
+                         (let [items (->> asserted
+                                          (filter (fn [^Datom d] (or (not= idx :vaet) (ref-attr? schema (.-a d)))))
+                                          (map (fn [^Datom d] [(codec/encode-key idx (.-e d) (.-a d) (.-v d) (.-tx d)) d]))
+                                          (sort-by first (fn [a b] (codec/compare-bytes a b))))]
+                           [idx [(object-array (map first items)) (object-array (map second items))]])))
+        retracted (into {}
+                        (for [idx [:eavt :aevt :avet :vaet]]
+                          [idx (into #{} (comp (map second)
+                                               (filter (fn [^Datom d] (or (not= idx :vaet) (ref-attr? schema (.-a d)))))
+                                               (map #(dkey idx %)))
+                                     retracts)]))]
+    (->TxDb db t schema overlays retracted)))
+
+(defn- check-ensures!
+  "Checks every `:db/ensure` entity spec against the transaction's resulting db."
+  [ctx ensures asserted retracts]
+  (when (seq ensures)
+    (let [{:keys [db schema t]} ctx
+          retracted-keys (into #{} (map (fn [[_ ^Datom o]] [(.-e o) (.-a o) (vkey (.-v o))])) retracts)
+          has-attr? (fn [e aid]
+                      (or (some (fn [^Datom d] (and (== (.-e d) e) (== (.-a d) aid))) asserted)
+                          (some (fn [^Datom c] (not (contains? retracted-keys [e aid (vkey (.-v c))])))
+                                (datoms-of db :eavt [e aid]))))
+          after (delay (make-tx-db db schema t asserted retracts))
+          vals-of (fn [spec aid] (mapv (fn [^Datom d] (.-v d)) (datoms-of db :eavt [spec aid])))]
+      (doseq [[e spec] (distinct ensures)]
+        (let [label (get (:ids schema) spec spec)
+              missing (remove (fn [kw] (when-some [aid (get (:idents schema) kw)] (has-attr? e aid)))
+                              (vals-of spec 69))]
+          (when (seq missing)
+            (fail :db.error/entity-attr
+                  (str "Entity " e " missing attributes " (pr-str (vec missing)) " of spec " label)
+                  {:entity e :spec label}))
+          (doseq [sym (vals-of spec 70)]
+            (let [f (or (resolve-callable sym)
+                        (fail :db.error/not-a-data-function (str "Unable to resolve data function: " sym)
+                              {:function sym}))
+                  r (f @after e)]
+              (when-not (true? r)
+                (fail :db.error/entity-pred
+                      (str "Entity " e " failed pred " sym " of spec " label)
+                      {:db.error/pred-return r})))))))))
 
 ;; ------------------------------------------------------------------ prepare
 
@@ -636,12 +1025,36 @@
         ctx {:db db-before :schema schema :meta meta :t t :tx tx :part-cache (atom {})}
         raw (expand-forms ctx tx-data)
         ops (mapv #(resolve-op ctx %) raw)
+        _ (reject-excision! ops)
         {:keys [ops tempids n-shared n-db db-eids]} (resolve-tempids ctx ops)
-        {:keys [asserts adds retracts retracted-keys]} (compute-datoms ctx ops db-eids)
-        _ (check-no-valuetype-change! retracts)
+        {:keys [ops ensures dropped]} (split-ops ops)
+        res1 (compute-datoms ctx ops db-eids)
+        {syn :ops checks :checks} (composite-ops ctx ops res1)
+        res (if (seq syn) (compute-datoms ctx (into ops syn) db-eids) res1)
+        {:keys [asserts adds retracts retracted-keys]} res
+        all-ops (into ops syn)
+        _ (check-boot-datoms! schema retracts)
+        alter-eids (check-alterations! ctx all-ops res)
         _ (check-uniqueness! ctx adds asserts retracted-keys)
+        _ (check-attr-preds! ctx (into ops checks))
         _ (check-db-partition! asserts db-eids)
-        auto (schema-installs ctx asserts)
+        auto (schema-installs ctx asserts alter-eids)
+        ;; ids allocated to entities that ended up without datoms (for example only a
+        ;; dropped composite tuple) are not consumed
+        n-shared (if (empty? dropped)
+                   n-shared
+                   (let [used (into #{} (mapcat (fn [^Datom d]
+                                                (cond-> [(.-e d)] (ref-attr? schema (.-a d)) (conj (.-v d)))))
+                                  asserts)
+                       mask (dec (bit-shift-left 1 42))
+                       top (reduce (fn [m e]
+                                     (let [e (long e) n (bit-and e mask) part (codec/part-of e)]
+                                       (if (and (not= part part-db) (not= part part-tx) (> n t) (< n (long n-shared))
+                                                (or (contains? used e) (not (contains? dropped e))))
+                                         (max m n)
+                                         m)))
+                                   t (vals tempids))]
+                   (inc (long top))))
         ;; the tx's own instant
         now (System/currentTimeMillis)
         last-ms (last-instant db-before)
@@ -663,6 +1076,7 @@
                      (into asserts)
                      (into auto))
         retract-datoms (mapv first retracts)
+        _ (check-ensures! ctx ensures asserted retracts)
         tx-data (-> [] (into (when instant-datom [instant-datom]))
                     (into (remove #(identical? % instant-datom) asserted))
                     (into retract-datoms))
