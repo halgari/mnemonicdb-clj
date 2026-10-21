@@ -329,11 +329,17 @@
       (fail :db.error/not-an-entity (str "Unable to resolve entity: " (pr-str x)) {:entity x})))
 
 (defn- check-eid
+  "Rejects ids Datomic rejects: negative ids, user-partition ids not yet allocated, and
+  :db.part/db / :db.part/tx ids beyond Datomic's allocation window (probed: tx ids above
+  max(999, current tx n); db ids above last allocated + 927)."
   [ctx ^long eid]
-  (let [part (codec/part-of eid)]
+  (let [part (codec/part-of eid)
+        n (bit-and eid (dec (bit-shift-left 1 42)))
+        meta (:meta ctx)]
     (when (or (neg? eid)
-              (and (not= part part-db) (not= part part-tx)
-                   (>= (bit-and eid (dec (bit-shift-left 1 42))) (long (:next-t (:meta ctx))))))
+              (cond (== part part-db) (>= n (+ (long (:next-db-n meta)) 927))
+                    (== part part-tx) (and (> n (long (:next-t meta))) (>= n 1000))
+                    :else (>= n (long (:next-t meta)))))
       (fail :db.error/invalid-entity-id (str "Invalid entity id: " eid) {:entity eid}))
     eid))
 
@@ -742,13 +748,15 @@
     [:put :log (codec/long->bytes tx) arr]))
 
 (defn- fresh-entity?
-  "True when `e` cannot have datoms in db-before: its id lies beyond the ids allocated so far."
-  [ctx ^long e]
-  (let [meta (:meta ctx)
-        n (bit-and e (dec (bit-shift-left 1 42)))]
-    (>= n (if (== (codec/part-of e) part-db)
-            (long (:next-db-n meta))
-            (long (:t ctx))))))
+  "True when `e` was allocated by this very tx (so db-before holds no datoms for it): the tx
+  entity itself, a :db.part/db id in `db-eids`, or a user-partition id at or beyond the tx's
+  t (check-eid rejects literal user ids that high). Explicit ids in :db.part/db or
+  :db.part/tx are never assumed fresh."
+  [ctx db-eids ^long e]
+  (let [part (codec/part-of e)]
+    (cond (== part part-tx) (== e (long (:tx ctx)))
+          (== part part-db) (contains? db-eids e)
+          :else (>= (bit-and e (dec (bit-shift-left 1 42))) (long (:t ctx))))))
 
 (defn- compute-datoms
   "Resolved ops -> {:asserts [Datom] :adds [Datom] :retracts [[Datom retracted-old-datom]]
@@ -769,10 +777,10 @@
                                (pr-str {:d1 (datom-vec schema d1) :d2 (datom-vec schema d2)}))
                           {:d1 (datom-vec schema d1) :d2 (datom-vec schema d2)}))
         ;; entities allocated by this very tx have no datoms in db-before: skip the reads
-        existing-of (fn [^long e aid] (if (fresh-entity? ctx e) [] (datoms-of db :eavt [e aid])))
+        existing-of (fn [^long e aid] (if (fresh-entity? ctx db-eids e) [] (datoms-of db :eavt [e aid])))
         ;; the current datom [e a v] (exact key lookup; never scans the other values)
         existing-value (fn [^long e ^long aid ^bytes vb]
-                         (when-not (fresh-entity? ctx e)
+                         (when-not (fresh-entity? ctx db-eids e)
                            (first (datoms-of-prefix db :eavt (prefix-ea+v e aid vb)))))
         ;; expand :retract-attr against db-before
         ops (into []
