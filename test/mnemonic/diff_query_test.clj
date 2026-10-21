@@ -320,6 +320,7 @@
                          ['[:find ?e ?a :where [?e :p/age 20]] hist-d hist-m]]] ;; unbound ?a: both error
         (let [a (try {:ok (canon (d/q q ds))} (catch Throwable e {:err (error-kind e)}))
               b (try {:ok (canon (m/q q ms))} (catch Throwable e {:err (error-kind e)}))]
-          (if (:err a)
-            (is (:err b) (pr-str q))
+          (if (contains? a :err)
+            (do (is (contains? b :err) (pr-str q))
+                (when (:err a) (is (= (:err a) (:err b)) (pr-str q))))
             (is (= a b) (pr-str q))))))))

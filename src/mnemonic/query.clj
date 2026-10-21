@@ -1,7 +1,10 @@
 (ns mnemonic.query
-  "Datalog query entry points: q, query, qseq. Execution lives in mnemonic.query.engine."
-  (:require [mnemonic.query.engine :as engine])
-  (:import (java.util Collection)))
+  "Datalog query entry points: q, query, qseq. Execution lives in mnemonic.query.engine;
+  rules, not/or and aggregates are loaded for their multimethod registrations."
+  (:require [mnemonic.query.aggregates]
+            [mnemonic.query.engine :as engine]
+            [mnemonic.query.rules])
+  )
 
 (set! *warn-on-reflection* true)
 
@@ -11,12 +14,14 @@
 (defn- run [q args opts]
   (engine/execute (engine/parse q) (vec args) opts))
 
-(defn- run-map [m]
-  (when-not (contains? m :query)
-    (throw (ex-info "Query map requires :query"
-                    {:db/error :db.error/invalid-query
-                     :cognitect.anomalies/category :cognitect.anomalies/incorrect})))
-  (run (:query m) (:args m) (select-keys m [:timeout])))
+(defn- run-map
+  ([m] (run-map m nil))
+  ([m extra-opts]
+   (when-not (contains? m :query)
+     (throw (ex-info "Query map requires :query"
+                     {:db/error :db.error/invalid-query
+                      :cognitect.anomalies/category :cognitect.anomalies/incorrect})))
+   (run (:query m) (:args m) (merge (select-keys m [:timeout]) extra-opts))))
 
 (defn q
   "Runs a query. `query` is the vector/list/map/string form; `inputs` match its :in.
@@ -32,10 +37,10 @@
   (run-map query-map))
 
 (defn qseq
-  "Like q (also accepts a query-map), returning a seq of the result. Eager."
+  "Like q (also accepts a query-map), returning a seq of the result. The seq is lazy:
+  pull expressions are realized as it is consumed. nil when empty."
   [query & inputs]
-  (let [r (if (query-map? query) (run-map query) (run query inputs nil))]
-    (cond
-      (instance? Collection r) (seq r)
-      (nil? r) nil
-      :else (list r))))
+  (let [opts {:lazy true}]
+    (if (query-map? query)
+      (run-map query opts)
+      (run query inputs opts))))

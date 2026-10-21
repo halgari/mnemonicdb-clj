@@ -275,9 +275,9 @@
       (let [r (m/q '[:find ?c :with ?e :where [?e :p/city ?c]] db)]
         (is (vector? r))
         (is (= {["X"] 2 ["Y"] 1} (frequencies r)))))
-    (testing "aggregates and pull are deferred"
-      (is (= :db.error/unsupported (err #(m/q '[:find (count ?e) :where [?e :p/name _]] db))))
-      (is (= :db.error/unsupported (err #(m/q '[:find (pull ?e [*]) :where [?e :p/name _]] db)))))))
+    (testing "aggregates and pull in :find"
+      (is (= [[3]] (m/q '[:find (count ?e) :where [?e :p/name _]] db)))
+      (is (= 3 (count (m/q '[:find (pull ?e [*]) :where [?e :p/name _]] db)))))))
 
 (deftest query-forms
   (with-db
