@@ -83,6 +83,9 @@
     n
     -1))
 
+(defn- stale-view []
+  (throw (IllegalStateException. "Datom view read after its cursor was exhausted or closed")))
+
 ;; The current key lives in the raw cursor's reused buffer (`klen` bytes, -1 = invalid).
 ;; `key` materializes an exact-length copy lazily (callers may retain it); `datom` decodes
 ;; straight from the buffer.
@@ -117,11 +120,13 @@
   ;; The cursor is its own flyweight view: components decode in place from the raw
   ;; cursor's key buffer (valid until advance).
   IDatomView
-  (eid [_] (codec/key-e code (.kbuf raw) klen))
-  (attr [_] (codec/key-a code (.kbuf raw) klen))
-  (value [_] (codec/key-value code (.kbuf raw) klen))
-  (valueLong [_] (codec/key-value-long code (.kbuf raw) klen))
-  (txid [_] (codec/key-tx (.kbuf raw) klen))
+  ;; a view read after the cursor moved past its end or closed would decode a recycled
+  ;; buffer: fail loudly instead
+  (eid [_] (when (neg? klen) (stale-view)) (codec/key-e code (.kbuf raw) klen))
+  (attr [_] (when (neg? klen) (stale-view)) (codec/key-a code (.kbuf raw) klen))
+  (value [_] (when (neg? klen) (stale-view)) (codec/key-value code (.kbuf raw) klen))
+  (valueLong [_] (when (neg? klen) (stale-view)) (codec/key-value-long code (.kbuf raw) klen))
+  (txid [_] (when (neg? klen) (stale-view)) (codec/key-tx (.kbuf raw) klen))
   (isAdded [_] true)
   (toDatom [this] (.datom this))
   (close [_]
@@ -156,19 +161,43 @@
 
 ;; ------------------------------------------------------------------ segment cursor
 
+(defn- mutable-value? [v]
+  (or (instance? java.util.Date v) (bytes? v)))
+
+(defn- copy-value [v]
+  (cond
+    (instance? java.util.Date v) (java.util.Date. (.getTime ^java.util.Date v))
+    (bytes? v) (aclone ^bytes v)
+    :else v))
+
+(defn- detach
+  "`d` itself, or a copy whose mutable value (java.util.Date, byte[], or a tuple holding
+  one) is a fresh copy: the cached Datom is shared by every reader, and a caller that
+  mutates the value it got must not change what later reads see (an uncached read
+  decodes a fresh value every time)."
+  ^Datom [^Datom d]
+  (let [v (.-v d)]
+    (cond
+      (mutable-value? v)
+      (Datom. (.-e d) (.-a d) (copy-value v) (.-tx d) (.-added d))
+      (and (vector? v) (some mutable-value? v))
+      (Datom. (.-e d) (.-a d) (mapv copy-value v) (.-tx d) (.-added d))
+      :else d)))
+
 (defn seg-datom
   "The Datom of entry `i` of a cached segment (mnemonic.segcache): decoded on first
   access and stored back into the shared array `ds`. A racy but benign write: decoding is
   deterministic and a Datom's fields are final, so another thread sees nil (and decodes
-  again) or a complete Datom."
+  again) or a complete Datom. Mutable values are copied on the way out (`detach`)."
   ^Datom [^long code ^objects ks ^objects ds ^long i]
   (let [d (aget ds i)]
-    (if (nil? d)
-      (let [^bytes k (aget ks i)
-            d (codec/decode-key-code code k (alength k))]
-        (aset ds i d)
-        d)
-      d)))
+    (detach
+     (if (nil? d)
+       (let [^bytes k (aget ks i)
+             d (codec/decode-key-code code k (alength k))]
+         (aset ds i d)
+         d)
+       d))))
 
 ;; Entries [i, end) of a cached segment: shared, immutable key arrays (`ks`), lazily
 ;; decoded Datoms (`ds`) and, for history CFs, retracting txs (`rtx`). No native call and
