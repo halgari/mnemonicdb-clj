@@ -24,3 +24,10 @@ Intentional differences between MnemonicDB and the Datomic Peer API, with ration
 | `d/next-t` on a with-db | Returns the speculative next t | Returns the base db's next t | Minor; not yet implemented |
 | as-of schema | (n/a) | as-of dbs use the latest schema | Simplicity; schema needed to decode |
 | `d/as-of`/`d/since` with a `java.util.Date` | Converts via log | Converted via `:db/txInstant` scan; `as-of-t` may differ | Not diff-tested |
+| Pull | `:xform` fn must be listed in `datomic/extensions.edn` | Any fn, var, keyword, or symbol of an already-loaded namespace (unqualified symbols resolve in `clojure.core`); namespaces are never loaded on demand | No extensions.edn; no code loading from patterns |
+| Pull/Entity | A component cycle (A comp-ref B, B comp-ref A) overflows the stack under `[*]`, default component expansion and `d/touch` | The component already being expanded on the path is rendered as `{:db/id n}`; touch leaves it untouched | Robustness |
+| Entity | `EntityMap` is not callable | `Entity` also implements `IFn` (`(e :attr)`) | Superset, requested by the design |
+| Entity | `str`/print of a touched entity includes cached reverse lookups | Prints forward attributes only | Cosmetic |
+| Pull | String attribute names (`["*"]` gives string keys; `[":p/name"]`) | Rejected with `:db.error/invalid-attr-spec` | Rarely used |
+| Pull | `[* {:p/boss 1}]` (wildcard plus depth recursion) throws an NPE | Returns the expected result | Datomic bug |
+| Entity/Pull | History dbs return retractions in datoms | Entity and pull read asserted datoms only | Retractions have no meaning for a map view |

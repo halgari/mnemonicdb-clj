@@ -53,7 +53,8 @@
     (var? x) x
     (keyword? x) x
     (symbol? x) (or (if (namespace x)
-                      (try (requiring-resolve x) (catch Exception _ nil))
+                      (some-> (find-ns (symbol (namespace x)))
+                              (ns-resolve (symbol (name x))))
                       (ns-resolve 'clojure.core x))
                     (throw (spec-error :db.error/invalid-attr-spec
                                        (str "Cannot resolve :xform " x) {:xform x})))
@@ -183,7 +184,7 @@
 
 ;; ------------------------------------------------------------------ evaluation
 
-(def ^:private empty-state {:seen #{} :depths {} :revisit false})
+(def ^:private empty-state {:seen #{} :depths {} :revisit false :comp #{}})
 
 (declare pull-entity)
 
@@ -191,10 +192,13 @@
   (= :db.type/ref (:value-type attr)))
 
 (defn- default-ref-value
-  "A ref target without a sub-pattern: components expand, other refs are {:db/id}."
-  [db sch ^Attr attr eid]
-  (if (:component? attr)
-    (pull-entity db sch eid wildcard-ast empty-state)
+  "A ref target of `parent` without a sub-pattern: components expand, other refs are
+  {:db/id}. A component already being expanded on this path (a component cycle, where
+  Datomic overflows the stack) is rendered as {:db/id}."
+  [db sch ^Attr attr parent eid st]
+  (if (and (:component? attr) (not (contains? (:comp st) eid)) (not= parent eid))
+    (pull-entity db sch eid wildcard-ast
+                 (assoc empty-state :comp (conj (:comp st) parent eid)))
     {:db/id eid}))
 
 (defn- recursion-child
@@ -221,7 +225,7 @@
                   (string? c) (throw (entity/not-a-keyword c))
                   :else nil)
     (:reverse? spec) {:db/id (long c)}
-    (ref-attr? attr) (default-ref-value db sch attr (long c))
+    (ref-attr? attr) (default-ref-value db sch attr eid (long c) st)
     :else c))
 
 (defn- spec-raw
@@ -254,14 +258,14 @@
 
 (defn- wildcard-entries
   "[key value] for every attribute of `eid` not overridden by an explicit spec."
-  [db sch eid override]
+  [db sch eid override st]
   (->> (entity/datoms-seq db :eavt [eid])
        (partition-by (fn [^Datom d] (.-a d)))
        (keep (fn [ds]
                (let [^Attr attr (get (:attrs sch) (.-a ^Datom (first ds)))]
                  (when (and attr (not (contains? override (:ident attr))))
                    (let [value (fn [^Datom d] (if (ref-attr? attr)
-                                                (default-ref-value db sch attr (long (.-v d)))
+                                                (default-ref-value db sch attr eid (long (.-v d)) st)
                                                 (.-v d)))]
                      [(:ident attr)
                       (if (= :db.cardinality/many (:cardinality attr))
@@ -274,7 +278,7 @@
   (let [st (if (and (not (:revisit st)) (contains? (:seen st) eid)) (assoc st :revisit true) st)
         m (if (:id? ast) {:db/id eid} {})
         m (if (:wildcard? ast)
-            (reduce (fn [acc [k v]] (assoc acc k v)) m (wildcard-entries db sch eid (:override ast)))
+            (reduce (fn [acc [k v]] (assoc acc k v)) m (wildcard-entries db sch eid (:override ast) st))
             m)
         m (reduce (fn [acc ^AttrSpec spec]
                     (let [k (:key spec)]

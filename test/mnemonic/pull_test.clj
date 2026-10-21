@@ -283,3 +283,10 @@
       (:p/_friends (m/entity db (ids "a"))))
     (is (= before (.get ^java.util.concurrent.atomic.AtomicLong index/open-cursors))
         "pull and entity close every cursor eagerly")))
+
+(deftest xform-no-load-test
+  (let [{:keys [db ids]} (fixture)]
+    (is (= :db.error/invalid-attr-spec
+           (err #(m/pull db '[(:p/name :xform not.loaded.ns/f)] (ids "a")))))
+    (is (nil? (find-ns 'not.loaded.ns)))
+    (is (= {:p/name "AL"} (m/pull db '[(:p/name :xform clojure.string/upper-case)] (ids "a"))))))

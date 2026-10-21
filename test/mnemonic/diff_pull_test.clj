@@ -293,3 +293,20 @@
         (is (= (:db/id (d/entity d 99999999)) (:db/id (m/entity m 99999999))))
         (is (= (seq (d/entity d 99999999)) (seq (m/entity m 99999999))))
         (is (= (pr-str (d/entity d (ids "a"))) (pr-str (m/entity m (ids "a")))))))))
+
+(deftest as-of-pull-matches-datomic
+  (o/with-both [cd cm]
+    (let [{:keys [d m ids]} (setup cd cm)
+          t0 (d/basis-t d)
+          tx [{:db/id (ids "a") :p/age 31 :p/tags ["z"] :p/boss (ids "c")}
+              [:db/retract (ids "b") :p/friends (ids "a")]]]
+      (is (= t0 (m/basis-t m)))
+      @(d/transact cd tx)
+      @(m/transact cm tx)
+      (let [d2 (d/db cd) m2 (m/db cm)]
+        (doseq [pattern ['[*] '[:p/age :p/tags {:p/boss [:p/name]}] '[:p/name {:p/friends ...}]
+                         '[:p/_boss] '[{:p/addr [*]}]]
+                k ["a" "b" "c"]
+                [dd mm] [[(d/as-of d2 t0) (m/as-of m2 t0)] [d2 m2]]]
+          (is (= (run #(d/pull dd pattern (ids k))) (run #(m/pull mm pattern (ids k))))
+              (pr-str pattern k)))))))

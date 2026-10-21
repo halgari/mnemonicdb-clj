@@ -124,3 +124,47 @@
         a (m/entity db (ids "a"))]
     (is (thrown? UnsupportedOperationException (assoc a :x 1)))
     (is (thrown? UnsupportedOperationException (conj a [:x 1])))))
+
+(deftest key-set-test
+  (let [{:keys [db ids]} (fixture)
+        a (m/entity db (ids "a"))]
+    (is (= #{:p/name :p/age :p/tags :p/addr :p/items :p/kind} (.keySet ^mnemonic.entity.IEntityKeys a)))))
+
+(deftest component-cycle-test
+  (let [u (str "mnemonic:mem://" (java.util.UUID/randomUUID))
+        _ (m/create-database u)
+        c (m/connect u)
+        _ @(m/transact c [{:db/id "r" :db/ident :c/ref :db/valueType :db.type/ref
+                           :db/cardinality :db.cardinality/one :db/isComponent true}
+                          {:db/id "n" :db/ident :c/name :db/valueType :db.type/string
+                           :db/cardinality :db.cardinality/one}])
+        tids (:tempids @(m/transact c [{:db/id "x" :c/name "X" :c/ref "y"}
+                                       {:db/id "y" :c/name "Y" :c/ref "x"}]))
+        db (m/db c)
+        x (tids "x") y (tids "y")]
+    (testing "touch terminates and prints finitely"
+      (is (string? (pr-str (m/touch (m/entity db x))))))
+    (testing "pull falls back to {:db/id} on a component cycle (Datomic overflows)"
+      (is (= {:db/id x :c/name "X" :c/ref {:db/id y :c/name "Y" :c/ref {:db/id x}}}
+             (m/pull db '[*] x)))
+      (is (= {:c/ref {:db/id y :c/name "Y" :c/ref {:db/id x}}} (m/pull db '[:c/ref] x)))
+      (is (= {:c/name "X" :c/ref {:c/ref {:db/id x :c/name "X" :c/ref {:db/id y}}}}
+             (m/pull db '[:c/name {:c/ref [:c/ref]}] x))))))
+
+(deftest layered-db-test
+  (let [{:keys [c ids]} (fixture)
+        t0 (m/basis-t (m/db c))
+        _ @(m/transact c [{:db/id (ids "a") :p/age 31 :p/tags ["z"]}])
+        db (m/db c)
+        old (m/as-of db t0)
+        a (ids "a")]
+    (is (= 31 (:p/age (m/entity db a))))
+    (is (= 30 (:p/age (m/entity old a))) "as-of entity")
+    (is (= {:p/age 30} (m/pull old [:p/age] a)))
+    (is (= {:p/age 31} (m/pull db [:p/age] a)))
+    (let [age-id (:id (m/attribute db :p/age))
+          f (m/filter db (fn [_ d] (not= (:a d) age-id)))]
+      (is (nil? (:p/age (m/entity f a))))
+      (is (= {:p/name "Al"} (m/pull f [:p/name :p/age] a))))
+    (is (contains? #{30 31} (:p/age (m/entity (m/history db) a))) "history entity reads asserted datoms")
+    (is (not= (m/entity old a) (m/entity db a)))))

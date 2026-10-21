@@ -138,6 +138,9 @@
 
 (declare entity-seq)
 
+(definterface IEntityKeys
+  (keySet []))
+
 (deftype Entity [db ^long eid cache]
   ILookup
   (valAt [this k] (.valAt this k nil))
@@ -182,6 +185,9 @@
   Seqable
   (seq [this] (seq (entity-seq this)))
 
+  IEntityKeys
+  (keySet [this] (into #{} (map first) (entity-seq this)))
+
   IHashEq
   (hasheq [this] (.hashCode this))
 
@@ -221,19 +227,26 @@
   [^Entity e]
   (.-db e))
 
+(defn- touch* [^Entity e path]
+  (let [cache (.-cache e)
+        path (conj path (.-eid e))]
+    (when-not (:touched? @cache)
+      (let [sch (index/-schema (.-db e))]
+        (doseq [[k _] (ensure-all! e)
+                :let [^Attr attr (schema/attr sch k)]
+                :when (and attr (:component? attr))
+                :let [v (get e k)]]
+          (doseq [child (if (set? v) v [v])]
+            ;; a component cycle stays untouched (Datomic overflows the stack there)
+            (when (and (instance? Entity child) (not (contains? path (.-eid ^Entity child))))
+              (touch* child path)))))
+      (swap! cache assoc :touched? true)))
+  e)
+
 (defn touch
   "Loads all attributes of `e` and touches component entities recursively."
   [^Entity e]
-  (when-not (:touched? @(.-cache e))
-    (swap! (.-cache e) assoc :touched? true)
-    (let [sch (index/-schema (.-db e))]
-      (doseq [[k _] (ensure-all! e)
-              :let [^Attr attr (schema/attr sch k)]
-              :when (and attr (:component? attr))
-              :let [v (get e k)]]
-        (doseq [child (if (set? v) v [v])]
-          (when (instance? Entity child) (touch child))))))
-  e)
+  (touch* e #{}))
 
 (defmethod print-method Entity [^Entity e ^java.io.Writer w]
   (let [st @(.-cache e)]
