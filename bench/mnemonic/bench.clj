@@ -241,6 +241,13 @@
       (tx! ctx nodes)
       (swap! datasets assoc-in [(:name b) :tree-loaded] true))))
 
+(def ^:private only
+  "MNEMONIC_BENCH_ONLY=a,c,sh restricts sub-benchmarks (query letters a-f; as-of-history
+  keys qa sa sh qh qc). Meant for profiling a single piece."
+  (some-> (System/getenv "MNEMONIC_BENCH_ONLY") (str/split #",") set))
+
+(defn- on? [k] (or (nil? only) (contains? only k)))
+
 (defn queries [b sz]
   (let [{:keys [ctx]} (dataset! b sz)
         _ (load-tree! b ctx (:tree sz))
@@ -269,7 +276,7 @@
              '[:find ?e :in $ [?em ...] :where [?e :p/email ?em]] [in-emails]
              (fn [res] (email-set b db* res))]]
         out (volatile! {:metrics [] :checks-m {}})]
-    (doseq [[label q args norm] qs]
+    (doseq [[label q args norm] qs :when (on? (subs label 0 1))]
       (let [f #(apply call b :q q db* args)
             ;; long queries need fewer warm iterations
             probe (second (timed-ns (f)))
@@ -310,28 +317,33 @@
             q-asof '[:find ?em ?a :where [?e :p/email ?em] [?e :p/age ?a]]
             q-hist '[:find ?a ?added :in $ ?em :where [?e :p/email ?em] [?e :p/age ?a _ ?added]]
             em (data/email (mod (* 17 7919) n))
-            opts {:warm-ms 1500 :run-ms 2500 :min-iters 5}
+            opts {:warm-ms 1500 :run-ms (max 2500 (:query-ms sz)) :min-iters 5}
             scan3 (fn [db*] (+ (scan-count (call b :datoms db* :aevt :p/age))
                                (scan-count (call b :datoms db* :aevt :p/name))
                                (scan-count (call b :datoms db* :aevt :p/email))))
-            qa (u/run-for #(call b :q q-asof asof) opts)
-            sa (u/run-for #(scan3 asof) opts)
-            sh (u/run-for #(scan-count (call b :datoms hist :aevt :p/age)) opts)
-            qh (u/run-for #(call b :q q-hist hist em) opts)
-            qc (u/run-for #(call b :q q-asof now) opts)]
-        {:metrics [[(str "updates/sec (" hb " per tx)") (per-sec half upd-ns) :hi]
-                   ["as-of query (email,age join) ms" (:mean-ms qa) :lo]
-                   ["current-db same query ms" (:mean-ms qc) :lo]
-                   ["as-of 3-attr AEVT scan datoms/sec" (/ (:result sa) (/ (:mean-ms sa) 1000.0)) :hi]
-                   ["history :p/age AEVT scan datoms/sec" (/ (:result sh) (/ (:mean-ms sh) 1000.0)) :hi]
-                   ["history scan ms" (:mean-ms sh) :lo]
-                   ["history query (one entity) ms" (:mean-ms qh) :lo]]
-         :checks-m {"as-of query rows" (count (:result qa))
-                    "as-of query hash" (hash (set (:result qa)))
-                    "as-of scan datoms" (:result sa)
-                    "history scan datoms" (:result sh)
-                    "history query rows" (count (:result qh))
-                    "history query hash" (hash (set (:result qh)))}})
+            run (fn [k f] (when (on? k) (u/run-for f opts)))
+            qa (run "qa" #(call b :q q-asof asof))
+            sa (run "sa" #(scan3 asof))
+            sh (run "sh" #(scan-count (call b :datoms hist :aevt :p/age)))
+            qh (run "qh" #(call b :q q-hist hist em))
+            qc (run "qc" #(call b :q q-asof now))
+            rate (fn [t] (when t (/ (:result t) (/ (:mean-ms t) 1000.0))))
+            mean (fn [t] (:mean-ms t))
+            res {:metrics [[(str "updates/sec (" hb " per tx)") (per-sec half upd-ns) :hi]
+                           ["as-of query (email,age join) ms" (mean qa) :lo]
+                           ["current-db same query ms" (mean qc) :lo]
+                           ["as-of 3-attr AEVT scan datoms/sec" (rate sa) :hi]
+                           ["history :p/age AEVT scan datoms/sec" (rate sh) :hi]
+                           ["history scan ms" (mean sh) :lo]
+                           ["history query (one entity) ms" (mean qh) :lo]]
+                 :checks-m (cond-> {}
+                             qa (assoc "as-of query rows" (count (:result qa))
+                                       "as-of query hash" (hash (set (:result qa))))
+                             sa (assoc "as-of scan datoms" (:result sa))
+                             sh (assoc "history scan datoms" (:result sh))
+                             qh (assoc "history query rows" (count (:result qh))
+                                       "history query hash" (hash (set (:result qh)))))}]
+        (if only (update res :metrics #(filterv second %)) res))
       (finally (be/drop-db! ctx)))))
 
 ;; --- open / reopen
