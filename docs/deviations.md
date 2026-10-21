@@ -15,3 +15,12 @@ Intentional differences between MnemonicDB and the Datomic Peer API, with ration
 | Transact | Changing `:db/valueType` of an existing attribute follows Datomic's schema-alteration rules | `:db.error/unsupported` until schema alteration is implemented | Schema alteration is milestone M6 |
 | Transact | `d/transact` returns a `datomic.promise` future | Returns a `CompletableFuture`; deref throws `ExecutionException` wrapping the `ex-info` exactly as Datomic | Same observable behavior |
 | API | `d/datoms` with an unknown index throws `IllegalArgumentException` | `ex-info` with `:db.error/invalid-index` | Consistent error shape |
+| Values | `-0.0` and `0.0` are equal | Distinct keys; `-0.0` sorts before `0.0` | Byte-order encoding of IEEE bits |
+| Transactions | Negative longs may be used as raw entity ids | Rejected | Avoid ambiguous ids |
+| Transactions | Reverse refs (`:ns/_attr`) on non-ref attrs | Rejected with an error | Clear error |
+| `d/with` | Allowed on as-of and filter dbs | Throws `:db.error/unsupported` | Not yet implemented (overlay over a time/filter view) |
+| `:db/noHistory` | Mem db keeps history until indexing | Never written to history | No indexing job; matches durable semantics |
+| Bootstrap history | Two retractions at t0 | Not present | Bootstrap is loaded as final state only |
+| `d/next-t` on a with-db | Returns the speculative next t | Returns the base db's next t | Minor; not yet implemented |
+| as-of schema | (n/a) | as-of dbs use the latest schema | Simplicity; schema needed to decode |
+| `d/as-of`/`d/since` with a `java.util.Date` | Converts via log | Converted via `:db/txInstant` scan; `as-of-t` may differ | Not diff-tested |
