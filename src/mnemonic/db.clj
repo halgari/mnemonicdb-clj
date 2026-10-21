@@ -112,7 +112,9 @@
 ;; mode: 0 done, 1 the batch is a complete chunk, 2 the batch is part of a big chunk (the
 ;; raw cursor holds the next unread key, rlen bytes)
 (deftype ChunkCursor [store ^Snap snap ^Cache c ^IReader rd ^long cfc ^boolean hist?
-                      ^bytes prefix ^IRawCursor raw ^long cap
+                      ^bytes prefix ^IRawCursor raw ^long cap ^long ah
+                      ^:unsynchronized-mutable ^long filled
+                      ^:unsynchronized-mutable ^boolean fill?
                       ^:unsynchronized-mutable ^objects ks
                       ^:unsynchronized-mutable ^objects ds
                       ^:unsynchronized-mutable ^longs rtx
@@ -143,10 +145,16 @@
           complete? (not (in-chunk? raw nxt prefix ch))
           ka (.toArray kl)
           ra (when rl (long-array-of rl))
-          s (when k
-              (if complete?
-                (sc/store! c (sc/scan-pool c) k rd w ka ra false)
-                (sc/store! c (sc/scan-pool c) k rd w nil nil true)))]
+          ^Seg s (when k
+                   (if complete?
+                     (sc/store! c (sc/scan-pool c) k rd w ka ra false)
+                     (sc/store! c (sc/scan-pool c) k rd w nil nil true)))]
+      (when s
+        (set! filled (+ filled (sc/seg-weight-of s)))
+        ;; an attribute larger than the scan budget would only churn the scan pool
+        (when (> filled (quot (sc/scan-budget c) 2))
+          (sc/mark-big-scan! c ah)
+          (set! fill? (boolean false))))
       (set! rlen (long nxt))
       (.batch this ka (if (and s complete?) (sc/seg-datoms s) (object-array (alength ka))) ra
               ch (if complete? 1 2))))
@@ -159,7 +167,7 @@
             k (sc/gkey cfc (sc/chunk-granule prefix ch) 16)
             ^Seg s (if (== ch kch) known (sc/lookup c (sc/scan-pool c) k rd))]
         (cond
-          (nil? s) (.readRaw this klen ch k)
+          (nil? s) (.readRaw this klen ch (when fill? k))
           (sc/seg-big? s) (.readRaw this klen ch nil)
           :else (.batch this (sc/seg-keys s) (sc/seg-datoms s) (sc/seg-rtx s) ch 1)))))
   (settle [this]
@@ -201,10 +209,10 @@
   mnemonic.index.IViewCursor
   (view [_] (when (< i end) (index/seg-datom 1 ks ds i))))
 
-(defn- chunk-cursor [store snap ^Cache c rd cf cfc hist? ^bytes prefix]
+(defn- chunk-cursor [store snap ^Cache c rd cf cfc hist? ^bytes prefix ah]
   (let [^IRawCursor raw (open-raw store snap cf nil)]
     (try
-      (let [cur (ChunkCursor. store snap c rd cfc hist? prefix raw (sc/chunk-cap c)
+      (let [cur (ChunkCursor. store snap c rd cfc hist? prefix raw (sc/chunk-cap c) ah 0 true
                               (object-array 0) nil nil 0 0 -1 0 -1 false)]
         (.openAt cur (.seekInto raw prefix) -1 nil)
         (.settle cur)
@@ -240,9 +248,10 @@
                     (point-cursor store snap c rd cf idx hist? prefix cfc e)
                     (plain-cursor store snap cf idx hist? prefix)))
           (4 8) (cond
-                  (== len 8) (if (sc/admit? c (sc/gkey-hash (sc/gkey cfc prefix 8)))
-                               (chunk-cursor store snap c rd cf cfc hist? prefix)
-                               (plain-cursor store snap cf idx hist? prefix))
+                  (== len 8) (let [ah (sc/gkey-hash (sc/gkey cfc prefix 8))]
+                               (if (and (not (sc/big-scan? c ah)) (sc/admit? c ah))
+                                 (chunk-cursor store snap c rd cf cfc hist? prefix ah)
+                                 (plain-cursor store snap cf idx hist? prefix)))
                   (>= len 16) (chunk-probe store snap c rd cf idx hist? prefix cfc)
                   :else (plain-cursor store snap cf idx hist? prefix))
           (plain-cursor store snap cf idx hist? prefix))))))

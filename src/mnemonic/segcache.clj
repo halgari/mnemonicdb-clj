@@ -245,6 +245,7 @@
 (defn seg-rtx ^longs [^Seg s] (.-rtx s))
 (defn seg-big? [^Seg s] (.-big s))
 (defn seg-size ^long [^Seg s] (alength ^objects (.-ks s)))
+(defn seg-weight-of ^long [^Seg s] (.-weight s))
 
 (defn- total-weight ^long [^Seg s]
   (let [^Seg p (.prev s)]
@@ -290,12 +291,25 @@
                 ^AtomicLong epoch* ^AtomicLong max-t
                 ^long point-cap ^long chunk-cap ^long budget
                 ^LongAdder hits ^LongAdder misses ^LongAdder stale
-                ^LongAdder fills ^LongAdder bigs])
+                ^LongAdder fills ^LongAdder bigs
+                ^java.util.Set big-scans])   ; hashes of [a] scans larger than the scan budget
 
 (defn point-pool ^Pool [^Cache c] (.-point c))
 (defn scan-pool ^Pool [^Cache c] (.-scan c))
 (defn point-cap ^long [^Cache c] (.-point-cap c))
 (defn chunk-cap ^long [^Cache c] (.-chunk-cap c))
+
+(defn scan-budget ^long [^Cache c] (.-budget ^Pool (.-scan c)))
+
+(defn big-scan?
+  "True when the attribute scan of hash `h` was found larger than half the scan budget
+  (it is then streamed from RocksDB: caching it would only churn the scan pool)."
+  [^Cache c ^long h]
+  (.contains ^java.util.Set (.-big-scans c) h))
+
+(defn mark-big-scan! [^Cache c ^long h]
+  (.add ^java.util.Set (.-big-scans c) h)
+  nil)
 
 (defn- pow2-at-least ^long [^long x]
   (loop [p 1] (if (< p x) (recur (bit-shift-left p 1)) p)))
@@ -319,7 +333,8 @@
                 (prop-long "mnemonic.index-cache.point-cap" 512)
                 (prop-long "mnemonic.index-cache.chunk-cap" 4096)
                 budget
-                (LongAdder.) (LongAdder.) (LongAdder.) (LongAdder.) (LongAdder.))))))
+                (LongAdder.) (LongAdder.) (LongAdder.) (LongAdder.) (LongAdder.)
+                (ConcurrentHashMap/newKeySet))))))
 
 ;; ------------------------------------------------------------------ writer side
 
@@ -522,11 +537,14 @@
           n))))))
 
 (defn clear!
-  "Drops every segment (stamps are kept: they stay correct)."
+  "Drops every segment and the admission history (stamps are kept: they stay correct)."
   [^Cache c]
   (when c
     (doseq [^Pool p [(.-point c) (.-scan c)]]
-      (.set ^AtomicReference (.-gen p) (new-gen))))
+      (.set ^AtomicReference (.-gen p) (new-gen)))
+    (.clear ^java.util.Set (.-big-scans c))
+    (let [^AtomicIntegerArray d (.-door c)]
+      (dotimes [i (.length d)] (.set d i 0))))
   nil)
 
 (defn stats
