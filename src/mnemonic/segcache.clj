@@ -292,7 +292,9 @@
                 ^long point-cap ^long chunk-cap ^long budget
                 ^LongAdder hits ^LongAdder misses ^LongAdder stale
                 ^LongAdder fills ^LongAdder bigs
-                ^java.util.Set big-scans])   ; hashes of [a] scans larger than the scan budget
+                ^java.util.Set big-scans
+                ;; doorkeeper window: its generation moves every door-window first misses
+                ^AtomicLong door-n ^long door-window ^java.util.concurrent.atomic.AtomicInteger door-gen])   ; hashes of [a] scans larger than the scan budget
 
 (defn point-pool ^Pool [^Cache c] (.-point c))
 (defn scan-pool ^Pool [^Cache c] (.-scan c))
@@ -323,8 +325,12 @@
     (when (pos? mb)
       (let [budget (* mb 1048576)
             sbits (prop-long "mnemonic.index-cache.stripe-bits" 18)
-            ;; ~ one doorkeeper slot per 256 budget bytes (4..16M slots)
-            dslots (min (bit-shift-left 1 22) (max 4096 (pow2-at-least (quot budget 256))))]
+            ;; a granule is admitted when it misses twice within `window` first misses,
+            ;; about the number of entity segments the budget holds: under uniform reads
+            ;; of a working set much larger than the cache few granules repeat that soon,
+            ;; so the cache does not churn; hot granules repeat well within it
+            window (max 4096 (quot budget 1024))
+            dslots (min (bit-shift-left 1 22) (pow2-at-least (* 2 window)))]
         (Cache. (AtomicLongArray. (unchecked-int (bit-shift-left 1 sbits))) (dec (bit-shift-left 1 sbits))
                 (AtomicIntegerArray. (unchecked-int dslots)) (dec dslots)
                 (not= "false" (System/getProperty "mnemonic.index-cache.doorkeeper"))
@@ -334,7 +340,8 @@
                 (prop-long "mnemonic.index-cache.chunk-cap" 4096)
                 budget
                 (LongAdder.) (LongAdder.) (LongAdder.) (LongAdder.) (LongAdder.)
-                (ConcurrentHashMap/newKeySet))))))
+                (ConcurrentHashMap/newKeySet)
+                (AtomicLong. 0) window (java.util.concurrent.atomic.AtomicInteger. 1))))))
 
 ;; ------------------------------------------------------------------ writer side
 
@@ -408,15 +415,20 @@
 
 (defn admit?
   "Doorkeeper: false on the first miss of hash `h` (which is remembered), true on the
-  next one."
+  next one within the doorkeeper window. A slot holds 24 hash bits and the 8-bit window
+  generation, so moving the generation forgets every slot at once."
   [^Cache c ^long h]
   (or (not (.-door? c))
       (let [^AtomicIntegerArray d (.-door c)
             i (unchecked-int (bit-and (.-dmask c) (unsigned-bit-shift-right h 32)))
-            v (unchecked-int h)]
+            g (.get ^java.util.concurrent.atomic.AtomicInteger (.-door-gen c))
+            v (unchecked-int (bit-or (bit-and h 0xFFFFFF00) (bit-and g 0xff)))]
         (if (== v (.get d i))
           true
-          (do (.set d i v) false)))))
+          (do (.set d i v)
+              (when (zero? (rem (.incrementAndGet ^AtomicLong (.-door-n c)) (.-door-window c)))
+                (.incrementAndGet ^java.util.concurrent.atomic.AtomicInteger (.-door-gen c)))
+              false)))))
 
 (defn- valid-for? [^Cache c ^Seg s ^long h ^long b]
   (let [hi (.hi s)]
@@ -543,8 +555,7 @@
     (doseq [^Pool p [(.-point c) (.-scan c)]]
       (.set ^AtomicReference (.-gen p) (new-gen)))
     (.clear ^java.util.Set (.-big-scans c))
-    (let [^AtomicIntegerArray d (.-door c)]
-      (dotimes [i (.length d)] (.set d i 0))))
+    (.incrementAndGet ^java.util.concurrent.atomic.AtomicInteger (.-door-gen c)))
   nil)
 
 (defn stats

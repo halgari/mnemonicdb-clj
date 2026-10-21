@@ -54,6 +54,9 @@
 
 (def ^:private n-ents 3000)
 
+;; these tests exercise the cache: on even when the suite runs with it off by default
+(def ^:private on "?index-cache-mb=256")
+
 (defn- with-props
   "Runs `f` with system properties `props` set (restored after)."
   [props f]
@@ -166,13 +169,13 @@
 
 (deftest cache-agrees-with-rocksdb-under-concurrent-writes
   (doseq [[label props uri-opts kind]
-          [["default" {} "" :mem]
+          [["default" {} on :mem]
            ["point-cap 1, chunk-cap 2 (big granules)"
-            {"mnemonic.index-cache.point-cap" "1" "mnemonic.index-cache.chunk-cap" "2"} "" :mem]
-           ["3-bit stamps (collisions)" {"mnemonic.index-cache.stripe-bits" "3"} "" :mem]
-           ["1 MB budget (eviction)" {} "?index-cache-mb=1" :mem]
-           ["no doorkeeper" {"mnemonic.index-cache.doorkeeper" "false"} "" :mem]
-           ["file store" {} "" :file]]]
+            {"mnemonic.index-cache.point-cap" "1" "mnemonic.index-cache.chunk-cap" "2"} on :mem]
+           ["3-bit stamps (collisions)" {"mnemonic.index-cache.stripe-bits" "3"} on :mem]
+           ["1 MB budget (eviction)" {"mnemonic.index-cache.doorkeeper" "false"} "?index-cache-mb=1" :mem]
+           ["no doorkeeper" {"mnemonic.index-cache.doorkeeper" "false"} on :mem]
+           ["file store" {} on :file]]]
     (testing label
       (let [uri (if (= kind :file)
                   (str "mnemonic:file://" (tmp-dir) uri-opts)
@@ -188,7 +191,7 @@
           (is (<= (:bytes stats) (* 2 1048576))))))))
 
 (deftest hit-serves-exact-state-test
-  (let [uri (str "mnemonic:mem://segcache-exact-" (System/nanoTime))]
+  (let [uri (str "mnemonic:mem://segcache-exact-" (System/nanoTime) on)]
     (m/create-database uri)
     (let [c (m/connect uri)]
       @(m/transact c [{:db/ident :t/n :db/valueType :db.type/long :db/cardinality :db.cardinality/one}])
@@ -208,7 +211,7 @@
 
 (deftest lifecycle-test
   (testing "a hit on a released db throws like a cursor open"
-    (let [uri (str "mnemonic:mem://segcache-rel-" (System/nanoTime))]
+    (let [uri (str "mnemonic:mem://segcache-rel-" (System/nanoTime) on)]
       (m/create-database uri)
       (let [c (m/connect uri)
             d (m/db c)
@@ -217,7 +220,7 @@
         (m/release-db d)
         (is (thrown-with-msg? Exception #"released" (read d))))))
   (testing "a hit after the store closed throws connection-released, never touches native code"
-    (let [uri (str "mnemonic:file://" (tmp-dir))]
+    (let [uri (str "mnemonic:file://" (tmp-dir) on)]
       (m/create-database uri)
       (let [c (m/connect uri)
             d (m/db c)

@@ -31,8 +31,9 @@ through `org.rocksdb/rocksdbjni`. On recent JDKs add
 | `mnemonic:file:///absolute/path?sync=false` | same, without fsync per commit (see Durability) |
 | `mnemonic:file:///absolute/path?cache-mb=512&compression=lz4` | same, with storage options (see Tuning) |
 
-Query parameters are `sync` (`true` or `false`) and the storage options `cache-mb`,
-`write-buffer-mb` and `compression` (`none`, `lz4` or `lz4+zstd`); combine them with `&`.
+Query parameters are `sync` (`true` or `false`), the storage options `cache-mb`,
+`write-buffer-mb` and `compression` (`none`, `lz4` or `lz4+zstd`) and `index-cache-mb`
+(heap index cache, `0` = off; see Tuning); combine them with `&`.
 An unknown key or a bad value is rejected with `:db.error/invalid-db-uri`. They belong to the connection, not the database's identity: the
 first `create-database` / `connect` per process decides. `mnemonic:mem://name` accepts the
 same storage options (`sync` is accepted and ignored); they apply when the database is
@@ -167,6 +168,16 @@ Settings are system properties (`-Dmnemonic.rocks.<name>=...`) read once at star
 `bytes_per_sync` and `wal_bytes_per_sync` are set to 1 MB so background writeback does not pile up before a commit's fsync. Closing a connection flushes the memtables (a close after a large `?sync=false` load takes a few hundred milliseconds), so the next connect does not replay the WAL: a 100k-entity database that took 1.7 s to reopen after an unclean-looking load now reopens in 40 ms.
 
 For write throughput see "Durability and group commit": batch several changes into one transaction, or submit from several threads with `transact-async`.
+
+### Index cache (heap)
+
+Every database (file and mem) keeps decoded index segments in the JVM heap, the way a Datomic peer caches index segments, shared by every db value of the database: all datoms of an entity (EAVT `[e]`), the references to an entity (VAET `[v]`), one value of an attribute (AVET `[a v]`, including "no such value", so lookup refs that miss are cached too) and chunks of 1024 entity ids of an attribute (AEVT, the scan cache), for the current and the history indexes. Longer prefixes (`[e a]`, `[v a]`, ...) are served from their segment. A hit costs no RocksDB call, no decoding and no lock, so readers scale with cores; entity, pull, query, `datoms`, as-of, since and history views all use it unchanged.
+
+| setting | default | meaning |
+|---|---|---|
+| `index-cache-mb` (URI query parameter or `open-store` key; system property `mnemonic.index-cache-mb`) | 256 | Heap budget in MB; `0` turns the cache off. Plan about 130-170 bytes of heap per cached datom (the estimate the budget counts with: 100 bytes plus the key length). 3/4 of it holds entity, reference and lookup segments, 1/4 scan chunks, so a large scan cannot evict the hot entities; an attribute scan larger than half the scan part is streamed instead of cached. |
+
+Segments enter on their second miss (a one-off read pays nothing extra) and leave by CLOCK (second chance) eviction. The cache needs no invalidation messages: every write stamps the granules it touches before it is applied, and a segment is only used by db values whose basis it is valid for, so it can never return anything other than what RocksDB would; a segment replaced after a write keeps serving older db values that still hold it. Size it to the working set, not the database: with 4x more data than budget, uniform random entity reads run at RocksDB speed (a few percent slower from the churn) while a skewed 90/10 workload is about 3x faster. The transactor thread bypasses the cache (what it reads it is about to change); writes pay one stamp per index entry (about 2 percent on a bulk load). `(mnemonic.api/index-cache-stats conn-or-db)` returns `{:hits :misses :stale :fills :big :evictions :entries :bytes :point-bytes :scan-bytes :budget-bytes}` (cumulative counters; `:stale` = entry found but not valid for the reader's basis), or nil when the cache is off. Releasing a connection or closing the store drops the cache.
 
 ### Startup
 
