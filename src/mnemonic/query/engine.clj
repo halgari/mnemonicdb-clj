@@ -11,9 +11,12 @@
     - `run-clauses`     runs a clause list (with deferral) against a relation."
   (:require [mnemonic.codec :as codec]
             [mnemonic.index :as index]
+            [mnemonic.pull :as pull]
+            [mnemonic.query.aggregates :as aggregates]
             [mnemonic.query.fns :as fns]
             [mnemonic.query.parser :as parser])
-  (:import (java.util ArrayList Arrays Collection HashMap HashSet LinkedHashSet List)
+  (:import (java.util ArrayList Arrays Collection HashMap HashSet LinkedHashMap LinkedHashSet List)
+           (java.util.concurrent TimeoutException)
            (mnemonic.datom Datom)))
 
 (set! *warn-on-reflection* true)
@@ -44,13 +47,16 @@
     (System/arraycopy extra 0 r n m)
     r))
 
-(defn- check-deadline! [ctx]
+(defn check-deadline!
+  "Throws :db.error/query-timeout when the query deadline in `ctx` has passed."
+  [ctx]
   (when-let [d (:deadline ctx)]
     (when (> (System/nanoTime) (long d))
       (throw (ex-info "Query canceled: timeout elapsed"
                       {:db/error :db.error/query-timeout
                        :cognitect.anomalies/category :cognitect.anomalies/interrupted
-                       :cognitect.anomalies/message "Query canceled: timeout elapsed"})))))
+                       :cognitect.anomalies/message "Query canceled: timeout elapsed"}
+                      (TimeoutException. "Query canceled: timeout elapsed"))))))
 
 (defmacro ^:private each-tuple
   "Binds `t` to each tuple of `tuples` (an ArrayList), checking the deadline now and then."
@@ -399,11 +405,33 @@
 (defn- var-args [clause]
   (keep #(when (= :var (:type %)) (:sym %)) (:args clause)))
 
-(defn- clause-ready? [rel clause]
+(defn- rule-required-syms
+  "Variables the caller must have bound for rule-call `clause` (the call arguments at the
+  rule's required head positions)."
+  [ctx clause]
+  (let [defs (get (:rules ctx) (:name clause))
+        args (:args clause)]
+    (when (and (seq defs) (= (count (:head (first defs))) (count args)))
+      (let [positions (into #{} (mapcat (fn [{:keys [head required]}]
+                                          (keep-indexed (fn [i h] (when (some #{h} required) i)) head)))
+                            defs)]
+        (keep-indexed (fn [i a] (when (and (contains? positions i) (= :var (:type a))) (:sym a)))
+                      args)))))
+
+(defn- needs
+  "Variables that must be bound before `clause` can run."
+  [ctx clause]
+  (case (:clause clause)
+    (:pred :fn) (concat (var-args clause)
+                        (let [f (:fn clause)] (when (fns/fn-var? f) [f])))
+    (:not :not-join) (:vars clause)
+    :or-join (:required clause)
+    :rule (rule-required-syms ctx clause)
+    nil))
+
+(defn- clause-ready? [ctx rel clause]
   (let [vidx (var-index rel)]
-    (and (every? #(contains? vidx %) (var-args clause))
-         (let [f (:fn clause)]
-           (or (not (fns/fn-var? f)) (contains? vidx f))))))
+    (every? #(contains? vidx %) (needs ctx clause))))
 
 (defn- arg-getter
   "A fn of tuple for argument `term`."
@@ -449,7 +477,8 @@
     (extend-rel ctx rel (binding-syms binding)
                 (fn [t] (binding-rows binding (call t) false)))))
 
-(defn- deferrable? [clause] (contains? #{:pred :fn} (:clause clause)))
+(defn- deferrable? [clause]
+  (contains? #{:pred :fn :rule :not :not-join :or-join} (:clause clause)))
 
 (defn run-clauses
   "Executes `clauses` in written order against `rel`. Predicates and function
@@ -457,27 +486,37 @@
   [ctx rel clauses]
   (letfn [(drain [rel pending]
             (loop [rel rel pending pending]
-              (if-let [c (first (filter #(clause-ready? rel %) pending))]
+              (if-let [c (first (filter #(clause-ready? ctx rel %) pending))]
                 (recur (execute-clause ctx rel c)
                        (vec (remove #(identical? c %) pending)))
                 [rel pending])))]
     (loop [rel rel cs (seq clauses) pending []]
       (check-deadline! ctx)
       (if-let [c (first cs)]
-        (if (and (deferrable? c) (not (clause-ready? rel c)))
+        (if (and (deferrable? c) (not (clause-ready? ctx rel c)))
           (recur rel (next cs) (conj pending c))
           (let [[rel' pending'] (drain (execute-clause ctx rel c) pending)]
             (recur rel' (next cs) pending')))
         (if (seq pending)
           (let [vidx (var-index rel)
-                missing (into #{} (comp (mapcat var-args) (remove #(contains? vidx %))) pending)]
+                missing (into #{} (comp (mapcat #(needs ctx %)) (remove #(contains? vidx %))) pending)]
             (throw (qerror :db.error/insufficient-binding
-                           (str (vec missing) " not bound in expression clause: "
-                                (pr-str (:fn (first pending))))
+                           (str (vec missing) " not bound in clause: "
+                                (pr-str (let [c (first pending)]
+                                          (or (:fn c) (:name c) (:clause c)))))
                            {:variables missing :clause (first pending)})))
           rel)))))
 
 ;; ------------------------------------------------------------------ inputs
+
+(defn- parse-rules-input
+  "Rule map for the `%` argument (a rule-set vector); nil means no rules."
+  [a]
+  (cond
+    (nil? a) {}
+    (or (sequential? a) (string? a)) (if (and (sequential? a) (empty? a)) {} (parser/parse-rules a))
+    :else (throw (qerror :db.error/invalid-query "Rules must be a collection of rule definitions"
+                         {:rules a}))))
 
 (defn- bind-inputs
   "Matches `args` with the :in bindings; returns ctx (sources, rules) and the relation of
@@ -497,7 +536,7 @@
         (let [b (first bs) a (first as)]
           (case (:bind b)
             :src (recur (next bs) (next as) (assoc-in ctx [:sources (:sym b)] a) rel)
-            :rules (recur (next bs) (next as) (assoc ctx :rules a) rel)
+            :rules (recur (next bs) (next as) (assoc ctx :rules (parse-rules-input a)) rel)
             (let [rows (binding-rows b a true)]
               (recur (next bs) (next as) ctx
                      (extend-rel ctx rel (binding-syms b) (fn [_] rows))))))
@@ -530,7 +569,8 @@
 ;; ------------------------------------------------------------------ find
 
 (defmulti find-element-fn
-  "A fn of tuple returning the value of find element `elem` against relation `rel`."
+  "A fn of tuple returning the raw value of find element `elem` against relation `rel`.
+  For :pull elements the raw value is what `finish-element-fn` turns into the pulled map."
   (fn [_ctx _rel elem] (:type elem)))
 
 (defmethod find-element-fn :default [_ _ elem]
@@ -538,7 +578,9 @@
                  (str "Find element " (pr-str (:type elem)) " is not supported yet")
                  {:element elem})))
 
-(defmethod find-element-fn :var [_ rel {:keys [sym]}]
+(defn- column-fn
+  "Getter of the column of variable `sym` in `rel`; throws when unbound."
+  [rel sym]
   (let [i (get (var-index rel) sym)]
     (when-not i
       (throw (qerror :db.error/unbound-query-variables
@@ -546,6 +588,43 @@
                      {:variables #{sym}})))
     (let [i (long i)]
       (fn [^objects t] (aget t i)))))
+
+(defmethod find-element-fn :var [_ rel {:keys [sym]}]
+  (column-fn rel sym))
+
+(defmethod find-element-fn :pull [_ rel {:keys [var pattern]}]
+  (let [ef (column-fn rel var)]
+    (if (= :var (:type pattern))
+      (let [pf (column-fn rel (:sym pattern))]
+        (fn [t] [(ef t) (pf t)]))
+      ef)))
+
+(defmulti finish-element-fn
+  "nil, or a fn turning the raw value of find element `elem` into its result value
+  (pull). Applied after de-duplication, and lazily for qseq."
+  (fn [_ctx _rel elem] (:type elem)))
+
+(defmethod finish-element-fn :default [_ _ _] nil)
+
+(defmethod finish-element-fn :pull [ctx _ {:keys [src pattern]}]
+  (let [db (source ctx src)]
+    (when-not (db? db)
+      (throw (qerror :db.error/invalid-data-source
+                     (str (class db) " is not a valid data source type for pull."))))
+    (when (index/-history? db)
+      (throw (IllegalStateException. "Can't pull from history")))
+    (if (= :var (:type pattern))
+      (let [cache (volatile! nil)
+            parsed (fn [pat]
+                     (let [c @cache]
+                       (if (and c (identical? (key c) pat))
+                         (val c)
+                         (let [ast (pull/parse-pattern pat)]
+                           (vreset! cache (clojure.lang.MapEntry. pat ast))
+                           ast))))]
+        (fn [[e pat]] (pull/pull-from-ast db (parsed pat) e)))
+      (let [ast (pull/parse-pattern (:val pattern))]
+        (fn [e] (pull/pull-from-ast db ast e))))))
 
 (defn- key-fn [x kind]
   (case kind
@@ -558,55 +637,120 @@
     (dotimes [i (count fs)] (aset r i ((nth fs i) t)))
     (vec r)))
 
-(defn- shape-result
-  "Projects the final relation per the :find spec, :with and :keys/:syms/:strs."
-  [ctx ast rel]
-  (let [{:keys [find with return-map]} ast
-        ffs (mapv #(find-element-fn ctx rel %) (:elements find))
-        vidx (var-index rel)
-        wfs (mapv (fn [s] (let [i (long (get vidx s -1))]
-                            (when (neg? i)
-                              (throw (qerror :db.error/unbound-query-variables
-                                             (str "Query is referencing unbound variables: #{" s "}")
-                                             {:variables #{s}})))
-                            (fn [^objects t] (aget t i))))
-                  with)
-        seen (LinkedHashSet.)
+(defn- distinct-rows
+  "Raw rows (vectors aligned with the find elements), de-duplicated together with the
+  :with values."
+  [ctx rel ffs wfs]
+  (let [seen (LinkedHashSet.)
         rows (ArrayList.)]
     (each-tuple [t (:tuples rel) ctx]
       (let [fv (tuple-vec ffs t)
             k (if (seq wfs) (conj fv (tuple-vec wfs t)) fv)]
         (when (.add seen k) (.add rows fv))))
-    (let [rows (vec rows)
-          with? (seq wfs)
-          to-map (when return-map
-                   (let [ks (mapv #(key-fn % (:type return-map)) (:names return-map))]
-                     (fn [row] (zipmap ks row))))]
-      (case (:spec find)
-        :find-rel (cond
-                    to-map (mapv to-map rows)
-                    with? rows
-                    :else (HashSet. ^Collection rows))
-        :find-coll (mapv first rows)
-        :find-scalar (ffirst rows)
+    (vec rows)))
+
+(defn- group-rows
+  "Raw rows for a :find with aggregates: the relation is projected to the non-aggregate
+  elements, the aggregate arguments and :with, de-duplicated, grouped by the non-aggregate
+  elements and each aggregate applied to the values of its group."
+  [ctx rel elems kfs afs wfs aggs]
+  (let [seen (HashSet.)
+        groups (LinkedHashMap.)
+        nagg (count afs)]
+    (each-tuple [t (:tuples rel) ctx]
+      (let [k (tuple-vec kfs t)
+            a (tuple-vec afs t)]
+        (when (.add seen [k a (tuple-vec wfs t)])
+          (let [^objects cols (or (.get groups k)
+                                  (let [c (object-array nagg)]
+                                    (dotimes [i nagg] (aset c i (ArrayList.)))
+                                    (.put groups k c)
+                                    c))]
+            (dotimes [i nagg] (.add ^ArrayList (aget cols i) (nth a i)))))))
+    (let [out (ArrayList.)]
+      (doseq [[k ^objects cols] groups]
+        (check-deadline! ctx)
+        (let [row (object-array (count elems))]
+          (loop [i 0 ki 0 ai 0]
+            (when (< i (count elems))
+              (if (= :agg (:type (nth elems i)))
+                (do (aset row i ((nth aggs ai) (vec (aget cols ai))))
+                    (recur (inc i) ki (inc ai)))
+                (do (aset row i (nth k ki))
+                    (recur (inc i) (inc ki) ai)))))
+          (.add out (vec row))))
+      (vec out))))
+
+(defn- lazy-map
+  "Like `map` over a vector but one element at a time (no chunking), so that pulls are
+  realized only as the seq is consumed."
+  [f coll]
+  (lazy-seq
+   (when-let [s (seq coll)]
+     (cons (f (first s)) (lazy-map f (rest s))))))
+
+(defn- shape-result
+  "Projects the final relation per the :find spec, :with and :keys/:syms/:strs. With
+  `lazy?` (qseq) the result is a seq whose pulls are realized as it is consumed."
+  [ctx ast rel lazy?]
+  (let [{:keys [find with return-map]} ast
+        elems (:elements find)
+        agg? (boolean (some #(= :agg (:type %)) elems))
+        wfs (mapv #(column-fn rel %) with)
+        finishers (mapv #(finish-element-fn ctx rel %) elems)
+        pull? (boolean (some some? finishers))
+        rows (if agg?
+               (let [plain (remove #(= :agg (:type %)) elems)
+                     aggs (filter #(= :agg (:type %)) elems)]
+                 (group-rows ctx rel elems
+                             (mapv #(find-element-fn ctx rel %) plain)
+                             (mapv #(column-fn rel (:sym (peek (:args %)))) aggs)
+                             wfs
+                             (mapv aggregates/resolve-agg aggs)))
+               (distinct-rows ctx rel (mapv #(find-element-fn ctx rel %) elems) wfs))
+        ;; aggregate rows carry results in place; pull finishing applies to pull elements
+        pulled (if pull?
+                 (fn [row] (vec (map-indexed (fn [i v] (if-let [f (nth finishers i)] (f v) v)) row)))
+                 identity)
+        to-map (when return-map
+                 (let [ks (mapv #(key-fn % (:type return-map)) (:names return-map))]
+                   (fn [row] (zipmap ks row))))
+        spec (:spec find)]
+    (if lazy?
+      (case spec
+        :find-rel (when (seq rows) (lazy-map (if to-map (comp to-map pulled) pulled) rows))
+        :find-coll (when (seq rows) (lazy-map (comp first pulled) rows))
+        :find-scalar (some-> (first rows) pulled first seq)
         :find-tuple (when-let [row (first rows)]
-                      (if to-map (to-map row) row))))))
+                      (seq (let [r (pulled row)] (if to-map (to-map r) r)))))
+      (case spec
+        :find-rel (cond
+                    to-map (mapv (comp to-map pulled) rows)
+                    (or agg? pull? (seq wfs)) (mapv pulled rows)
+                    :else (HashSet. ^Collection rows))
+        :find-coll (mapv (comp first pulled) rows)
+        :find-scalar (some-> (first rows) pulled first)
+        :find-tuple (when-let [row (first rows)]
+                      (let [r (pulled row)] (if to-map (to-map r) r)))))))
 
 ;; ------------------------------------------------------------------ entry point
 
 (defn execute
-  "Runs parsed query `ast` against `args`. `opts`: {:timeout ms}."
+  "Runs parsed query `ast` against `args`. `opts`: {:timeout ms, :lazy true}."
   [ast args opts]
   (let [ctx {:deadline (when-let [ms (:timeout opts)]
                          (+ (System/nanoTime) (* (long ms) 1000000)))}]
     (check-sources! ast)
     (doseq [el (:elements (:find ast))]
-      (when-not (contains? (methods find-element-fn) (:type el))
-        (throw (qerror :db.error/unsupported
-                       (str "Find element " (pr-str (:type el)) " is not supported yet")
-                       {:element el}))))
+      (case (:type el)
+        :agg (aggregates/resolve-agg el)
+        (:var :pull) nil
+        (when-not (contains? (methods find-element-fn) (:type el))
+          (throw (qerror :db.error/unsupported
+                         (str "Find element " (pr-str (:type el)) " is not supported yet")
+                         {:element el})))))
     (let [[ctx rel] (bind-inputs ctx ast args)
           rel (run-clauses ctx rel (:where ast))]
-      (shape-result ctx ast rel))))
+      (shape-result ctx ast rel (boolean (:lazy opts))))))
 
 (defn parse [q] (parser/parse-query q))

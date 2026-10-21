@@ -36,5 +36,13 @@ Intentional differences between MnemonicDB and the Datomic Peer API, with ration
 | Query | `:limit`/`:offset` in a `d/query` map | Ignored (as Datomic 1.0.7745 does) | Probed equal |
 | Query | `fulltext` | Throws `:db.error/unsupported` | Not implemented |
 | Query errors | Plain exceptions for unresolvable fns, bad binding values, nil inputs | `ex-info` with `:db.error/invalid-query` (unresolvable ident/lookup ref: `:db.error/not-an-entity`) | Datomic has no keyword for these |
-| Query timeout | Datomic's cancel exception | `ex-info` `:db.error/query-timeout`, checked at clause boundaries and every 4096 tuples/datoms | Own error keyword |
+| Query timeout | `java.util.concurrent.TimeoutException` wrapped by a plain exception (no `:db/error` keyword; probed) | `ex-info` `:db.error/query-timeout` with a `TimeoutException` cause, checked at clause boundaries, every 4096 tuples/datoms, in rule rounds and in grouping | Datomic has no keyword to match |
 | Query | Deferral of predicates/fn exprs until args are bound | Same (probed: a predicate before the pattern that binds its vars works); constant-only predicates are evaluated but never filter | Probed equal |
+| Query rules | A rule call with more arguments than the rule head silently ignores the extras | `:db.error/invalid-query` | Catches typos; fewer arguments is an error in both |
+| Query rules | Rule bodies cannot use `$` explicitly (`Cannot resolve key: $`); head variable left unbound by a body fails with `IndexOutOfBoundsException` | `$` in a rule body (explicit or default) is the source of the rule call; an unbound head variable is `:db.error/insufficient-binding` | Datomic quirks |
+| Query rules | A pattern like `[?x :a ?x]` in a rule body binds ?x to the attribute values (quirk) | Matches only datoms whose entity equals the value | Datomic quirk, not reproduced |
+| Query | Top-level `(and ...)` and `(not (and ...))` fail to compile | Accepted as a conjunction | Parser keeps `:and` clauses |
+| Query pull | `(pull ?e pattern)` takes a bare symbol bound in `:in`; a `?`-prefixed pattern variable is rejected | A `?`-prefixed variable is the pattern input; a bare symbol is not accepted | The parser's variable syntax |
+| Query pull | Several pull elements over the same variable crash with an array-index error | Work | Datomic bug |
+| Query aggregates | `variance`/`stddev` over doubles sum in Datomic's set order | Sum in tuple order (equal for exactly representable data, may differ in the last digits) | Order of a de-duplicated set is unspecified |
+| Query qseq | Accepts only a query map; a scalar `.` find throws a seq error | Also accepts `(qseq q & inputs)`; scalar finds throw the same seq error; empty results are `nil`; pulls are realized one element at a time | Superset |
