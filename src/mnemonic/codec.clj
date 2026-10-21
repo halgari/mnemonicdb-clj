@@ -64,50 +64,124 @@
               (aset r i (unchecked-byte (inc (bit-and (aget r i) 0xff))))
               r))))
 
+
 (defn compare-bytes
   "Unsigned lexicographic comparison."
   ^long [^bytes a ^bytes b]
   (long (Arrays/compareUnsigned a b)))
 
-(defn- write-byte! [^ByteArrayOutputStream out ^long b]
-  (.write out (int b)))
+(definterface IKeyBuf
+  (reserve [^long n])
+  (putByte [^long b])
+  (putLong [^long x])
+  (putLongRaw [^long x])
+  (putIntRaw [^long x])
+  (putEscapedString [^String s])
+  (putByteArray [^bytes bs])
+  (toBytes []))
 
-(defn- write-raw! [^ByteArrayOutputStream out ^bytes bs]
-  (.write out bs 0 (alength bs)))
+(deftype KeyBuf [^:unsynchronized-mutable ^bytes buf ^:unsynchronized-mutable ^long pos]
+  IKeyBuf
+  (reserve [_ n]
+    (let [need (+ pos n)]
+      (when (> need (alength buf))
+        (set! buf (Arrays/copyOf buf (unchecked-int (max need (* 2 (alength buf))))))))
+    nil)
+  (putByte [this b]
+    (.reserve this 1)
+    (aset buf (unchecked-int pos) (unchecked-byte b))
+    (set! pos (+ pos 1))
+    nil)
+  (putLong [this x]
+    ;; 8 bytes big-endian with the sign bit flipped (unsigned order == signed order)
+    (.putLongRaw this (bit-xor x Long/MIN_VALUE)))
+  (putLongRaw [this x]
+    (.reserve this 8)
+    (let [b buf p pos]
+      (aset b (unchecked-int p) (unchecked-byte (unsigned-bit-shift-right x 56)))
+      (aset b (unchecked-int (+ p 1)) (unchecked-byte (unsigned-bit-shift-right x 48)))
+      (aset b (unchecked-int (+ p 2)) (unchecked-byte (unsigned-bit-shift-right x 40)))
+      (aset b (unchecked-int (+ p 3)) (unchecked-byte (unsigned-bit-shift-right x 32)))
+      (aset b (unchecked-int (+ p 4)) (unchecked-byte (unsigned-bit-shift-right x 24)))
+      (aset b (unchecked-int (+ p 5)) (unchecked-byte (unsigned-bit-shift-right x 16)))
+      (aset b (unchecked-int (+ p 6)) (unchecked-byte (unsigned-bit-shift-right x 8)))
+      (aset b (unchecked-int (+ p 7)) (unchecked-byte x))
+      (set! pos (+ p 8)))
+    nil)
+  (putIntRaw [this x]
+    (.reserve this 4)
+    (let [b buf p pos]
+      (aset b (unchecked-int p) (unchecked-byte (unsigned-bit-shift-right x 24)))
+      (aset b (unchecked-int (+ p 1)) (unchecked-byte (unsigned-bit-shift-right x 16)))
+      (aset b (unchecked-int (+ p 2)) (unchecked-byte (unsigned-bit-shift-right x 8)))
+      (aset b (unchecked-int (+ p 3)) (unchecked-byte x))
+      (set! pos (+ p 4)))
+    nil)
+  ;; Strings are stored as CESU-8: each UTF-16 code unit is encoded on its own (1-3 bytes, so a
+  ;; supplementary character becomes two 3-byte surrogate encodings). Unlike UTF-8, the byte
+  ;; order of this encoding equals Java's String.compareTo (UTF-16 code unit order), which is
+  ;; Datomic's value order; it also round-trips unpaired surrogates. Then 0x00 -> 0x00 0xFF,
+  ;; terminated by 0x00 0x00.
+  (putEscapedString [this s]
+    (let [n (.length s)]
+      (.reserve this (+ (* 3 n) 2))
+      (let [b buf]
+        (loop [i 0 p pos]
+          (if (< i n)
+            (let [c (long (int (.charAt s i)))]
+              (cond
+                (== c 0) (do (aset b (unchecked-int p) (unchecked-byte 0))
+                             (aset b (unchecked-int (+ p 1)) (unchecked-byte 0xFF))
+                             (recur (inc i) (+ p 2)))
+                (< c 0x80) (do (aset b (unchecked-int p) (unchecked-byte c))
+                               (recur (inc i) (+ p 1)))
+                (< c 0x800) (do (aset b (unchecked-int p) (unchecked-byte (bit-or 0xC0 (unsigned-bit-shift-right c 6))))
+                                (aset b (unchecked-int (+ p 1)) (unchecked-byte (bit-or 0x80 (bit-and c 0x3F))))
+                                (recur (inc i) (+ p 2)))
+                :else (do (aset b (unchecked-int p) (unchecked-byte (bit-or 0xE0 (unsigned-bit-shift-right c 12))))
+                          (aset b (unchecked-int (+ p 1)) (unchecked-byte (bit-or 0x80 (bit-and (unsigned-bit-shift-right c 6) 0x3F))))
+                          (aset b (unchecked-int (+ p 2)) (unchecked-byte (bit-or 0x80 (bit-and c 0x3F))))
+                          (recur (inc i) (+ p 3)))))
+            (do (aset b (unchecked-int p) (unchecked-byte 0))
+                (aset b (unchecked-int (+ p 1)) (unchecked-byte 0))
+                (set! pos (+ p 2)))))))
+    nil)
+  ;; Datomic orders byte arrays by length, then by signed byte values: a 4-byte length followed
+  ;; by the bytes with the sign bit flipped (self-delimiting, no escaping needed).
+  (putByteArray [this bs]
+    (let [n (alength bs)]
+      (.putIntRaw this n)
+      (.reserve this n)
+      (let [b buf p pos]
+        (dotimes [i n]
+          (aset b (unchecked-int (+ p i)) (unchecked-byte (bit-xor 0x80 (aget bs i)))))
+        (set! pos (+ p n))))
+    nil)
+  (toBytes [_] (Arrays/copyOf buf (unchecked-int pos))))
 
-(defn- write-long!
-  "8 bytes big-endian with the sign bit flipped (unsigned order == signed order)."
-  [^ByteArrayOutputStream out ^long x]
-  (write-raw! out (.array (.putLong (ByteBuffer/allocate 8) (bit-xor x Long/MIN_VALUE)))))
+(defn new-key-buf
+  "A growable, unsynchronized key writer."
+  (^KeyBuf [] (KeyBuf. (byte-array 48) 0))
+  (^KeyBuf [^long cap] (KeyBuf. (byte-array (max cap 16)) 0)))
+
+(defn key-buf-bytes
+  "Copy of the bytes written to `kb` so far."
+  ^bytes [^KeyBuf kb]
+  (.toBytes kb))
+
+(defn- write-byte! [^KeyBuf out ^long b]
+  (.putByte out b))
+
+(defn- write-long! [^KeyBuf out ^long x]
+  (.putLong out x))
 
 (defn- write-int!
   "4 bytes big-endian with the sign bit flipped, XORed with `mask` (0 or -1)."
-  [^ByteArrayOutputStream out ^long x ^long mask]
-  (write-raw! out (.array (.putInt (ByteBuffer/allocate 4)
-                                   (unchecked-int (bit-xor (bit-xor x 0x80000000) mask))))))
+  [^KeyBuf out ^long x ^long mask]
+  (.putIntRaw out (unchecked-int (bit-xor (bit-xor x 0x80000000) mask))))
 
 (defn- read-long ^long [^ByteBuffer buf]
   (bit-xor (.getLong buf) Long/MIN_VALUE))
-
-(defn- write-escaped!
-  "Bytes with 0x00 -> 0x00 0xFF, terminated by 0x00 0x00. Every byte is XORed
-  with `mask` (0x00, or 0xFF to invert the order)."
-  [^ByteArrayOutputStream out ^bytes bs ^long mask]
-  (dotimes [i (alength bs)]
-    (let [b (bit-and 0xFF (aget bs i))]
-      (write-byte! out (bit-xor b mask))
-      (when (zero? b)
-        (write-byte! out (bit-xor 0xFF mask)))))
-  (write-byte! out mask)
-  (write-byte! out mask))
-
-(defn- write-byte-array!
-  "Datomic orders byte arrays by length, then by signed byte values: a 4-byte length followed
-  by the bytes with the sign bit flipped (self-delimiting, no escaping needed)."
-  [^ByteArrayOutputStream out ^bytes bs]
-  (write-raw! out (.array (.putInt (ByteBuffer/allocate 4) (alength bs))))
-  (dotimes [i (alength bs)]
-    (write-byte! out (bit-xor 0x80 (bit-and 0xFF (aget bs i))))))
 
 (defn- read-byte-array ^bytes [^ByteBuffer buf]
   (let [n (.getInt buf)
@@ -123,28 +197,10 @@
         (if (zero? b)
           (let [n (bit-xor (bit-and 0xFF (.get buf)) mask)]
             (when-not (zero? n)
-              (write-byte! out 0)
+              (.write out 0)
               (recur)))
-          (do (write-byte! out b)
+          (do (.write out (int b))
               (recur)))))
-    (.toByteArray out)))
-
-;; Strings are stored as CESU-8: each UTF-16 code unit is encoded on its own (1-3 bytes, so a
-;; supplementary character becomes two 3-byte surrogate encodings). Unlike UTF-8, the byte
-;; order of this encoding equals Java's String.compareTo (UTF-16 code unit order), which is
-;; Datomic's value order; it also round-trips unpaired surrogates.
-(defn- utf8 ^bytes [^String s]
-  (let [n (.length s)
-        out (ByteArrayOutputStream. (+ n 8))]
-    (dotimes [i n]
-      (let [c (long (int (.charAt s i)))]
-        (cond
-          (< c 0x80) (write-byte! out c)
-          (< c 0x800) (do (write-byte! out (bit-or 0xC0 (bit-shift-right c 6)))
-                          (write-byte! out (bit-or 0x80 (bit-and c 0x3F))))
-          :else (do (write-byte! out (bit-or 0xE0 (bit-shift-right c 12)))
-                    (write-byte! out (bit-or 0x80 (bit-and (bit-shift-right c 6) 0x3F)))
-                    (write-byte! out (bit-or 0x80 (bit-and c 0x3F)))))))
     (.toByteArray out)))
 
 (defn- from-utf8 ^String [^bytes bs]
@@ -164,19 +220,52 @@
                       (recur (+ i 3)))))))
     (.toString sb)))
 
+(defn- read-string-escaped
+  "Read an escaped, terminated CESU-8 string (mask 0) straight from the buffer."
+  ^String [^ByteBuffer buf]
+  (if-not (.hasArray buf)
+    (from-utf8 (read-escaped buf 0))
+    (let [arr (.array buf)
+          off (.arrayOffset buf)
+          start (+ off (.position buf))
+          lim (+ off (.limit buf))
+          ;; ASCII fast path: no zero and no high byte before the terminator
+          i (loop [i start]
+              (if (and (< i lim) (pos? (aget arr i))) (recur (inc i)) i))]
+      (if (and (< (inc i) lim) (zero? (aget arr i)) (zero? (aget arr (inc i))))
+        (do (.position buf (unchecked-int (- (+ i 2) off)))
+            (String. arr (unchecked-int start) (unchecked-int (- i start)) StandardCharsets/ISO_8859_1))
+        (let [sb (StringBuilder. (unchecked-int (max 16 (- i start))))]
+          (loop [i start]
+            (when (>= i lim) (throw (java.nio.BufferUnderflowException.)))
+            (let [b (bit-and 0xFF (aget arr i))]
+              (cond
+                (zero? b)
+                (do (when (>= (inc i) lim) (throw (java.nio.BufferUnderflowException.)))
+                    (if (zero? (aget arr (inc i)))
+                      (.position buf (unchecked-int (- (+ i 2) off)))
+                      (do (.append sb (char 0)) (recur (+ i 2)))))
+                (< b 0x80) (do (.append sb (char b)) (recur (inc i)))
+                (< b 0xE0) (do (.append sb (char (bit-or (bit-shift-left (bit-and b 0x1F) 6)
+                                                         (bit-and 0x3F (aget arr (+ i 1))))))
+                               (recur (+ i 2)))
+                :else (do (.append sb (char (bit-or (bit-shift-left (bit-and b 0x0F) 12)
+                                                    (bit-shift-left (bit-and 0x3F (aget arr (+ i 1))) 6)
+                                                    (bit-and 0x3F (aget arr (+ i 2))))))
+                          (recur (+ i 3))))))
+          (.toString sb))))))
+
 ;; ------------------------------------------------------------------ value encoding
 
-(defn- write-sortable-double! [^ByteArrayOutputStream out ^double d]
+(defn- write-sortable-double! [^KeyBuf out ^double d]
   (let [bits (Double/doubleToLongBits d)]               ; canonical NaN
-    (write-raw! out (.array (.putLong (ByteBuffer/allocate 8)
-                                      (bit-xor bits (if (neg? bits) -1 Long/MIN_VALUE)))))))
+    (.putLongRaw out (bit-xor bits (if (neg? bits) -1 Long/MIN_VALUE)))))
 
-(defn- write-sortable-float! [^ByteArrayOutputStream out ^double f]
+(defn- write-sortable-float! [^KeyBuf out ^double f]
   (let [bits (Float/floatToIntBits (unchecked-float f))]
-    (write-raw! out (.array (.putInt (ByteBuffer/allocate 4)
-                                     (unchecked-int (bit-xor bits (if (neg? bits) -1 Integer/MIN_VALUE))))))))
+    (.putIntRaw out (unchecked-int (bit-xor bits (if (neg? bits) -1 Integer/MIN_VALUE))))))
 
-(defn- write-bigint! [^ByteArrayOutputStream out ^BigInteger n]
+(defn- write-bigint! [^KeyBuf out ^BigInteger n]
   (let [sg (.signum n)]
     (case sg
       0 (write-byte! out 1)
@@ -207,33 +296,36 @@
 (defn- write-bigdec-numeric!
   "The numeric part: zero, or sign + exponent + significant digits (trailing zeros
   stripped), so numerically equal values share it."
-  [^ByteArrayOutputStream out ^BigDecimal d]
+  [^KeyBuf out ^BigDecimal d]
   (if (zero? (.signum d))
     (write-byte! out 1)
     (let [d (.stripTrailingZeros d)
           neg (neg? (.signum d))
           mask (if neg 0xFF 0)
-          digits (utf8 (str (.abs (.unscaledValue d))))
+          ^String digits (str (.abs (.unscaledValue d)))
           exp (- (.precision d) (.scale d) 1)           ; value = 0.d1d2.. scaled: d1.d2.. x 10^exp
-          expb (.array (.putLong (ByteBuffer/allocate 8) (bit-xor exp Long/MIN_VALUE)))]
+          n (.length digits)]
       (write-byte! out (if neg 0 2))
-      (dotimes [i 8] (write-byte! out (bit-xor (bit-and 0xFF (aget expb i)) mask)))
-      (write-escaped! out digits mask))))
+      (.putLongRaw out (bit-xor (bit-xor exp Long/MIN_VALUE) (if neg -1 0)))
+      ;; digits are ASCII and never zero, so escaping is a no-op
+      (dotimes [i n] (write-byte! out (bit-xor (long (int (.charAt digits i))) mask)))
+      (write-byte! out mask)
+      (write-byte! out mask))))
 
 (defn- write-bigdec!
   "Numeric part, then the scale (format 2) as an order-preserving int: values sort
   numerically, numerically equal values by scale, and decode with their exact scale."
-  [^ByteArrayOutputStream out ^BigDecimal d]
+  [^KeyBuf out ^BigDecimal d]
   (write-bigdec-numeric! out d)
   (write-int! out (.scale d) 0))
 
 (defn bigdec-numeric-prefix
   "Tag plus numeric part of `d`: a key prefix matching `d` at every scale."
   ^bytes [^BigDecimal d]
-  (let [out (ByteArrayOutputStream.)]
+  (let [out (new-key-buf)]
     (write-byte! out tag-bigdec)
     (write-bigdec-numeric! out d)
-    (.toByteArray out)))
+    (.toBytes out)))
 
 (defn- read-bigdec ^BigDecimal [^ByteBuffer buf]
   (let [sg (bit-and 0xFF (.get buf))
@@ -253,14 +345,18 @@
         scale (bit-xor (.getInt buf) (unchecked-int 0x80000000))]
     (.setScale v (int scale) java.math.RoundingMode/UNNECESSARY)))
 
-(declare encode-value decode-value)
-
 (defn encode-value
-  "Append the tagged, order-preserving encoding of `v` to `out`."
-  [^ByteArrayOutputStream out v]
+  "Append the tagged, order-preserving encoding of `v` to the key writer `out`."
+  [^KeyBuf out v]
   (cond
     (nil? v) (write-byte! out tag-nil)
-    (or (instance? Long v) (instance? Integer v) (instance? Short v) (instance? Byte v))
+    (instance? Long v) (do (write-byte! out tag-long) (write-long! out (long v)))
+    (string? v) (do (write-byte! out tag-string) (.putEscapedString out ^String v))
+    (keyword? v) (let [^clojure.lang.Keyword k v]
+                   (write-byte! out tag-keyword)
+                   (.putEscapedString out (or (.getNamespace k) ""))
+                   (.putEscapedString out (.getName k)))
+    (or (instance? Integer v) (instance? Short v) (instance? Byte v))
     (do (write-byte! out tag-long) (write-long! out (long v)))
     (instance? Boolean v) (do (write-byte! out tag-boolean) (write-byte! out (if v 1 0)))
     (instance? BigInteger v) (do (write-byte! out tag-bigint) (write-bigint! out v))
@@ -274,15 +370,12 @@
                          (write-byte! out tag-uuid)
                          (write-long! out (.getMostSignificantBits u))
                          (write-long! out (.getLeastSignificantBits u)))
-    (string? v) (do (write-byte! out tag-string) (write-escaped! out (utf8 v) 0))
-    (keyword? v) (do (write-byte! out tag-keyword)
-                     (write-escaped! out (utf8 (or (namespace v) "")) 0)
-                     (write-escaped! out (utf8 (name v)) 0))
-    (symbol? v) (do (write-byte! out tag-symbol)
-                    (write-escaped! out (utf8 (or (namespace v) "")) 0)
-                    (write-escaped! out (utf8 (name v)) 0))
-    (instance? URI v) (do (write-byte! out tag-uri) (write-escaped! out (utf8 (str v)) 0))
-    (bytes? v) (do (write-byte! out tag-bytes) (write-byte-array! out v))
+    (symbol? v) (let [^clojure.lang.Symbol s v]
+                  (write-byte! out tag-symbol)
+                  (.putEscapedString out (or (.getNamespace s) ""))
+                  (.putEscapedString out (.getName s)))
+    (instance? URI v) (do (write-byte! out tag-uri) (.putEscapedString out (str v)))
+    (bytes? v) (do (write-byte! out tag-bytes) (.putByteArray out ^bytes v))
     (vector? v) (do (write-byte! out tag-tuple)
                     (doseq [x v] (encode-value out x))
                     (write-byte! out tag-tuple-end))
@@ -292,13 +385,9 @@
                            :value v}))))
 
 (defn value->bytes ^bytes [v]
-  (let [out (ByteArrayOutputStream.)]
+  (let [out (new-key-buf)]
     (encode-value out v)
-    (.toByteArray out)))
-
-(defn- ns-name->symbol [ns-bytes name-bytes make]
-  (let [ns (from-utf8 ns-bytes)]
-    (make (when-not (.isEmpty ns) ns) (from-utf8 name-bytes))))
+    (.toBytes out)))
 
 (defn decode-value
   "Decode one value from `buf`, advancing its position."
@@ -316,10 +405,14 @@
       0x15 (read-bigdec buf)
       0x16 (Date. (read-long buf))
       0x17 (let [msb (read-long buf)] (UUID. msb (read-long buf)))
-      0x18 (from-utf8 (read-escaped buf 0))
-      0x19 (let [n (read-escaped buf 0)] (ns-name->symbol n (read-escaped buf 0) keyword))
-      0x1A (let [n (read-escaped buf 0)] (ns-name->symbol n (read-escaped buf 0) symbol))
-      0x1B (URI. (from-utf8 (read-escaped buf 0)))
+      0x18 (read-string-escaped buf)
+      0x19 (let [ns (read-string-escaped buf)
+                 n (read-string-escaped buf)]
+             (keyword (when-not (.isEmpty ns) ns) n))
+      0x1A (let [ns (read-string-escaped buf)
+                 n (read-string-escaped buf)]
+             (symbol (when-not (.isEmpty ns) ns) n))
+      0x1B (URI. (read-string-escaped buf))
       0x1C (read-byte-array buf)
       0x1D (loop [acc (transient [])]
              (if (zero? (bit-and 0xFF (.get buf (.position buf))))
@@ -332,89 +425,108 @@
 ;; ------------------------------------------------------------------ longs as bytes
 
 (defn long->bytes ^bytes [^long x]
-  (.array (.putLong (ByteBuffer/allocate 8) x)))
+  (let [b (byte-array 8)]
+    (dotimes [i 8]
+      (aset b i (unchecked-byte (unsigned-bit-shift-right x (* 8 (- 7 i))))))
+    b))
 
 (defn bytes->long ^long [^bytes b]
-  (.getLong (ByteBuffer/wrap b)))
+  (loop [i 0 acc 0]
+    (if (< i 8)
+      (recur (inc i) (bit-or (bit-shift-left acc 8) (bit-and 0xFF (aget b i))))
+      acc)))
 
 ;; ------------------------------------------------------------------ keys
 
-(def ^:private layouts
-  "Component kinds per index, in key order. :l long id, :v tagged value, :r raw ref."
-  {:eavt [:l :l :v :l]
-   :aevt [:l :l :v :l]
-   :avet [:l :v :l :l]
-   :vaet [:r :l :l :l]})
+(defn- unknown-index [index]
+  (throw (ex-info (str "Unknown index " index)
+                  {:db/error :db.error/unsupported
+                   :cognitect.anomalies/category :cognitect.anomalies/incorrect})))
 
-(defn- layout [index]
-  (or (get layouts index)
-      (throw (ex-info (str "Unknown index " index)
-                      {:db/error :db.error/unsupported
-                       :cognitect.anomalies/category :cognitect.anomalies/incorrect}))))
+(defn- value-pos
+  "Position of the tagged value component in the key of `index`; every other component
+  is a long (VAET's leading value is a raw ref)."
+  ^long [index]
+  (case index
+    :eavt 2
+    :aevt 2
+    :avet 1
+    :vaet -1
+    (unknown-index index)))
 
-(defn- write-component! [^ByteArrayOutputStream out kind x]
-  (case kind
-    :v (encode-value out x)
-    (write-long! out (long x))))
+(defn- write-prefix!
+  [^KeyBuf out index components numeric?]
+  (let [vp (value-pos index)
+        n (min 4 (count components))]
+    (dotimes [i n]
+      (let [x (nth components i)]
+        (if (== i vp)
+          (if (and numeric? (== i (dec n)) (instance? BigDecimal x))
+            (do (write-byte! out tag-bigdec)
+                (write-bigdec-numeric! out x))
+            (encode-value out x))
+          (write-long! out (long x)))))))
 
 (defn encode-prefix
   "Encode the leading `components` (in index order) of a key for `index`."
   ^bytes [index components]
-  (let [out (ByteArrayOutputStream.)]
-    (loop [kinds (seq (layout index)) cs (seq components)]
-      (when (and kinds cs)
-        (write-component! out (first kinds) (first cs))
-        (recur (next kinds) (next cs))))
-    (.toByteArray out)))
+  (let [out (new-key-buf)]
+    (write-prefix! out index components false)
+    (.toBytes out)))
 
 (defn encode-prefix-numeric
   "Like `encode-prefix`, but a BigDecimal as the last component is encoded without its
   scale, so the prefix matches every numerically equal value (as Datomic's index
   lookups and ranges do)."
   ^bytes [index components]
-  (let [out (ByteArrayOutputStream.)]
-    (loop [kinds (seq (layout index)) cs (seq components)]
-      (when (and kinds cs)
-        (let [kind (first kinds) x (first cs)]
-          (if (and (= kind :v) (nil? (next cs)) (instance? BigDecimal x))
-            (write-raw! out (bigdec-numeric-prefix x))
-            (write-component! out kind x)))
-        (recur (next kinds) (next cs))))
-    (.toByteArray out)))
+  (let [out (new-key-buf)]
+    (write-prefix! out index components true)
+    (.toBytes out)))
 
 (defn encode-key
   ^bytes [index e a v tx]
-  (encode-prefix index (case index
-                         :eavt [e a v tx]
-                         :aevt [a e v tx]
-                         :avet [a v e tx]
-                         :vaet [v a e tx])))
+  (let [out (new-key-buf)]
+    (case index
+      :eavt (do (write-long! out (long e)) (write-long! out (long a))
+                (encode-value out v) (write-long! out (long tx)))
+      :aevt (do (write-long! out (long a)) (write-long! out (long e))
+                (encode-value out v) (write-long! out (long tx)))
+      :avet (do (write-long! out (long a)) (encode-value out v)
+                (write-long! out (long e)) (write-long! out (long tx)))
+      :vaet (do (write-long! out (long v)) (write-long! out (long a))
+                (write-long! out (long e)) (write-long! out (long tx)))
+      (unknown-index index))
+    (.toBytes out)))
 
 (defn decode-key
   "Decode an index key into a Datom (added = true)."
   ^Datom [index ^bytes k]
-  (let [buf (ByteBuffer/wrap k)
-        [c1 c2 c3 c4] (mapv (fn [kind] (if (= kind :v) (decode-value buf) (read-long buf)))
-                            (layout index))]
+  (let [buf (ByteBuffer/wrap k)]
     (case index
-      :eavt (datom/datom c1 c2 c3 c4 true)
-      :aevt (datom/datom c2 c1 c3 c4 true)
-      :avet (datom/datom c3 c1 c2 c4 true)
-      :vaet (datom/datom c3 c2 c1 c4 true))))
+      :eavt (let [e (read-long buf) a (read-long buf) v (decode-value buf) tx (read-long buf)]
+              (Datom. e a v tx true))
+      :aevt (let [a (read-long buf) e (read-long buf) v (decode-value buf) tx (read-long buf)]
+              (Datom. e a v tx true))
+      :avet (let [a (read-long buf) v (decode-value buf) e (read-long buf) tx (read-long buf)]
+              (Datom. e a v tx true))
+      :vaet (let [v (read-long buf) a (read-long buf) e (read-long buf) tx (read-long buf)]
+              (Datom. e a v tx true))
+      (unknown-index index))))
 
 ;; ------------------------------------------------------------------ log entries
 
 (defn encode-log-entry
   "Count (int), then per datom: E A V added(1 byte). TX is the log key."
   ^bytes [datoms]
-  (let [out (ByteArrayOutputStream.)]
-    (write-raw! out (.array (.putInt (ByteBuffer/allocate 4) (int (count datoms)))))
+  (let [n (count datoms)
+        ^KeyBuf out (new-key-buf (+ 8 (* 40 n)))]
+    (.putIntRaw out n)
     (doseq [^Datom d datoms]
       (write-long! out (.-e d))
       (write-long! out (.-a d))
       (encode-value out (.-v d))
       (write-byte! out (if (.-added d) 1 0)))
-    (.toByteArray out)))
+    (.toBytes out)))
 
 (defn decode-log-entry
   [^long tx ^bytes b]
@@ -426,5 +538,5 @@
               a (read-long buf)
               v (decode-value buf)
               added (not (zero? (.get buf)))]
-          (recur (inc i) (conj! acc (datom/datom e a v tx added))))
+          (recur (inc i) (conj! acc (Datom. e a v tx added))))
         (persistent! acc)))))
