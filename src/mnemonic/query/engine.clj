@@ -276,11 +276,18 @@
                  (every? (fn [[p q]] (= (datom-comp d p) (datom-comp d q))) same))))))))
 
 (defn- scan!
-  "Calls `(f datom)` for every datom of `db` in the index range that passes `pass?`."
-  [db [idx prefix] pass? f]
-  (reduce (fn [_ d] (when (pass? d) (f d)) nil)
-          nil
-          (index/datoms-iterable db idx prefix)))
+  "Calls `(f datom)` for every datom of `db` in the index range that passes `pass?`,
+  checking the query deadline every 4096 datoms."
+  [ctx db [idx prefix] pass? f]
+  (let [cnt (long-array 1)]
+    (reduce (fn [_ d]
+              (let [c (aget cnt 0)]
+                (aset cnt 0 (inc c))
+                (when (zero? (bit-and c 4095)) (check-deadline! ctx)))
+              (when (pass? d) (f d))
+              nil)
+            nil
+            (index/datoms-iterable db idx prefix))))
 
 (defn- new-values
   "Object[] of the free-variable values taken from datom `d`."
@@ -308,7 +315,7 @@
         (when-let [res (resolve-pattern db specs (object-array 0) true)]
           (when-let [sp (scan-plan res terms)]
             (when-let [pass? (datom-filter res (nth sp 2) same)]
-              (scan! db sp pass?
+              (scan! ctx db sp pass?
                      (fn [^Datom d]
                        (check-deadline! ctx)
                        (each-tuple [t tuples ctx] (emit! t d)))))))
@@ -325,7 +332,7 @@
                           ^ArrayList g (or (.get groups k)
                                            (let [g (ArrayList.)] (.put groups k g) g))]
                       (.add g t))))
-                (scan! db sp pass?
+                (scan! ctx db sp pass?
                        (fn [^Datom d]
                          (when-let [^ArrayList g (.get groups (mapv #(datom-comp d %) bound-pos))]
                            (dotimes [i (.size g)] (emit! (.get g i) d)))))))))
@@ -336,7 +343,7 @@
           (when-let [res (resolve-pattern db specs t false)]
             (when-let [sp (scan-plan res terms)]
               (when-let [pass? (datom-filter res (nth sp 2) same)]
-                (scan! db sp pass? (fn [^Datom d] (emit! t d)))))))))
+                (scan! ctx db sp pass? (fn [^Datom d] (emit! t d)))))))))
     result))
 
 (defn- exec-coll-pattern [ctx coll rel plan]
@@ -347,7 +354,7 @@
         groups (HashMap.)
         const-specs (vec (keep-indexed (fn [p s] (when (= :const (:kind s)) [p (:val s)])) specs))]
     (each-tuple [t tuples ctx]
-      (let [k (mapv #(aget t (long (:idx (nth specs %)))) bound-pos)
+      (let [k (mapv #(fns/normalize-value (aget t (long (:idx (nth specs %))))) bound-pos)
             ^ArrayList g (or (.get groups k) (let [g (ArrayList.)] (.put groups k g) g))]
         (.add g t)))
     (when-not (.isEmpty groups)
@@ -355,7 +362,7 @@
         (check-deadline! ctx)
         (when (and (every? (fn [[p c]] (= c (nth row p))) const-specs)
                    (every? (fn [[p q]] (= (nth row p) (nth row q))) same))
-          (when-let [^ArrayList g (.get groups (mapv #(nth row %) bound-pos))]
+          (when-let [^ArrayList g (.get groups (mapv #(fns/normalize-value (nth row %)) bound-pos))]
             (let [extra (when-not no-new?
                           (let [e (object-array (count new-pos))]
                             (dotimes [i (count new-pos)] (aset e i (nth row (nth new-pos i))))

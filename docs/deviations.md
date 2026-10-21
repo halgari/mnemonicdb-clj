@@ -30,3 +30,11 @@ Intentional differences between MnemonicDB and the Datomic Peer API, with ration
 | Entity | `str`/print of a touched entity includes cached reverse lookups | Prints forward attributes only | Cosmetic |
 | Pull | String attribute names (`["*"]` gives string keys; `[":p/name"]`) | Rejected with `:db.error/invalid-attr-spec` | Rarely used |
 | Pull | `[* {:p/boss 1}]` (wildcard plus depth recursion) throws an NPE | Returns the expected result | Datomic bug |
+| Query | `:in $` with no arguments throws `:db.error/too-few-inputs` (a query without `:in` accepts zero args) | Both accepted; `$` fails with `:db.error/invalid-data-source` on use | The parser AST does not distinguish the implicit `[$]` from an explicit `:in $` |
+| Query fns | Allowlist plus anything the Datomic compiler resolves | Allowlist, any `clojure.core` var, auto-required qualified vars, `Class/static`, `.instance`, and `?f` variables holding a fn | Superset; matches probed Datomic for clojure.core, interop and qualified names |
+| Query fns | `< > <= >=` binary only | Same (compare-based, works on strings/Dates); `+ - * /` etc. variadic | Probed equal |
+| Query | `:limit`/`:offset` in a `d/query` map | Ignored (as Datomic 1.0.7745 does) | Probed equal |
+| Query | `fulltext` | Throws `:db.error/unsupported` | Not implemented |
+| Query errors | Plain exceptions for unresolvable fns, bad binding values, nil inputs | `ex-info` with `:db.error/invalid-query` (unresolvable ident/lookup ref: `:db.error/not-an-entity`) | Datomic has no keyword for these |
+| Query timeout | Datomic's cancel exception | `ex-info` `:db.error/query-timeout`, checked at clause boundaries and every 4096 tuples/datoms | Own error keyword |
+| Query | Deferral of predicates/fn exprs until args are bound | Same (probed: a predicate before the pattern that binds its vars works); constant-only predicates are evaluated but never filter | Probed equal |

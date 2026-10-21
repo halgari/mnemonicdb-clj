@@ -13,6 +13,7 @@
     :db/cardinality :db.cardinality/one :db/index true}
    {:db/id "t" :db/ident :p/tags :db/valueType :db.type/string :db/cardinality :db.cardinality/many}
    {:db/id "b" :db/ident :p/boss :db/valueType :db.type/ref :db/cardinality :db.cardinality/one}
+   {:db/id "s" :db/ident :p/self :db/valueType :db.type/ref :db/cardinality :db.cardinality/one}
    {:db/id "k" :db/ident :p/kind :db/valueType :db.type/ref :db/cardinality :db.cardinality/one}
    {:db/id "f" :db/ident :p/f :db/valueType :db.type/float :db/cardinality :db.cardinality/one}
    {:db/id "g" :db/ident :p/big :db/valueType :db.type/bigint :db/cardinality :db.cardinality/one}
@@ -20,7 +21,7 @@
 
 (def ^:private people
   [{:db/id "al" :p/name "Al" :p/age 10 :p/city "X" :p/tags ["x" "y"] :p/kind :kind/a
-    :p/f (float 1.5) :p/big 5N}
+    :p/f (float 1.5) :p/big 5N :p/self "al"}
    {:db/id "bo" :p/name "Bo" :p/age 20 :p/city "X" :p/boss "al" :p/kind :kind/b}
    {:db/id "cy" :p/name "Cy" :p/age 30 :p/city "Y" :p/boss "bo"}])
 
@@ -78,13 +79,13 @@
       (is (= #{} (m/q '[:find ?e :where [?e :p/boss 99999]] db))))
     (testing "variable attribute"
       (let [r (m/q '[:find ?a ?v :in $ ?e :where [?e ?a ?v]] db (eid "Al"))]
-        (is (= 8 (count r)))
+        (is (= 9 (count r)))
         (is (contains? r [(m/entid db :p/name) "Al"]) "attributes come back as entity ids")
         (is (contains? r [(m/entid db :p/tags) "y"])))
       (is (= #{[(m/entid db :p/name)]}
              (m/q '[:find ?a :in $ ?e :where [?e ?a "Al"]] db (eid "Al")))))
     (testing "variable attribute with value only uses refs"
-      (is (= #{[(eid "Bo") (m/entid db :p/boss)]}
+      (is (= #{[(eid "Bo") (m/entid db :p/boss)] [(eid "Al") (m/entid db :p/self)]}
              (m/q '[:find ?e ?a :in $ ?v :where [?e ?a ?v]] db (eid "Al"))))
       (is (= #{} (m/q '[:find ?e ?a :in $ ?v :where [?e ?a ?v]] db "Al"))))
     (testing "full scan is an error"
@@ -97,7 +98,11 @@
       (is (= #{} (m/q '[:find ?e :where [?e :p/age 10 _ false]] db)))
       (is (= #{[(eid "Al")]} (m/q '[:find ?e :where [?e :p/age 10 _ true]] db))))
     (testing "same variable twice"
-      (is (= #{} (m/q '[:find ?e :where [?e :p/age ?e]] db))))
+      (is (= #{} (m/q '[:find ?e :where [?e :p/age ?e]] db)))
+      (is (= #{[(eid "Al")]} (m/q '[:find ?e :where [?e :p/self ?e]] db)))
+      (is (= #{[1]} (m/q '[:find ?x :in $c [?y ...] :where [$c ?x ?y]] [[1 2]] [(int 2)]))
+          "collection-source join keys are normalized (Integer vs Long)")
+      (is (= #{[1 1]} (m/q '[:find ?x ?y :in $c :where [$c ?x ?y ?x]] [[1 1 1] [1 2 3]]))))
     (testing "value coercions"
       (is (= #{} (m/q '[:find ?e :where [?e :p/age 10.0]] db)))
       (is (= #{[(eid "Al")]} (m/q '[:find ?e :in $ ?v :where [?e :p/age ?v]] db (int 10))))

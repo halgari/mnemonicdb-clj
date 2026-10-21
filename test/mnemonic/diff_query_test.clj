@@ -300,17 +300,26 @@
     @(d/transact cd [[:db/add [:p/name "Al"] :p/age 11] [:db/retract [:p/name "Bo"] :p/age 20]])
     @(m/transact cm [[:db/add [:p/name "Al"] :p/age 11] [:db/retract [:p/name "Bo"] :p/age 20]])
     (let [t (dec (d/basis-t (d/db cd)))
-          layers (try [(m/as-of (m/db cm) t) (m/history (m/db cm))]
-                      (catch Throwable _ nil))]
-      (when layers
-        (let [[asof-m hist-m] layers
-              asof-d (d/as-of (d/db cd) t)
-              hist-d (d/history (d/db cd))]
-          (doseq [[q ds ms] [['[:find ?n ?a :where [?e :p/name ?n] [?e :p/age ?a]] asof-d asof-m]
-                             ['[:find ?a :where [?e :p/name "Al"] [?e :p/age ?a]] hist-d hist-m]
-                             ['[:find ?a ?ad :where [?e :p/name "Al"] [?e :p/age ?a _ ?ad]] hist-d hist-m]
-                             ['[:find ?a ?tx ?ad :where [?e :p/age ?a ?tx ?ad]] hist-d hist-m]
-                             ['[:find ?a :where [?e :p/age ?a _ false]] hist-d hist-m]
-                             ['[:find ?e ?a :where [?e :p/age 20]] hist-d hist-m]]]
-            (let [a (canon (d/q q ds)) b (canon (m/q q ms))]
-              (is (= a b) (pr-str q)))))))))
+          asof-m (m/as-of (m/db cm) t) asof-d (d/as-of (d/db cd) t)
+          since-m (m/since (m/db cm) t) since-d (d/since (d/db cd) t)
+          hist-m (m/history (m/db cm)) hist-d (d/history (d/db cd))]
+      (doseq [[q ds ms] [['[:find ?n ?a :where [?e :p/name ?n] [?e :p/age ?a]] asof-d asof-m]
+                         ['[:find ?n ?a :where [?e :p/name ?n] [?e :p/age ?a]] since-d since-m]
+                         ['[:find ?n ?a :where [?e :p/name ?n] [?e :p/age ?a]] hist-d hist-m]
+                         ['[:find ?a :where [?e :p/name "Al"] [?e :p/age ?a]] hist-d hist-m]
+                         ['[:find ?a ?ad :where [?e :p/name "Al"] [?e :p/age ?a _ ?ad]] hist-d hist-m]
+                         ['[:find ?a ?tx ?ad :where [?e :p/age ?a ?tx ?ad]] hist-d hist-m]
+                         ['[:find ?a ?tx ?ad :where [?e :p/age ?a ?tx ?ad]] since-d since-m]
+                         ['[:find ?a :where [?e :p/age ?a _ false]] hist-d hist-m]
+                         ['[:find ?e ?tx :where [?e :p/age 20 ?tx false]] hist-d hist-m]
+                         ['[:find ?e :where [?e :p/age 20]] hist-d hist-m]
+                         ['[:find ?e :where [?e :p/age 20]] asof-d asof-m]
+                         ['[:find ?v ?ad :where [?e :p/tags ?v _ ?ad]] hist-d hist-m]
+                         ['[:find ?a ?v :where [?e :p/name "Al"] [?e ?a ?v _ false]] hist-d hist-m]
+                         ['[:find ?e ?a :where [?e ?a]] hist-d hist-m] ;; full scan error on both sides
+                         ['[:find ?e ?a :where [?e :p/age 20]] hist-d hist-m]]] ;; unbound ?a: both error
+        (let [a (try {:ok (canon (d/q q ds))} (catch Throwable e {:err (error-kind e)}))
+              b (try {:ok (canon (m/q q ms))} (catch Throwable e {:err (error-kind e)}))]
+          (if (:err a)
+            (is (:err b) (pr-str q))
+            (is (= a b) (pr-str q))))))))
