@@ -261,13 +261,7 @@
 (defn- unsupported-write []
   (throw (UnsupportedOperationException. "Entities are read-only")))
 
-(declare entity-seq ensure-all! load-forward)
-
-(def ^:private eager?
-  "Read every forward attribute on the first forward-attribute miss: one EAVT [e] read
-  per entity (one segment-cache granule, as a Datomic entity reads its segment) instead
-  of one [e a] read per attribute. System property mnemonic.entity.eager (default true)."
-  (not= "false" (System/getProperty "mnemonic.entity.eager")))
+(declare entity-seq)
 
 (definterface IEntityKeys
   (keySet []))
@@ -275,7 +269,7 @@
 (deftype Entity [db ^long eid cache]
   ILookup
   (valAt [this k] (.valAt this k nil))
-  (valAt [this k nf]
+  (valAt [_ k nf]
     (let [^EntityCache cache cache
           k (if (and (string? k) (str/starts-with? ^String k ":")) (keyword (subs ^String k 1)) k)]
       (cond
@@ -285,7 +279,7 @@
           (let [cached (.getAttr cache k miss)
                 v (if (identical? cached miss)
                     (let [fk (reverse-attr-name k)
-                          v (if fk (load-reverse db eid k fk) (load-forward this k))]
+                          v (if fk (load-reverse db eid k fk) (load-attr db eid k))]
                       (.putAttr cache k v)
                       v)
                     cached)]
@@ -342,18 +336,6 @@
       (let [entries (load-all (.-db e) (.-eid e))]
         (.setAll cache entries)
         entries))))
-
-(defn- load-forward
-  "Value of forward attribute `k` of entity `e`, or ::none."
-  [^Entity e k]
-  (let [db (.-db e)]
-    (if eager?
-      (if-let [^Attr attr (schema/attr (index/-schema db) k)]
-        (do (ensure-all! e)
-            (let [v (.getAttr ^EntityCache (.-cache e) (:ident attr) miss)]
-              (if (identical? v miss) none v)))
-        none)
-      (load-attr db (.-eid e) k))))
 
 (defn- entity-seq [^Entity e]
   (map (fn [[k _]] (MapEntry/create k (get e k))) (ensure-all! e)))

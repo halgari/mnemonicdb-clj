@@ -200,8 +200,8 @@
       (is (= :nf (get b :p/age :nf)))
       (is (not (contains? b :p/age))))))
 
-(deftest one-read-per-entity-test
-  ;; the first forward attribute read loads the whole entity (one EAVT [e] read)
+(deftest attribute-resolution-test
+  ;; absent, unknown and renamed attributes (reads served from cached [e] segments)
   (let [{:keys [db c ids]} (fixture)
         a (m/entity db (ids "a"))]
     (is (= 30 (:p/age a)))
