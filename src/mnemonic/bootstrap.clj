@@ -15,7 +15,7 @@
 (def ^:private meta-key (.getBytes "meta" StandardCharsets/UTF_8))
 (def ^:private empty-bytes (byte-array 0))
 
-(def initial-meta {:format 1 :next-t 1000 :next-db-n 73})
+(def initial-meta {:format codec/format-version :next-t 1000 :next-db-n 73})
 
 (defn bootstrap-datoms
   "The bootstrap datoms as a vector of Datoms (added = true), in file order."

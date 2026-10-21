@@ -6,7 +6,6 @@
             [mnemonic.datom :as datom]
             [mnemonic.db :as db]
             [mnemonic.index :as index]
-            [mnemonic.rocks :as rocks]
             [mnemonic.schema :as schema]
             [mnemonic.tx :as tx])
   (:import (java.util Arrays Comparator Date Iterator Map$Entry NavigableMap TreeMap)
@@ -38,10 +37,7 @@
       (and (not hist?) prefix) (index/-view b idx prefix)
       (not hist?) (index/-seek-view b idx start)
       prefix (index/-seek-history b idx prefix)
-      :else (let [store (.-store b)]
-              (index/seek-cursor
-               (db/->GuardedCursor store (rocks/raw-cursor store (history-cf idx) (.-snap b)))
-               start idx true)))))
+      :else (db/history-seek-cursor b idx start))))
 
 ;; ------------------------------------------------------------------ overlay (With)
 

@@ -39,8 +39,21 @@
   "Releases a connection."
   [connection] (conn/release connection))
 
+(defn shutdown
+  "Releases every connection (closing file stores). With `shutdown-clojure?` true, also
+  shuts down Clojure's agent thread pools."
+  [shutdown-clojure?] (conn/shutdown shutdown-clojure?))
+
+(defn get-database-names
+  "Names of the databases matching `uri`, which has `*` in place of the database name
+  (mnemonic:mem://* or mnemonic:file:///dir/*); nil when there are none."
+  [uri] (conn/get-database-names uri))
+
 (defn release-db
-  "Releases the RocksDB snapshot held by `db` now instead of when it is collected."
+  "Releases the RocksDB snapshot `db` reads from (for views and with-dbs: the snapshot
+  of the underlying db) now instead of when it is collected. Later reads of a released
+  db throw :db.error/db-released; iterations already started complete. Releasing a
+  connection's current db is safe: the connection publishes a fresh db."
   [db*] (dbns/release-db (index/-raw db*)))
 
 (defn db

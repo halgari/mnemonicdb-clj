@@ -14,6 +14,13 @@
 
 (set! *warn-on-reflection* true)
 
+;; ------------------------------------------------------------------ format
+
+(def format-version
+  "On-disk format version, stored in the store meta and checked on connect. Bump it on
+  any change to key or value encodings."
+  1)
+
 ;; ------------------------------------------------------------------ tags
 
 (def ^:const tag-tuple-end 0x00)

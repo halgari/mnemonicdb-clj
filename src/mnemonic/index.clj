@@ -44,13 +44,11 @@
     (and (>= (alength k) n)
          (Arrays/equals k 0 n prefix 0 n))))
 
-(defn- current-key
-  "Key under `raw` if valid and (when `prefix` is non-nil) within the prefix, else nil."
-  ^bytes [^IRawCursor raw ^bytes prefix]
-  (when (.isValid raw)
-    (let [k (.key raw)]
-      (when (or (nil? prefix) (starts-with? k prefix))
-        k))))
+(defn- in-prefix
+  "`k` when non-nil and (when `prefix` is non-nil) within the prefix, else nil."
+  ^bytes [^bytes k ^bytes prefix]
+  (when (and k (or (nil? prefix) (starts-with? k prefix)))
+    k))
 
 (deftype RangeCursor [^IRawCursor raw ^bytes prefix index history?
                       ^:unsynchronized-mutable ^bytes k
@@ -60,8 +58,7 @@
   (valid [_] (some? k))
   (advance [_]
     (when k
-      (.next raw)
-      (set! k (current-key raw prefix))
+      (set! k (in-prefix (.nextKey raw) prefix))
       (set! d nil))
     nil)
   (key [_] k)
@@ -84,8 +81,7 @@
 (defn- range-cursor [^IRawCursor raw ^bytes start ^bytes prefix index history?]
   (.incrementAndGet open-cursors)
   (try
-    (.seek raw start)
-    (->RangeCursor raw prefix index history? (current-key raw prefix) nil false)
+    (->RangeCursor raw prefix index history? (in-prefix (.seekKey raw start) prefix) nil false)
     (catch Throwable t
       (.decrementAndGet open-cursors)
       (.close raw)

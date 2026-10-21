@@ -1,5 +1,6 @@
 (ns mnemonic.log
   "Transaction log (tx-range) and tx-report queues."
+  (:refer-clojure :exclude [chunk])
   (:require [mnemonic.bootstrap :as bootstrap]
             [mnemonic.codec :as codec]
             [mnemonic.rocks :as rocks])
