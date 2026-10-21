@@ -273,6 +273,76 @@
         (reset! stop true)
         (is (every? #(>= (long @%) 0) workers))))))
 
+;; Regression (Fable I1): a cursor close used to push its slot to the pool and drain the
+;; snapshot's pools (locking other slots) while still holding its own slot monitor, so two
+;; concurrent closes racing a release could take each other's slot monitors in opposite
+;; order. Many rounds, several closing threads, release at a random moment; a deadlock
+;; shows up as a timeout.
+(deftest concurrent-closes-racing-release-do-not-deadlock
+  (let [s (r/open-store {:path "mem-pool-deadlock" :mem? true})]
+    (try
+      (r/write! s (for [i (range 50)] [:put :eavt (bs 0 i) (bs i)]) {})
+      (dotimes [round 400]
+        (let [snap (r/snapshot s)
+              go (promise)
+              workers (doall
+                       (for [w (range 6)]
+                         (future
+                           @go
+                           (loop [n 0]
+                             (when (< n 40)
+                               (let [r (try
+                                         ;; two leases at once so there are several slots in flight
+                                         (with-open [a (r/raw-cursor s :eavt snap)
+                                                     b (r/raw-cursor s :eavt snap)]
+                                           (.seekKey a (bs 0 0))
+                                           (.seekKey b (bs 0 1))
+                                           :ok)
+                                         (catch clojure.lang.ExceptionInfo e
+                                           (let [k (:db/error (ex-data e))]
+                                             (if (= k :db.error/db-released) :released (throw e)))))]
+                                 (when-not (= r :released) (recur (inc n)))))))))]
+          (deliver go true)
+          (Thread/sleep 0 (rand-int 200000))
+          (let [rel (future (r/release-snapshot s snap))]
+            (doseq [w (cons rel workers)]
+              (when (= ::timeout (deref w 10000 ::timeout))
+                (throw (ex-info (str "deadlock in round " round) {:round round})))))))
+      (is (zero? (count (:cursors s))) "everything drained")
+      (is (zero? (count (:snaps s))))
+      (finally (r/close-store s)))))
+
+(deftest retire-snapshot-drains-idle-without-releasing
+  (let [s (r/open-store {:path "mem-pool-retire" :mem? true})]
+    (try
+      (r/write! s [[:put :eavt (bs 1) (bs 1)] [:put :aevt (bs 1) (bs 1)]] {})
+      (let [snap (r/snapshot s)
+            leased (r/raw-cursor s :eavt snap)]
+        (.close (r/raw-cursor s :aevt snap))
+        (.close (r/raw-cursor s :eavt snap))
+        (.seekToFirst leased)
+        (is (= 3 (count (:cursors s))))
+        (r/retire-snapshot! s snap)
+        (is (= 1 (count (:cursors s))) "idle iterators closed, the leased one stays")
+        (is (false? (r/snapshot-released? snap)))
+        (is (true? (.isValid leased)) "a leased cursor keeps working")
+        (with-open [c (r/raw-cursor s :aevt snap)]
+          (is (= [1] (ub (.seekKey c (bs 1)))) "later reads open fresh iterators"))
+        (.close leased)
+        (is (= 2 (count (:cursors s))) "and they pool again")
+        (r/release-snapshot s snap)
+        (is (zero? (count (:cursors s)))))
+      (finally (r/close-store s)))))
+
+(deftest mem-store-writes-without-wal
+  (let [s (r/open-store {:path "mem-nowal" :mem? true})]
+    (try
+      ;; sync? true on a mem store must not fail (sync requires the WAL)
+      (r/write! s [[:put :eavt (bs 1) (bs 1)]] {:sync? true})
+      (with-open [c (r/raw-cursor s :eavt nil)]
+        (is (= [1] (ub (.seekKey c (bs 1))))))
+      (finally (r/close-store s)))))
+
 ;; ------------------------------------------------------------------ prefix bloom filters
 
 (defn- prefix-scan

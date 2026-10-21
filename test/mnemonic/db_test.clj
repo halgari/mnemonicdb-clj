@@ -162,3 +162,25 @@
                                          (recur (conj acc dv)))
                                        acc))))
             (.close m)))))))
+
+(deftest retire-pool-bounds-pooled-iterators
+  (testing "retiring each superseded db keeps live pooled iterators bounded"
+    (with-db
+      (fn [store db0]
+        (let [prefix (codec/encode-prefix :eavt [])
+              read! (fn [db] (count (seq (ix/datoms-iterable db :eavt (codec/encode-prefix :eavt [0])))))
+              baseline (count (:cursors store))
+              final (loop [i 0 prev db0]
+                      (if (< i 2000)
+                        (let [nxt (db/successor-db store prev (+ 72 i 1) (db/db-meta prev) false)]
+                          (read! prev)                     ; the writer reads through the published db
+                          (read! prev)
+                          (db/retire-pool! prev)
+                          (recur (inc i) nxt))
+                        prev))]
+          (is (<= (- (count (:cursors store)) baseline) 8)
+              "only the current db's pool holds iterators")
+          (testing "a retired db is still readable and re-pools"
+            (is (= (read! db0) (read! db0)))
+            (is (not (db/released? db0))))
+          (db/release-db final))))))

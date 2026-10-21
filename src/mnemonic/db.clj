@@ -52,6 +52,15 @@
   [^Base db]
   (rocks/snapshot-released? (.-snap db)))
 
+(defn retire-pool!
+  "Closes the idle pooled native iterators of `db` without releasing its snapshot. For a
+  superseded published db: `db` and every cursor on it stay valid (later reads open fresh
+  iterators), but it no longer pins memtables/SSTs through idle iterators until the GC
+  runs its Cleaner. Writer thread, after publishing the successor."
+  [^Base db]
+  (rocks/retire-snapshot! (.-store db) (.-snap db))
+  nil)
+
 (defn db-meta
   "The store meta (counters) as of this db's snapshot."
   [^Base db]
