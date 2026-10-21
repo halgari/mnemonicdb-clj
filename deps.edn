@@ -1,0 +1,12 @@
+{:paths ["src" "resources"]
+ :deps {org.clojure/clojure {:mvn/version "1.12.6"}
+        org.rocksdb/rocksdbjni {:mvn/version "11.8.1"}}
+ :aliases
+ {:test {:extra-paths ["test"]
+         :extra-deps {io.github.cognitect-labs/test-runner {:git/tag "v0.5.1" :git/sha "dfb30dd"}
+                      org.clojure/test.check {:mvn/version "1.1.1"}
+                      com.datomic/peer {:mvn/version "1.0.7745"}
+                      org.slf4j/slf4j-nop {:mvn/version "2.0.17"}}
+         :jvm-opts ["--enable-native-access=ALL-UNNAMED"]
+         :main-opts ["-m" "cognitect.test-runner"]}
+  :bench {:extra-deps {criterium/criterium {:mvn/version "0.4.6"}}}}}

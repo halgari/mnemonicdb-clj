@@ -1,0 +1,3 @@
+[tools]
+java = "temurin-27.0.0+35"
+clojure = "1.12.6.1673"
