@@ -98,9 +98,21 @@
 
 (deftest admission-test
   (let [c (sc/new-cache 16)
-        h (sc/hash-range 1 (e-prefix 9) 8)]
+        h (sc/hash-range 1 (e-prefix 9) 8)
+        other (sc/hash-range 1 (e-prefix 10) 8)]
     (is (false? (sc/admit? c h)))
-    (is (true? (sc/admit? c h)))))
+    (testing "consecutive misses of one granule count as one read"
+      (is (false? (sc/admit? c h)))
+      (is (false? (sc/admit? c h))))
+    (is (false? (sc/admit? c other)))
+    (is (true? (sc/admit? c h)) "missed again by a later read")
+    (testing "a long run of misses of one granule is admitted"
+      (is (some true? (repeatedly 9 #(sc/admit? c other)))))
+    (testing "the window slides: seen two windows of first misses ago is forgotten"
+      (let [c (sc/new-cache 1)]
+        (is (false? (sc/admit? c h)))
+        (dotimes [i 20000] (sc/admit? c (sc/hash-range 1 (e-prefix (+ 100 i)) 8)))
+        (is (false? (sc/admit? c h)))))))
 
 (deftest budget-test
   (let [c (sc/new-cache 1)

@@ -41,7 +41,7 @@
   `chunk-cap` entries are remembered as 'big' and streamed from RocksDB."
   (:import (java.util Arrays)
            (java.util.concurrent ConcurrentHashMap ConcurrentLinkedQueue)
-           (java.util.concurrent.atomic AtomicIntegerArray AtomicLong AtomicLongArray
+           (java.util.concurrent.atomic AtomicLong AtomicLongArray
                                         AtomicReference LongAdder)
            (java.util.concurrent.locks ReentrantLock)
            (java.util.function BiFunction)))
@@ -285,16 +285,51 @@
 (defn- new-pool ^Pool [^long budget]
   (Pool. (AtomicReference. (new-gen)) budget (ReentrantLock.) (LongAdder.)))
 
+(definterface IDoor
+  (^boolean seenOrAdd [^long h])
+  (^void reset []))
+
+(defn- bit-set? [^longs a ^long b]
+  (not (zero? (bit-and (aget a (unsigned-bit-shift-right b 6)) (bit-shift-left 1 (bit-and b 63))))))
+
+(defn- set-bit! [^longs a ^long b]
+  (let [w (unsigned-bit-shift-right b 6)]
+    (aset a w (bit-or (aget a w) (bit-shift-left 1 (bit-and b 63))))))
+
+;; Doorkeeper: two Bloom filters (k = 2) over the hashes of missed granules, the current
+;; and the previous window of `window` first misses, so a granule seen once in the last
+;; 1-2 windows counts as seen. A Bloom filter has no false negatives; a false positive
+;; only admits a granule early. Racy plain bit writes: a lost bit costs one admission.
+(deftype Door [^long mask ^long window ^AtomicLong n
+               ^AtomicReference gens]   ; object-array [current previous] of long[] bits
+  IDoor
+  (seenOrAdd [_ h]
+    (let [b1 (bit-and mask (unsigned-bit-shift-right h 20))
+          b2 (bit-and mask (unsigned-bit-shift-right (unchecked-multiply h -7046029254386353131) 24))
+          ^objects g (.get gens)
+          ^longs c (aget g 0)
+          ^longs p (aget g 1)]
+      (if (or (and (bit-set? c b1) (bit-set? c b2))
+              (and (bit-set? p b1) (bit-set? p b2)))
+        true
+        (do (set-bit! c b1)
+            (set-bit! c b2)
+            (when (zero? (rem (.incrementAndGet n) window))
+              (.compareAndSet gens g (object-array [(long-array (alength c)) c])))
+            false))))
+  (reset [_]
+    (let [^objects g (.get gens)
+          w (alength ^longs (aget g 0))]
+      (.set gens (object-array [(long-array w) (long-array w)])))))
+
 (deftype Cache [^AtomicLongArray stripes ^long smask
-                ^AtomicIntegerArray door ^long dmask ^boolean door?
+                ^Door door ^boolean door?
                 ^Pool point ^Pool scan
                 ^AtomicLong epoch* ^AtomicLong max-t
                 ^long point-cap ^long chunk-cap ^long budget
                 ^LongAdder hits ^LongAdder misses ^LongAdder stale
                 ^LongAdder fills ^LongAdder bigs
                 ^java.util.Set big-scans   ; hashes of [a] scans larger than the scan budget
-                ;; doorkeeper window: its generation moves every door-window first misses
-                ^AtomicLong door-n ^long door-window ^java.util.concurrent.atomic.AtomicInteger door-gen
                 ;; presence bits: set for every stored granule hash, never cleared on
                 ;; eviction; a clear bit proves the granule is not cached, so a miss skips
                 ;; the map probe. Racy plain writes: a lost bit only costs a miss.
@@ -332,16 +367,16 @@
                      (* 1024 (Long/parseLong kb))
                      (* mb 1048576))
             sbits (prop-long "mnemonic.index-cache.stripe-bits" 18)
-            ;; a granule is admitted when it misses twice within `window` first misses,
-            ;; about the number of entity segments the budget holds: under uniform reads
-            ;; of a working set much larger than the cache few granules repeat that soon,
-            ;; so the cache does not churn; hot granules repeat well within it
-            window (max 4096 (quot budget 1024))
-            dslots (min (bit-shift-left 1 22) (pow2-at-least (* 2 window)))
+            ;; a granule is admitted when it misses again within 1-2 windows of first
+            ;; misses; a window is about the number of segments the budget holds
+            window (max 4096 (quot budget 512))
+            dbits (pow2-at-least (* 8 window))
             ;; ~8 bits per segment the budget holds (64k..32M bits)
             pbits (min (bit-shift-left 1 25) (max 65536 (pow2-at-least (quot budget 64))))]
         (Cache. (AtomicLongArray. (unchecked-int (bit-shift-left 1 sbits))) (dec (bit-shift-left 1 sbits))
-                (AtomicIntegerArray. (unchecked-int dslots)) (dec dslots)
+                (Door. (dec dbits) window (AtomicLong. 0)
+                       (AtomicReference. (object-array [(long-array (quot dbits 64))
+                                                        (long-array (quot dbits 64))])))
                 (not= "false" (System/getProperty "mnemonic.index-cache.doorkeeper"))
                 (new-pool (- budget (quot budget 4))) (new-pool (quot budget 4))
                 (AtomicLong. 0) (AtomicLong. -1)
@@ -350,7 +385,6 @@
                 budget
                 (LongAdder.) (LongAdder.) (LongAdder.) (LongAdder.) (LongAdder.)
                 (ConcurrentHashMap/newKeySet)
-                (AtomicLong. 0) window (java.util.concurrent.atomic.AtomicInteger. 1)
                 (long-array (quot pbits 64)) (dec pbits))))))
 
 ;; ------------------------------------------------------------------ writer side
@@ -436,22 +470,29 @@
   ^long [^Cache c ^long h]
   (.get ^AtomicLongArray (.-stripes c) (unchecked-int (bit-and (.-smask c) h))))
 
+(def ^:private ^ThreadLocal last-miss
+  ;; [hash of this thread's last missed granule, consecutive misses of it]
+  (ThreadLocal/withInitial (reify java.util.function.Supplier (get [_] (long-array 2)))))
+
+(def ^:private ^:const run-skip
+  "Consecutive misses of one granule on one thread that are taken as one read (the
+  attributes of one entity read one after the other)."
+  8)
+
 (defn admit?
-  "Doorkeeper: false on the first miss of hash `h` (which is remembered), true on the
-  next one within the doorkeeper window. A slot holds 24 hash bits and the 8-bit window
-  generation, so moving the generation forgets every slot at once."
+  "Doorkeeper: false on the first miss of hash `h` (which is remembered), true when it
+  misses again within the next 1-2 windows (see Door). Up to `run-skip` consecutive
+  misses of the same granule on a thread (the next attributes of the entity being read)
+  count as that one miss, so a granule is admitted when a later read needs it again
+  rather than on its second attribute."
   [^Cache c ^long h]
   (or (not (.-door? c))
-      (let [^AtomicIntegerArray d (.-door c)
-            i (unchecked-int (bit-and (.-dmask c) (unsigned-bit-shift-right h 32)))
-            g (.get ^java.util.concurrent.atomic.AtomicInteger (.-door-gen c))
-            v (unchecked-int (bit-or (bit-and h 0xFFFFFF00) (bit-and g 0xff)))]
-        (if (== v (.get d i))
-          true
-          (do (.set d i v)
-              (when (zero? (rem (.incrementAndGet ^AtomicLong (.-door-n c)) (.-door-window c)))
-                (.incrementAndGet ^java.util.concurrent.atomic.AtomicInteger (.-door-gen c)))
-              false)))))
+      (let [^longs lm (.get last-miss)
+            run (if (== h (aget lm 0)) (inc (aget lm 1)) 1)]
+        (aset lm 0 h)
+        (aset lm 1 run)
+        (or (> run run-skip)
+            (and (== run 1) (.seenOrAdd ^Door (.-door c) h))))))
 
 (defn- valid-for? [^Cache c ^Seg s ^long h ^long b]
   (let [hi (.hi s)]
@@ -586,7 +627,7 @@
       (.set ^AtomicReference (.-gen p) (new-gen)))
     (.clear ^java.util.Set (.-big-scans c))
     (Arrays/fill ^longs (.-present c) 0)
-    (.incrementAndGet ^java.util.concurrent.atomic.AtomicInteger (.-door-gen c)))
+    (.reset ^Door (.-door c)))
   nil)
 
 (defn stats

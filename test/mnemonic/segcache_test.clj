@@ -199,7 +199,7 @@
       (let [e (get (:tempids @(m/transact c [{:db/id "e" :t/n 1}])) "e")
             d1 (m/db c)
             vs #(mapv :v (m/datoms % :eavt e :t/n))]
-        (dotimes [_ 3] (is (= [1] (vs d1))))
+        (dotimes [_ 12] (is (= [1] (vs d1))))
         (is (pos? (:hits (m/index-cache-stats c))))
         @(m/transact c [[:db/add e :t/n 2]])
         (let [d2 (m/db c)]
@@ -217,7 +217,7 @@
       (let [c (m/connect uri)
             d (m/db c)
             read #(count (seq (m/datoms % :eavt :db/ident)))]
-        (dotimes [_ 3] (read d))
+        (dotimes [_ 12] (read d))
         (m/release-db d)
         (is (thrown-with-msg? Exception #"released" (read d))))))
   (testing "a hit after the store closed throws connection-released, never touches native code"
@@ -226,7 +226,7 @@
       (let [c (m/connect uri)
             d (m/db c)
             read #(vec (m/datoms % :eavt :db/ident))]
-        (dotimes [_ 3] (read d))
+        (dotimes [_ 12] (read d))
         (is (pos? (:hits (m/index-cache-stats c))))
         (m/release c)
         (is (= :db.error/connection-released
