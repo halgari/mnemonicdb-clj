@@ -1,4 +1,7 @@
 (ns mnemonic.reflection-test
+  "Loads every src namespace in a fresh JVM (same classpath) and fails on any
+  reflection warning. A subprocess avoids :reload, which would redefine
+  deftype/definterface classes under already-compiled code."
   (:require [clojure.java.io :as io]
             [clojure.string :as str]
             [clojure.test :refer [deftest is]]))
@@ -15,10 +18,17 @@
        sort))
 
 (deftest no-reflection-warnings
-  (let [err (java.io.StringWriter.)]
-    (binding [*err* err
-              *warn-on-reflection* true]
-      (doseq [ns-sym (src-namespaces)]
-        (require ns-sym :reload)))
-    (is (not (str/includes? (str err) "Reflection warning"))
-        (str err))))
+  (let [java (str (io/file (System/getProperty "java.home") "bin" "java"))
+        form (pr-str `(binding [*warn-on-reflection* true]
+                        (doseq [n# '~(src-namespaces)] (require n#))
+                        (shutdown-agents)))
+        pb   (doto (ProcessBuilder. ^java.util.List
+                                    [java "--enable-native-access=ALL-UNNAMED"
+                                     "-cp" (System/getProperty "java.class.path")
+                                     "clojure.main" "-e" form])
+               (.redirectErrorStream true))
+        proc (.start pb)
+        out  (slurp (.getInputStream proc))
+        exit (.waitFor proc)]
+    (is (zero? exit) out)
+    (is (not (str/includes? out "Reflection warning")) out)))
