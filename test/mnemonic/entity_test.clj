@@ -166,5 +166,9 @@
           f (m/filter db (fn [_ d] (not= (:a d) age-id)))]
       (is (nil? (:p/age (m/entity f a))))
       (is (= {:p/name "Al"} (m/pull f [:p/name :p/age] a))))
-    (is (contains? #{30 31} (:p/age (m/entity (m/history db) a))) "history entity reads asserted datoms")
+    (let [h (m/history db)
+          msg (fn [f] (try (f) nil (catch IllegalStateException e (ex-message e))))]
+      (is (= "Can't create entity from history" (msg #(m/entity h a))))
+      (is (= "Can't pull from history" (msg #(m/pull h [:p/age] a))))
+      (is (= "Can't pull from history" (msg #(m/pull-many h [:p/age] [a])))))
     (is (not= (m/entity old a) (m/entity db a)))))

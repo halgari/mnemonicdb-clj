@@ -30,4 +30,3 @@ Intentional differences between MnemonicDB and the Datomic Peer API, with ration
 | Entity | `str`/print of a touched entity includes cached reverse lookups | Prints forward attributes only | Cosmetic |
 | Pull | String attribute names (`["*"]` gives string keys; `[":p/name"]`) | Rejected with `:db.error/invalid-attr-spec` | Rarely used |
 | Pull | `[* {:p/boss 1}]` (wildcard plus depth recursion) throws an NPE | Returns the expected result | Datomic bug |
-| Entity/Pull | History dbs return retractions in datoms | Entity and pull read asserted datoms only | Retractions have no meaning for a map view |

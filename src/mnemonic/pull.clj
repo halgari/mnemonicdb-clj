@@ -289,6 +289,10 @@
                   m (:attrs ast))]
     (when (seq m) m)))
 
+(defn- check-not-history [db]
+  (when (index/-history? db)
+    (throw (IllegalStateException. "Can't pull from history"))))
+
 (defn pull-from-ast
   "Pulls `eid` (a long, or anything `entity/resolve-eid` accepts) from `db` under a
   parsed pattern. For use by the query engine."
@@ -302,11 +306,13 @@
 (defn pull
   "Pulls `eid` (id, ident or lookup ref) from `db` using `pattern`."
   [db pattern eid]
+  (check-not-history db)
   (when (some? pattern)
     (pull-from-ast db (parse-pattern pattern) eid)))
 
 (defn pull-many
   "Pulls each of `eids`; a vector of results (nil for entities with no content)."
   [db pattern eids]
+  (check-not-history db)
   (let [ast (parse-pattern pattern)]
     (mapv #(pull-from-ast db ast %) eids)))

@@ -219,6 +219,8 @@
 (defn entity
   "The entity for an id, ident, or lookup ref; nil when it does not resolve."
   [db x]
+  (when (index/-history? db)
+    (throw (IllegalStateException. "Can't create entity from history")))
   (when-let [eid (resolve-eid db x)]
     (->Entity db eid (atom {:attrs {} :order nil :all? false :touched? false}))))
 
