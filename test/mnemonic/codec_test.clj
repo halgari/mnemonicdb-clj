@@ -256,3 +256,11 @@
   (is (= 1000 (c/tx->t (c/t->tx 1000))))
   (is (= 3 (c/part-of (c/t->tx 1000))))
   (is (= 0 (c/part-of 72))))
+
+(deftest string-order-is-utf16-code-unit-order
+  (let [ss ["" "a" "퟿" "😀" "\uD83D" "\uDE00" "" "￿" "\u0000" "z\u0000a"]
+        by-value (sort compare ss)
+        by-bytes (sort-by c/value->bytes c/compare-bytes ss)]
+    (is (= by-value by-bytes))
+    (is (every? #(= % (rt %)) ss) "including unpaired surrogates")
+    (is (= (rt :a/😀) :a/😀))))

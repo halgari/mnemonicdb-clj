@@ -95,8 +95,40 @@
               (recur)))))
     (.toByteArray out)))
 
-(defn- utf8 ^bytes [^String s] (.getBytes s StandardCharsets/UTF_8))
-(defn- from-utf8 ^String [^bytes bs] (String. bs StandardCharsets/UTF_8))
+;; Strings are stored as CESU-8: each UTF-16 code unit is encoded on its own (1-3 bytes, so a
+;; supplementary character becomes two 3-byte surrogate encodings). Unlike UTF-8, the byte
+;; order of this encoding equals Java's String.compareTo (UTF-16 code unit order), which is
+;; Datomic's value order; it also round-trips unpaired surrogates.
+(defn- utf8 ^bytes [^String s]
+  (let [n (.length s)
+        out (ByteArrayOutputStream. (+ n 8))]
+    (dotimes [i n]
+      (let [c (long (int (.charAt s i)))]
+        (cond
+          (< c 0x80) (write-byte! out c)
+          (< c 0x800) (do (write-byte! out (bit-or 0xC0 (bit-shift-right c 6)))
+                          (write-byte! out (bit-or 0x80 (bit-and c 0x3F))))
+          :else (do (write-byte! out (bit-or 0xE0 (bit-shift-right c 12)))
+                    (write-byte! out (bit-or 0x80 (bit-and (bit-shift-right c 6) 0x3F)))
+                    (write-byte! out (bit-or 0x80 (bit-and c 0x3F)))))))
+    (.toByteArray out)))
+
+(defn- from-utf8 ^String [^bytes bs]
+  (let [n (alength bs)
+        sb (StringBuilder. n)]
+    (loop [i 0]
+      (when (< i n)
+        (let [b (bit-and 0xFF (aget bs i))]
+          (cond
+            (< b 0x80) (do (.append sb (char b)) (recur (inc i)))
+            (< b 0xE0) (do (.append sb (char (bit-or (bit-shift-left (bit-and b 0x1F) 6)
+                                                     (bit-and 0x3F (aget bs (+ i 1))))))
+                           (recur (+ i 2)))
+            :else (do (.append sb (char (bit-or (bit-shift-left (bit-and b 0x0F) 12)
+                                                (bit-shift-left (bit-and 0x3F (aget bs (+ i 1))) 6)
+                                                (bit-and 0x3F (aget bs (+ i 2))))))
+                      (recur (+ i 3)))))))
+    (.toString sb)))
 
 ;; ------------------------------------------------------------------ value encoding
 

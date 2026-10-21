@@ -1,6 +1,7 @@
 (ns mnemonic.db
   "Base db: a RocksDB snapshot plus basis-t and schema."
-  (:require [mnemonic.codec :as codec]
+  (:require [mnemonic.bootstrap :as bootstrap]
+            [mnemonic.codec :as codec]
             [mnemonic.index :as index]
             [mnemonic.rocks :as rocks]
             [mnemonic.schema :as schema])
@@ -61,6 +62,11 @@
   (-filter-pred [_] nil)
   (-raw [this] this))
 
+(defn db-meta
+  "The store meta (counters) as of this db's snapshot."
+  [^Base db]
+  (.-meta db))
+
 (defn release-db
   "Release the snapshot held by `db` (idempotent)."
   [^Base db]
@@ -104,7 +110,7 @@
       (let [tx (last-log-tx store snap)
             basis (if tx (codec/tx->t tx) 0)
             sch (load-schema store snap)
-            db (->Base store snap basis sch nil releaser)]
+            db (->Base store snap basis sch (bootstrap/read-meta store snap) releaser)]
         (rocks/register-cleanup! db releaser)
         db)
       (catch Throwable t

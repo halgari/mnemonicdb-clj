@@ -53,10 +53,11 @@
   [:put :default meta-key (.getBytes ^String (pr-str meta) StandardCharsets/UTF_8)])
 
 (defn read-meta
-  "Stored meta map, or nil."
-  [store]
-  (when-let [^bytes b (rocks/get-bytes store :default nil meta-key)]
-    (edn/read-string (String. b StandardCharsets/UTF_8))))
+  "Stored meta map, or nil. With `snap`, reads as of that snapshot."
+  ([store] (read-meta store nil))
+  ([store snap]
+   (when-let [^bytes b (rocks/get-bytes store :default snap meta-key)]
+     (edn/read-string (String. b StandardCharsets/UTF_8)))))
 
 (defn bootstrap!
   "Write the bootstrap datoms, their log entries and initial meta in one batch."
