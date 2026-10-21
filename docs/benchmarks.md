@@ -323,3 +323,32 @@ history indexes, `decode_key` takes 34 percent, and the rest is transient-vector
 conj/persistent and seq churn (`RT.first`, `TransientVector.conj`,
 `ByteArrayOutputStream.ensureCapacity`). Per-datom byte-array and vector allocation, not
 RocksDB itself (`RocksIterator.value` is about 2 percent), is the cost.
+
+## Progress across performance rounds
+
+Factor = how many times slower than Datomic mem (below 1 = faster). mnemonic-mem unless noted. Scale 1.0, same machine.
+
+| workload | baseline (fbc31df) | round 1 (98e9d4a) | round 2 (6ba6bd3) |
+|---|---:|---:|---:|
+| bulk-load entities/sec | 2.90x | 1.52x | 1.55x (41.9k/s) |
+| small-tx tx/sec | 7.64x | 2.64x | 1.56x (21.5k/s) |
+| AEVT scan | 12.67x | 7.75x | 8.18x (5.1M datoms/s) |
+| EAVT scan | 6.66x | 3.48x | 3.43x (3.8M datoms/s) |
+| entity + 3 attrs | 4.64x | 2.80x | 2.53x (308k/s) |
+| pull [*] | 1.23x | 0.96x | 0.82x |
+| pull nested | 3.02x | 1.82x | 2.08x |
+| lookup-ref entid | 3.13x | 1.54x | 1.85x |
+| query a single pattern | 0.74x | 0.39x | 0.38x |
+| query b 3-way join | 2.48x | 0.73x | 0.64x |
+| query c join + range | 64.3x | 4.83x | 1.48x (1.35 ms) |
+| query d aggregates | 0.92x | 0.52x | 0.44x |
+| query e recursive rule | 1.78x | 1.05x | 1.03x |
+| query f :in collection | 2.72x | 1.70x | 1.32x |
+| as-of query | 9.43x | 5.30x | 3.82x |
+| as-of 3-attr scan | 13.8x | 9.42x | 7.87x |
+| history scan | 21.4x | 8.91x | 8.89x |
+| entity, 8 threads | — | 2.82x | 2.46x (2.3M/s) |
+
+Durable writes (file db on a real filesystem, round 2): fsync on — 309 tx/s with 1 submitting thread, 628 with 4, 2,445 with 16 (group commit); `?sync=false` — 25.6k / 32.9k / 33.9k tx/s.
+
+Scans and as-of/history scans are near the JNI floor (raw RocksIterator next+isValid ≈ 90–120 ns/entry); see the round-1 second opinions for measurements.
