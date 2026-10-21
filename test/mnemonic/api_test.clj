@@ -225,3 +225,20 @@
     (tx! c schema)
     (dotimes [_ 500] (doall (seq (m/datoms (m/db c) :aevt :db/ident))))
     (is (= before (.get index/open-cursors)))))
+
+(deftest base-db-failure-after-write-test
+  (let [c (fresh)]
+    (tx! c schema)
+    (let [real mnemonic.db/base-db
+          calls (atom 0)
+          f (with-redefs [mnemonic.db/base-db (fn [store]
+                                                (if (= 1 (swap! calls inc))
+                                                  (throw (RuntimeException. "boom"))
+                                                  (real store)))]
+              (let [f (m/transact c [{:db/id "a" :person/name "Al"}])]
+                (try @f nil (catch ExecutionException e e))))]
+      (is (some? f))
+      (let [r (tx! c [{:db/id "b" :person/name "Bo"}])]
+        (is (= 1003 (m/basis-t (:db-after r))) "new t (1001 and entity 1002 were used)")
+        (is (= #{"Al" "Bo"}
+               (set (map :v (seq (m/datoms (m/db c) :avet :person/name))))))))))
