@@ -28,6 +28,26 @@
   db sees the stamp. A segment superseded by a newer fill of the same granule stays
   attached to it (one level) and keeps serving older db values in its own [lo, hi].
 
+  Memory-ordering assumptions (what the validity rule relies on):
+  - One writer at a time stamps: regular batches stamp under the cache's lock, each with
+    a t above every earlier stamp, so plain ordered stores (lazySet) are the max. Other
+    concurrent writers of index CFs (t not above the last) are irregular (epoch below).
+  - Writer: stamp -> full fence -> RocksDB write. Any snapshot that contains the batch
+    was taken after the write, hence after the stamps.
+  - Reader: snapshot -> full fence (`snapshot-taken!`, in db/base-db and successor-db) ->
+    stamp reads, so a stamp read cannot be ordered before the snapshot it validates.
+    RocksDB's own snapshot/write synchronization (C++ acquire/release around the
+    sequence number) is what makes \"the snapshot contains the batch\" a happens-after of
+    the batch's write.
+  - Db values reach other threads by safe publication (the connection's atom, futures),
+    which also carries the stamps written before them.
+  - Segments are immutable once published through the map (ConcurrentHashMap gives the
+    happens-before); lo/hi/prev/state are volatile and only widen or retire. Decoded
+    Datoms are stored back racily: their fields are final, and mutable values (Date,
+    byte[]) are copied on the way out (mnemonic.index/seg-datom).
+  - Closing: close-store waits for in-flight native calls, then `close!` drops the
+    segments and refuses later fills; hits check the store and snapshot first.
+
   The basis of a db identifies its index contents only when writes come in t order with a
   :log entry (the transactor). Any other batch that touches an index CF (raw test writes,
   a retried t) is irregular: it moves `epoch` to odd before the write and to even after;
@@ -252,15 +272,45 @@
   (let [^Seg p (.prev s)]
     (+ (.-weight s) (if p (.-weight p) 0))))
 
+(defn- align8 ^long [^long n] (bit-and (+ n 7) -8))
+
+(defn- value-weight
+  "Estimated heap bytes of the decoded value of index key `k` (cf code `cfc`): what the
+  Datom's value object adds on top of the key bytes (interned keywords and Boolean
+  constants add nothing)."
+  ^long [^long cfc ^bytes k]
+  (let [n (alength k)]
+    (case cfc
+      (2 6) 16                                          ; VAET: the ref as a boxed Long
+      (let [[off end] (if (or (== cfc 3) (== cfc 7)) [8 (- n 16)] [16 (- n 8)])
+            off (long off)
+            vlen (- (long end) off)]
+        (if (or (neg? vlen) (>= off n))
+          16
+          (case (bit-and 0xff (long (aget k off)))
+            0x10 0
+            (0x11 0x13 0x14) 16
+            0x16 24
+            0x17 32
+            0x19 0
+            (0x18 0x1a 0x1b) (+ 24 (align8 (+ 16 vlen)))      ; String: object + byte[]
+            0x1c (align8 (+ 16 vlen))
+            0x1d (+ 48 (* 2 (align8 (+ 16 vlen))))            ; tuple: vector + elements
+            (+ 40 (align8 (+ 16 vlen)))))))))
+
 (defn- seg-weight
-  "Estimated heap bytes: key byte[] (16 + length), two array slots, a lazily decoded Datom
-  with its value (~70), history tx 8; plus the segment, map node and key."
-  ^long [^bytes g ^objects ks rtx big?]
+  "Estimated heap bytes of a segment once its Datoms are decoded: per entry the key
+  byte[] (16 + length, 8-aligned), two array slots, the Datom (48), its decoded value
+  (`value-weight`) and, for history, a long; plus the segment, map node and granule key.
+  Calibrated against measured heap for longs, short and long strings (segcache-unit-test)."
+  [cfc ^bytes g ^objects ks rtx big?]
   (if big?
     (+ 160 (alength g))
     (loop [i 0 acc (+ 160 (alength g))]
       (if (< i (alength ks))
-        (recur (inc i) (+ acc 102 (alength ^bytes (aget ks i)) (if rtx 8 0)))
+        (let [^bytes k (aget ks i)]
+          (recur (inc i) (+ acc (align8 (+ 16 (alength k))) 8 48 (value-weight (long cfc) k)
+                            (if rtx 8 0))))
         acc))))
 
 ;; ------------------------------------------------------------------ pools
@@ -334,7 +384,8 @@
                 ;; presence bits: set for every stored granule hash, never cleared on
                 ;; eviction; a clear bit proves the granule is not cached, so a miss skips
                 ;; the map probe. Racy plain writes: a lost bit only costs a miss.
-                ^longs present ^long pmask])
+                ^longs present ^long pmask
+                ^java.util.concurrent.atomic.AtomicBoolean closed])   ; store closed: no fills
 
 (defn point-pool ^Pool [^Cache c] (.-point c))
 (defn scan-pool ^Pool [^Cache c] (.-scan c))
@@ -386,7 +437,8 @@
                 budget
                 (LongAdder.) (LongAdder.) (LongAdder.) (LongAdder.) (LongAdder.)
                 (ConcurrentHashMap/newKeySet)
-                (long-array (quot pbits 64)) (dec pbits))))))
+                (long-array (quot pbits 64)) (dec pbits)
+                (java.util.concurrent.atomic.AtomicBoolean. false))))))
 
 ;; ------------------------------------------------------------------ writer side
 
@@ -547,6 +599,8 @@
                   (recur (inc spins)))))))
         (finally (.unlock lock))))))
 
+(declare clear!)
+
 (defn store!
   "Caches a segment of granule `k` (a key owning an exact copy of the granule bytes) read
   from the snapshot of the db `rd` (basis r, epoch), `w` being the granule's stamp read
@@ -554,8 +608,9 @@
   keys, `rtx` retracting txs (history) or nil; `big?` marks a granule too large to cache."
   [^Cache c ^Pool pool ^GKey k ^IReader rd w ks rtx big?]
   (let [r (.basisT rd) ep (.epoch rd) w (long w) ^bytes g (.-g k)]
-  (when (and (<= w r) (>= ep 0) (== (.-len k) (alength g)))
-    (let [weight (seg-weight g ks rtx big?)]
+  (when (and (<= w r) (>= ep 0) (== (.-len k) (alength g))
+             (not (.get ^java.util.concurrent.atomic.AtomicBoolean (.-closed c))))
+    (let [weight (seg-weight (.-cfc k) g ks rtx big?)]
       (when (<= weight (quot (.-budget pool) 4))
         (let [^objects ks ks ^longs rtx rtx
               n (Seg. k ks (when-not big? (object-array (alength ks))) rtx ep (boolean big?) weight
@@ -569,14 +624,14 @@
                           nw (.-weight n)]
                       (cond
                         (nil? e)
-                        (do (aset delta 0 nw) (aset top? 0 true) n)
+                        (do (aset delta 0 nw) (aset top? 0 true) (.setState n 0) n)
 
                         (not= (.-epoch e) ep)
                         (if (> (.-epoch e) ep)
                           e
                           (do (aset delta 0 (- nw (total-weight e)))
                               (.setState e 2)
-                              (aset top? 0 true)
+                              (aset top? 0 true) (.setState n 0)
                               n))
 
                         ;; n is at least as new: it becomes the top entry
@@ -592,7 +647,7 @@
                             (do (.setState e 1)
                                 (.setPrev n e)
                                 (aset delta 0 (- nw pw))))
-                          (aset top? 0 true)
+                          (aset top? 0 true) (.setState n 0)
                           n)
 
                         ;; n is older and overlaps e: same contents, widen e
@@ -611,10 +666,14 @@
                 ^longs pr (.-present c)
                 w (unsigned-bit-shift-right bit 6)]
             (aset pr w (bit-or (aget pr w) (bit-shift-left 1 (bit-and bit 63)))))
+          ;; n's state is set inside the compute (before n is published as the top
+          ;; entry), never after: a concurrent replacement may already have retired it
           (.compute ^ConcurrentHashMap (.-m gen) k f)
           (when (aget top? 0)
-            (.setState n 0)
             (.offer ^ConcurrentLinkedQueue (.-q gen) n))
+          ;; a fill racing close!: drop what it may have put back
+          (when (.get ^java.util.concurrent.atomic.AtomicBoolean (.-closed c))
+            (clear! c))
           (.increment (if big? ^LongAdder (.-bigs c) ^LongAdder (.-fills c)))
           (when (> (.addAndGet ^AtomicLong (.-weight gen) (aget delta 0)) (.-budget pool))
             (evict! c pool))
@@ -629,6 +688,14 @@
     (.clear ^java.util.Set (.-big-scans c))
     (Arrays/fill ^longs (.-present c) 0)
     (.reset ^Door (.-door c)))
+  nil)
+
+(defn close!
+  "The store closed: drops every segment and refuses later fills."
+  [^Cache c]
+  (when c
+    (.set ^java.util.concurrent.atomic.AtomicBoolean (.-closed c) true)
+    (clear! c))
   nil)
 
 (defn stats
