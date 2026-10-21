@@ -298,10 +298,16 @@
   (check-arity op 4)
   [[:add (nth op 1) (nth op 2) (nth op 3)]])
 
-(defmethod expand-op :db/retract [_ _ctx op]
+(defmethod expand-op :db/retract [_ ctx op]
   (case (count op)
     4 [[:retract (nth op 1) (nth op 2) (nth op 3)]]
-    3 [[:retract-attr (nth op 1) (nth op 2)]]
+    3 (let [e (nth op 1)
+            _ (resolve-attr (:schema ctx) (nth op 2))]
+        ;; Datomic resolves the entity with entid here, so a tempid string is not a keyword
+        (when (and (string? e) (not (str/starts-with? e ":")))
+          (fail :db.error/not-a-keyword (str "Cannot interpret as a keyword: " e ", no leading :")
+                {:value e}))
+        [[:retract-attr e (nth op 2)]])
     (check-arity op 4)))
 
 (declare expand-map!)
@@ -350,17 +356,24 @@
         (reverse-attr-name? k) (reverse-entry! ctx out e k v)
         :else (forward-entry! ctx out e k v)))))
 
+(declare resolve-op)
+
 (defn expand-forms
   "Expand tx-data into a vector of raw ops (see `expand-op`). Maps become :add ops with
   nested maps expanded inline (depth first, parent op before the child's ops)."
   [ctx tx-data]
   (let [out (ArrayList.)]
     (doseq [form tx-data]
-      (cond
-        (map? form) (expand-map! ctx out (if-some [id (get form :db/id)] id (anon-tempid)) form)
-        (sequential? form) (doseq [op (expand-op (first form) ctx form)] (.add out op))
-        :else (fail :db.error/invalid-tx-data (str "Unexpected tx-data element: " (pr-str form))
-                    {:form form})))
+      (let [from (.size out)]
+        (cond
+          (map? form) (expand-map! ctx out (if-some [id (get form :db/id)] id (anon-tempid)) form)
+          (sequential? form) (doseq [op (expand-op (first form) ctx form)] (.add out op))
+          :else (fail :db.error/invalid-tx-data (str "Unexpected tx-data element: " (pr-str form))
+                      {:form form}))
+        ;; Datomic validates each op (attribute, value type, lookup refs) at the point it is
+        ;; expanded, so the first failing op wins over errors raised by later ops.
+        (dotimes [i (- (.size out) from)]
+          (resolve-op ctx (.get out (+ from i))))))
     (vec out)))
 
 ;; ------------------------------------------------------------------ resolution of ops
@@ -369,7 +382,10 @@
   "Raw op -> [kind e Attr v] with e a long or Tmp, v a normalized value (long or Tmp for refs)."
   [ctx [kind e a v]]
   (let [attr (resolve-attr (:schema ctx) a)
-        e' (resolve-ref ctx e true)]
+        _ (when (and (not= kind :retract-attr) (nil? v))
+            (fail :db.error/nil-value "Nil is not a legal value"))
+        ;; Datomic does not range-check the entity id of a value-less retract
+        e' (resolve-ref ctx e (not= kind :retract-attr))]
     (if (= kind :retract-attr)
       [kind e' attr nil]
       [kind e' attr (resolve-value ctx attr v)])))
@@ -437,32 +453,51 @@
                             (.get lookup-cache k)
                             (let [r (lookup-eid db aid v)] (.put lookup-cache k r) r))))
         identity-ops (filterv (fn [[kind e ^Attr attr]]
-                                (and (= kind :add) (tmp? e) (= :db.unique/identity (:unique attr))))
+                                (and (or (= kind :add) (= kind :retract)) (tmp? e) (= :db.unique/identity (:unique attr))))
                               ops)
         conflict! (fn [e1 attr v e2]
                     (fail :db.error/datoms-conflict
                           (str "Two datoms in the same transaction conflict\n"
                                (pr-str {:d1 [e1 (:ident attr) v tx true] :d2 [e2 (:ident attr) v tx true]}))
                           {:attribute (:ident attr)}))]
-    ;; upsert fixpoint
-    (loop []
-      (let [changed? (volatile! false)
-            pending (java.util.HashMap.)]
-        (doseq [[_ e ^Attr attr v] identity-ops]
-          (let [re (find-root @ptr e)
-                rv v]
-            (when-not (tmp? rv)
-              (let [existing (cached-lookup (:id attr) rv)]
-                (cond
-                  existing (cond (tmp? re) (do (vswap! ptr assoc re existing) (vreset! changed? true))
-                                 (not= re existing) (conflict! re attr rv existing))
-                  (tmp? re) (let [k [(:id attr) (vkey rv)]
-                                  other (some->> (.get pending k) (find-root @ptr))]
-                              (cond
-                                (nil? other) (.put pending k re)
-                                (not= other re) (do (vswap! ptr assoc re other) (vreset! changed? true))))))))
-          nil)
-        (when @changed? (recur))))
+    ;; Upsert, op by op in transaction order (this mirrors Datomic's observable behavior):
+    ;; a tempid asserting an identity value held by an existing entity binds to it; a tempid
+    ;; using a new value another tempid used earlier joins that tempid (asserts with asserts,
+    ;; retractions with retractions; an assert and a retraction of one new value for
+    ;; different tempids conflict). A tempid that already absorbed others cannot be bound to
+    ;; an existing entity or joined to another group (datoms-conflict). A tempid whose
+    ;; values have different holders is bound to the last one; the uniqueness check then
+    ;; reports :db.error/unique-conflict.
+    (let [sizes (java.util.HashMap.)   ; root tempid -> number of tempids joined into it
+          group-size (fn [r] (long (get sizes r 1)))
+          join! (fn [r p]              ; tempid root `r` joins `p` (a tempid root or an entity id)
+                  (vswap! ptr assoc r p)
+                  (when (tmp? p) (.put sizes p (+ (group-size p) (group-size r)))))
+          pending (java.util.HashMap.)]
+      (doseq [[kind e ^Attr attr v] identity-ops]
+        (let [r (find-root @ptr e)
+              ;; a tempid used as the (ref) identity value matches only the same tempid
+              ex (when-not (tmp? v) (cached-lookup (:id attr) v))
+              k [(:id attr) (if (tmp? v) [::tmp (find-root @ptr v)] (vkey v))]]
+          (cond
+            ex (let [t (loop [t e] (let [n (get @ptr t)] (if (tmp? n) (recur n) t)))]
+                 (if (tmp? r)
+                   (if (> (group-size r) 1)
+                     (conflict! r attr v ex)
+                     (vswap! ptr assoc r ex))
+                   ;; bound to another holder earlier: the latest holder wins and the
+                   ;; uniqueness check reports the clash (:db.error/unique-conflict)
+                   (vswap! ptr assoc t ex)))
+            :else
+            (let [[p pkind] (when-let [[p pk] (.get pending k)] [(find-root @ptr p) pk])]
+              (cond
+                (nil? p) (.put pending k [r kind])
+                (and (= p r) (= pkind kind)) nil
+                (not= pkind kind) (conflict! r attr v p)
+                (and (tmp? r) (== 1 (group-size r))) (join! r p)
+                (and (tmp? p) (not (tmp? r)) (== 1 (group-size p))) (join! p r)
+                :else (conflict! r attr v p))))))
+      nil)
     ;; allocation
     (let [members (let [m (LinkedHashMap.)]
                     (doseq [x tmps :let [r (find-root @ptr x)] :when (tmp? r)]

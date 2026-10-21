@@ -142,6 +142,12 @@
         (throw (tx/error :db.error/invalid-cas-many "attribute must be cardinality-one"
                          :cognitect.anomalies/incorrect data)))
       (let [eid (or (entid-or-nil db e)
+                    ;; an unresolvable entity has no current value: with a non-nil old
+                    ;; value the compare fails (as in Datomic) rather than not-an-entity
+                    (when (some? ov)
+                      (throw (tx/error :db.error/cas-failed (str "Compare failed: " ov " nil")
+                                       :cognitect.anomalies/conflict
+                                       {:e e :a a :v-old ov :v nil :datomic/cancelled true})))
                     (throw (tx/error :db.error/not-an-entity
                                      (str "Unable to resolve entity: " (pr-str e) " in datom "
                                           (pr-str [e a ov]))
