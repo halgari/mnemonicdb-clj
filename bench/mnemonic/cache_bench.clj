@@ -150,7 +150,7 @@
       (reset-stats!)
       (let [[r _] (rate N #(run-entid db* miss))] (rec! "entid miss, warm /s" r (hitrate))))
     ;; memory: every entity and email cached
-    (when (not= kind :datomic)
+    (when ((:stats h))
       (clear!) (gc!)
       (let [rt (Runtime/getRuntime)
             used0 (- (.totalMemory rt) (.freeMemory rt))]

@@ -292,9 +292,13 @@
                 ^long point-cap ^long chunk-cap ^long budget
                 ^LongAdder hits ^LongAdder misses ^LongAdder stale
                 ^LongAdder fills ^LongAdder bigs
-                ^java.util.Set big-scans
+                ^java.util.Set big-scans   ; hashes of [a] scans larger than the scan budget
                 ;; doorkeeper window: its generation moves every door-window first misses
-                ^AtomicLong door-n ^long door-window ^java.util.concurrent.atomic.AtomicInteger door-gen])   ; hashes of [a] scans larger than the scan budget
+                ^AtomicLong door-n ^long door-window ^java.util.concurrent.atomic.AtomicInteger door-gen
+                ;; presence bits: set for every stored granule hash, never cleared on
+                ;; eviction; a clear bit proves the granule is not cached, so a miss skips
+                ;; the map probe. Racy plain writes: a lost bit only costs a miss.
+                ^longs present ^long pmask])
 
 (defn point-pool ^Pool [^Cache c] (.-point c))
 (defn scan-pool ^Pool [^Cache c] (.-scan c))
@@ -319,7 +323,7 @@
 (defn new-cache
   "A cache with a budget of `mb` megabytes, or nil when `mb` is not positive. Test and
   tuning knobs (system properties, read here): mnemonic.index-cache.stripe-bits (18),
-  .point-cap (512 entries), .chunk-cap (4096), .doorkeeper (true), .budget-kb (tests:
+  .point-cap (512 entries), .chunk-cap (16384), .doorkeeper (true), .budget-kb (tests:
   overrides `mb`)."
   [mb]
   (let [mb (long (or mb (default-mb)))]
@@ -333,18 +337,21 @@
             ;; of a working set much larger than the cache few granules repeat that soon,
             ;; so the cache does not churn; hot granules repeat well within it
             window (max 4096 (quot budget 1024))
-            dslots (min (bit-shift-left 1 22) (pow2-at-least (* 2 window)))]
+            dslots (min (bit-shift-left 1 22) (pow2-at-least (* 2 window)))
+            ;; ~8 bits per segment the budget holds (64k..32M bits)
+            pbits (min (bit-shift-left 1 25) (max 65536 (pow2-at-least (quot budget 64))))]
         (Cache. (AtomicLongArray. (unchecked-int (bit-shift-left 1 sbits))) (dec (bit-shift-left 1 sbits))
                 (AtomicIntegerArray. (unchecked-int dslots)) (dec dslots)
                 (not= "false" (System/getProperty "mnemonic.index-cache.doorkeeper"))
                 (new-pool (- budget (quot budget 4))) (new-pool (quot budget 4))
                 (AtomicLong. 0) (AtomicLong. -1)
                 (prop-long "mnemonic.index-cache.point-cap" 512)
-                (prop-long "mnemonic.index-cache.chunk-cap" 4096)
+                (prop-long "mnemonic.index-cache.chunk-cap" 16384)
                 budget
                 (LongAdder.) (LongAdder.) (LongAdder.) (LongAdder.) (LongAdder.)
                 (ConcurrentHashMap/newKeySet)
-                (AtomicLong. 0) window (java.util.concurrent.atomic.AtomicInteger. 1))))))
+                (AtomicLong. 0) window (java.util.concurrent.atomic.AtomicInteger. 1)
+                (long-array (quot pbits 64)) (dec pbits))))))
 
 ;; ------------------------------------------------------------------ writer side
 
@@ -380,15 +387,21 @@
           (let [^AtomicLongArray st (.-stripes c)
                 mask (.-smask c)]
             (.set mt t)
-            (doseq [op ops]
-              (let [cfc (cf-code (nth op 1))]
-                (when (pos? cfc)
-                  (let [^bytes k (nth op 2)
-                        h (if (or (== cfc 4) (== cfc 8))
-                            (when (>= (alength k) 16) (hash-chunk cfc k (key-chunk k)))
-                            (let [n (write-granule-len cfc k)]
-                              (when (>= n 0) (hash-range cfc k n))))]
-                    (when h (stamp! st (bit-and mask (long h)) t))))))
+            ;; consecutive ops mostly hit the same granules (an entity's datoms, an
+            ;; attribute's chunk): a small direct-mapped filter skips repeated stamps
+            (let [seen (long-array 256)]
+              (doseq [op ops]
+                (let [cfc (cf-code (nth op 1))]
+                  (when (pos? cfc)
+                    (let [^bytes k (nth op 2)
+                          chunk? (or (== cfc 4) (== cfc 8))
+                          n (if chunk? (if (>= (alength k) 16) 16 -1) (write-granule-len cfc k))]
+                      (when (>= n 0)
+                        (let [h (if chunk? (hash-chunk cfc k (key-chunk k)) (hash-range cfc k n))
+                              j (bit-and h 255)]
+                          (when-not (and (== h (aget seen j)) (not (zero? h)))
+                            (aset seen j h)
+                            (stamp! st (bit-and mask h) t)))))))))
             false))))))
 
 (defn after-write!
@@ -445,7 +458,10 @@
   "The segment of granule `k` in `pool` that is valid for the db `rd` (an IReader), or nil."
   ^Seg [^Cache c ^Pool pool ^GKey k ^IReader rd]
   (let [^Gen g (.get ^AtomicReference (.-gen pool))
-        ^Seg s0 (.get ^ConcurrentHashMap (.-m g) k)]
+        bit (bit-and (.-pmask c) (unsigned-bit-shift-right (.-h k) 20))
+        ^Seg s0 (when-not (zero? (bit-and (aget ^longs (.-present c) (unsigned-bit-shift-right bit 6))
+                                          (bit-shift-left 1 (bit-and bit 63))))
+                  (.get ^ConcurrentHashMap (.-m g) k))]
     (if (nil? s0)
       (do (.increment ^LongAdder (.-misses c)) nil)
       (let [h (.-h k) b (.basisT rd) ep (.epoch rd)]
@@ -542,6 +558,10 @@
                                 (aset delta 0 (- nw (if ep* (.-weight ep*) 0)))
                                 e)
                             e))))))]
+          (let [bit (bit-and (.-pmask c) (unsigned-bit-shift-right (.-h k) 20))
+                ^longs pr (.-present c)
+                w (unsigned-bit-shift-right bit 6)]
+            (aset pr w (bit-or (aget pr w) (bit-shift-left 1 (bit-and bit 63)))))
           (.compute ^ConcurrentHashMap (.-m gen) k f)
           (when (aget top? 0)
             (.setState n 0)
@@ -558,6 +578,7 @@
     (doseq [^Pool p [(.-point c) (.-scan c)]]
       (.set ^AtomicReference (.-gen p) (new-gen)))
     (.clear ^java.util.Set (.-big-scans c))
+    (Arrays/fill ^longs (.-present c) 0)
     (.incrementAndGet ^java.util.concurrent.atomic.AtomicInteger (.-door-gen c)))
   nil)
 
