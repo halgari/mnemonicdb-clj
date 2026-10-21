@@ -290,54 +290,61 @@
   (let [p (ub prefix)]
     (vec (filter #(= p (vec (take (count p) %))) keys))))
 
+(defn- bytewise [a b]
+  (java.util.Arrays/compareUnsigned ^bytes (apply bs a) ^bytes (apply bs b)))
+
 (defn- prefix-test-keys
-  "Clustered 17..24 byte keys so that prefixes of 8, 16, 17 and 24 bytes all repeat."
-  [^java.util.Random rnd]
-  (vec (sort (fn [a b] (java.util.Arrays/compareUnsigned ^bytes (apply bs a) ^bytes (apply bs b)))
+  "Clustered keys: `head` bytes (several keys share each 8/16/17/25-byte prefix) plus a
+  0..6 byte tail."
+  [^java.util.Random rnd head]
+  (vec (sort bytewise
              (distinct
               (for [_ (range 3000)]
                 (vec (concat (repeat 7 0) [(.nextInt rnd 6)]
-                             (repeat 7 0) [(.nextInt rnd 5)]
-                             [(.nextInt rnd 4)]
+                             (repeat (- head 11) 0)
+                             [(.nextInt rnd 5) (.nextInt rnd 4) (.nextInt rnd 3)]
                              (repeatedly (.nextInt rnd 7) #(.nextInt rnd 3)))))))))
 
-(defn- random-probe [^java.util.Random rnd keys*]
-  (if (zero? (.nextInt rnd 3))
-    (vec (take (inc (.nextInt rnd 24))
-               (concat (repeat 7 0) [(.nextInt rnd 9)] (repeat 7 0) [(.nextInt rnd 8)]
-                       (repeatedly 8 #(.nextInt rnd 5)))))
-    (let [k (nth keys* (.nextInt rnd (count keys*)))]
-      (vec (take (inc (.nextInt rnd (count k))) k)))))
+(defn- random-probe
+  "A prefix of an existing key (any length) or of an existing key with one byte changed
+  (usually absent)."
+  [^java.util.Random rnd keys*]
+  (let [k (nth keys* (.nextInt rnd (count keys*)))
+        k (if (zero? (.nextInt rnd 3))
+            (update k (.nextInt rnd (count k)) #(mod (inc %) 7))
+            k)]
+    (vec (take (inc (.nextInt rnd (count k))) k))))
 
 (deftest prefix-cursors-match-total-order-across-sst-levels
   (testing "random prefixes of every length, keys spread over memtable and several SSTs"
-    (let [dir (temp-dir)
-          path (str (.resolve dir "db"))
-          rnd (java.util.Random. 7)
-          keys* (prefix-test-keys rnd)]
-      (try
-        (let [s (r/open-store {:path path})]
-          (try
-            (doseq [[i part] (map-indexed vector (partition-all 700 (shuffle keys*)))]
-              (r/write! s (for [k part] [:put :eavt (apply bs k) (bs 0)]) {})
-              (when (even? i) (r/flush! s)))
-            (let [snap (r/snapshot s)]
-              (dotimes [_ 1500]
-                (let [p (random-probe rnd keys*)]
-                  (is (= (expected-scan keys* (apply bs p)) (prefix-scan s snap :eavt (apply bs p)))
-                      (str "prefix " p))))
-              (r/release-snapshot s snap))
-            (finally (r/close-store s))))
-        (finally (delete-tree dir))))))
+    (doseq [[cf head] [[:eavt 16] [:aevt-h 16] [:vaet 16] [:avet r/avet-prefix-len] [:avet-h (inc r/avet-prefix-len)]]]
+      (let [dir (temp-dir)
+            path (str (.resolve dir "db"))
+            rnd (java.util.Random. 7)
+            keys* (prefix-test-keys rnd head)]
+        (try
+          (let [s (r/open-store {:path path})]
+            (try
+              (doseq [[i part] (map-indexed vector (partition-all 700 (shuffle keys*)))]
+                (r/write! s (for [k part] [:put cf (apply bs k) (bs 0)]) {})
+                (when (even? i) (r/flush! s)))
+              (let [snap (r/snapshot s)]
+                (dotimes [_ 1200]
+                  (let [p (random-probe rnd keys*)]
+                    (is (= (expected-scan keys* (apply bs p)) (prefix-scan s snap cf (apply bs p)))
+                        (str cf " prefix " p))))
+                (r/release-snapshot s snap))
+              (finally (r/close-store s))))
+          (finally (delete-tree dir)))))))
 
 (deftest stores-written-without-prefix-extractor-open-and-read-correctly
   (testing "existing stores (no extractor) stay readable; new and compacted files get the filter"
     (let [dir (temp-dir)
           path (str (.resolve dir "db"))
           rnd (java.util.Random. 11)
-          keys* (prefix-test-keys rnd)
+          keys* (prefix-test-keys rnd 16)
           extra (vec (repeat 24 9))
-          all (conj keys* extra)   ; extra sorts last
+          all (conj keys* extra)           ; extra sorts last
           check (fn [s]
                   (let [snap (r/snapshot s)]
                     (dotimes [_ 800]

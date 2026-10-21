@@ -14,7 +14,7 @@ MNEMONIC_BENCH_SCALE=0.1 mise exec -- clojure -M:bench -m mnemonic.bench   # qui
 ```
 
 Workload names: `bulk-load small-tx datoms-scan entity-lookup pull lookup-ref queries
-as-of-history open-reopen`. Results print to stdout as markdown and are appended to
+as-of-history open-reopen cold-lookup mt-lookup`. Results print to stdout as markdown and are appended to
 `bench/results/<date>-<git sha>.md` (with git sha, date, JVM). A `-dirty` suffix means
 uncommitted changes in the tree.
 
@@ -64,6 +64,8 @@ then a forced GC, then the timed pass.
 | `lookup-ref` | 100k `(d/entid db [:p/email "..."])` and 20k `(d/entity db [:p/email "..."])` plus an attr read. ops/sec. |
 | `queries` | mean time of: (a) single pattern by indexed value, (b) 3-way join age -> tags -> ident, (c) join + two range predicates + constant ref, (d) count/sum/max group-by status over 100k, (e) recursive `ancestor` rule over a 10k-node ternary tree (all descendants of the root, 9999 rows), (f) `:in [?em ...]` with 1000 emails. Warmed loop with `System/nanoTime` (not criterium). |
 | `as-of-history` | fresh db, 1000 people, 10k updates to `:p/age` (batches of 10). Then, on the as-of db at the halfway t: a join query and a 3-attr AEVT scan; on the history db: an AEVT scan of `:p/age` (21000 datoms) and a one-entity query; plus the same join query on the current db for comparison. |
+| `cold-lookup` | mnemonic-file only. Flushes the loaded dataset to SST files (add `MNEMONIC_BENCH_COMPACT=1` to compact them; by default the flushed L0 files stay), reconnects (empty block cache), then random entity lookups (cold pass, warm pass), lookup-ref hits (cold, warm) and lookup-ref misses (emails that do not exist). Shows what prefix bloom filters and the iterator pool buy on the read path. |
+| `mt-lookup` | Entity lookups and `d/entid` lookup refs from 1, 4 and 8 threads (`MNEMONIC_BENCH_THREADS=1,2,...`) on one shared db value. Total ops/sec; measures contention in the lifecycle guard and cursor open. |
 | `open-reopen` | mnemonic-file only: release, then `connect` + `db` + first entity read + first query on the loaded 125 MB database, mean of 5. |
 
 Correctness check: for every query and scan the row count and a hash of the (eid-independent)

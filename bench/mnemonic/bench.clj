@@ -11,11 +11,11 @@
             [clojure.string :as str]
             [datomic.api :as d]
             [mnemonic.api :as m]
-            [mnemonic.rocks :as rocks]
             [mnemonic.bench.backend :as be :refer [call tx! db]]
             [mnemonic.bench.data :as data]
             [mnemonic.bench.util :as u :refer [size timed-ns]])
-  (:import (java.util Random)))
+  (:import (java.util Random)
+           (org.rocksdb FlushOptions RocksDB)))
 
 (set! *warn-on-reflection* true)
 
@@ -378,6 +378,15 @@
 
 ;; --- cold point lookups (flushed SSTs, empty block cache) and multi-threaded readers
 
+(defn- flush-store!
+  "Flushes every column family to SSTs (plain RocksDB calls: works on any version)."
+  [store]
+  (with-open [fo (doto (FlushOptions.) (.setWaitForFlush true))]
+    (.flush ^RocksDB (:db store) fo ^java.util.List (vec (vals (:cfs store))))))
+
+(defn- compact-store! [store]
+  (doseq [h (vals (:cfs store))] (.compactRange ^RocksDB (:db store) ^org.rocksdb.ColumnFamilyHandle h)))
+
 (defn- entity-sum
   "Reads three attributes of entity `eid`; the sum keeps the work observable."
   ^long [b db* ^long eid]
@@ -399,13 +408,14 @@
   second pass warm."
   [b sz]
   (let [labels ["cold entity+3 attrs/sec" "warm entity+3 attrs/sec"
-                "cold entid hit/sec" "warm entid hit/sec" "entid miss/sec"]]
+                "cold entid hit/sec" "warm entid hit/sec" "entid miss/sec (distinct)"
+                "entid miss/sec (same shape)"]]
     (if-not (= "mnemonic-file" (:name b))
       {:metrics (mapv (fn [l] [l nil :hi]) labels)}
       (let [{:keys [ctx eids]} (dataset! b sz)
             uri (:uri ctx)]
-        (rocks/flush! (:store (:conn ctx)))
-        (when (System/getenv "MNEMONIC_BENCH_COMPACT") (rocks/compact! (:store (:conn ctx))))
+        (flush-store! (:store (:conn ctx)))
+        (when (System/getenv "MNEMONIC_BENCH_COMPACT") (compact-store! (:store (:conn ctx))))
         (call b :release (:conn ctx))
         (u/gc!)
         (let [conn (call b :connect uri)
@@ -420,16 +430,19 @@
               miss-ids (long-array (repeatedly n #(+ ents 10 (.nextInt r 1000000))))
               hit (fn [i] (m/entid db* [:p/email (data/email i)]))
               miss (fn [i] (m/entid db* [:p/email (str "nobody-" i "@nowhere.example")]))
+              miss2 (fn [i] (m/entid db* [:p/email (data/email i)]))
               c1 (pass-ns ids ent)
               c2 (pass-ns ids ent)
               h1 (pass-ns hit-ids hit)
               h2 (pass-ns hit-ids hit)
-              m1 (pass-ns miss-ids miss)]
+              m1 (pass-ns miss-ids miss)
+              m2 (pass-ns miss-ids miss2)]
           {:metrics [[(first labels) (per-sec n c1) :hi]
                      [(second labels) (per-sec n c2) :hi]
                      [(nth labels 2) (per-sec n h1) :hi]
                      [(nth labels 3) (per-sec n h2) :hi]
-                     [(nth labels 4) (per-sec n m1) :hi]]})))))
+                     [(nth labels 4) (per-sec n m1) :hi]
+                     [(nth labels 5) (per-sec n m2) :hi]]})))))
 
 (defn mt-lookup
   "Entity lookups and lookup-ref resolution from 1, 4 and 8 reader threads on one db
@@ -439,7 +452,7 @@
         db* (db ctx)
         threads (mapv #(Long/parseLong %) (str/split (u/env "MNEMONIC_BENCH_THREADS" "1,4,8") #","))
         n (:lookups sz)
-        ids (random-eids eids n 53)
+        ^longs ids (random-eids eids n 53)
         entid-fn (if (= :datomic (:kind b)) d/entid m/entid)
         r (Random. 54)
         refs (vec (repeatedly n #(vector :p/email (data/email (.nextInt r (int (:entities sz)))))))
