@@ -463,3 +463,11 @@ copying a granule when it is admitted). Writers pay one stamp per touched granul
 cached segment), admission on the second probe of the same read (filled and evicted on
 every read of a too-large working set: -16 percent uniform), a 4096-entry chunk cap
 (history chunks of updated attributes did not fit: as-of query 1.6 ms instead of 0.5).
+
+Fix round (f4c149f: byte accounting by value type, Date/byte[] copied out of cached
+Datoms, close-store ordering), one off/on run each: within run-to-run noise of the table
+above (mem: AEVT 7.6M -> 103M/s, EAVT 3.2M -> 22.0M/s, pull nested 90k -> 272k/s, as-of
+query 2.03 -> 0.45 ms, entity+3 warm 255k -> 1.14M/s, 8 threads 0.91M -> 7.8M/s,
+bulk-load -5%; big-file skewed 263k -> 832k/s, uniform 1.08-1.18x). The heap estimate
+now includes decoded values: 0.94-1.02 of measured heap across longs, 20/200-character
+strings, instants, uuids, keywords and bytes (segcache-heap-test).
