@@ -792,36 +792,44 @@
               (and (>= n hash-join-min-tuples) (identical? :const (:kind (nth specs 1))))
               (if-let [[idx prefix pass? a] (scan-const)]
                 (let [hinted (range-plan db rel specs hints a)
-                      ;; entity bound by the relation: scan only the AEVT window from its
-                      ;; smallest to its largest id (one transaction's entities are
-                      ;; contiguous, so the window is often about the relation's size)
-                      win (when (and (nil? hinted) (some? a) (identical? idx :aevt)
-                                     (identical? :bound (:kind (nth specs 0))))
-                            (eid-window tuples (long (:idx (nth specs 0))) (long a)))
-                      rdb (or hinted (when win (range-db db :aevt (nth win 0) (nth win 1))))
                       limit (* hash-join-scan-factor n)
-                      sizes (when (or (nil? rdb) win) (range-sizes db))
-                      skey (when sizes (if win (window-key win) (range-key idx prefix)))
-                      known (when sizes (.get sizes skey))]
-                  (if (and known (> (Math/abs (long known)) limit))
-                    (seeks!)
-                    (let [groups (HashMap.)]
-                      (each-tuple [t tuples ctx]
-                        (when-let [k (key-fn t)]
-                          (let [^ArrayList g (or (.get groups k)
-                                                 (let [g (ArrayList.)] (.put groups k g) g))]
-                            (.add g t))))
-                      (let [r (long (scan-budget! ctx cnt (or rdb db) idx prefix pass?
-                                                  (fn [^IDatomView d]
-                                                    (when-let [^ArrayList g (.get groups (datom-key d))]
-                                                      (dotimes [i (.size g)] (emit! (.get g i) d))))
-                                                  limit))]
-                        (when (and sizes (< (.size sizes) 256)
-                                   (or (nil? known) (neg? (long known))))
-                          (.put sizes skey r))
-                        (when (neg? r)
-                          (.clear out)
-                          (seeks!))))))
+                      sizes (range-sizes db)
+                      groups (HashMap.)
+                      ;; the relation by join key, built only when a scan is actually tried
+                      group! (fn []
+                               (when (.isEmpty groups)
+                                 (each-tuple [t tuples ctx]
+                                   (when-let [k (key-fn t)]
+                                     (let [^ArrayList g (or (.get groups k)
+                                                            (let [g (ArrayList.)] (.put groups k g) g))]
+                                       (.add g t))))))
+                      probe (fn [^IDatomView d]
+                              (when-let [^ArrayList g (.get groups (datom-key d))]
+                                (dotimes [i (.size g)] (emit! (.get g i) d))))
+                      ;; hash join over `sdb`'s range, given up past `limit` datoms (its size,
+                      ;; or that it is too large, learned under `skey` for this db value)
+                      joined? (fn [sdb skey]
+                                (let [known (when skey (.get sizes skey))]
+                                  (if (and known (> (Math/abs (long known)) limit))
+                                    false
+                                    (let [_ (group!)
+                                          r (long (scan-budget! ctx cnt sdb idx prefix pass? probe limit))]
+                                      (when (and skey (< (.size sizes) 256)
+                                                 (or (nil? known) (neg? (long known))))
+                                        (.put sizes skey r))
+                                      (or (not (neg? r))
+                                          (do (.clear out) false))))))]
+                  (or
+                   ;; the whole range (through the segment cache), or the hinted AVET range
+                   (joined? (or hinted db) (when-not hinted (range-key idx prefix)))
+                   ;; too large: with the entity bound by the relation, only the AEVT window
+                   ;; from its smallest to its largest id (one transaction's entities are
+                   ;; contiguous, so the window is often about the relation's size)
+                   (when-let [win (when (and (nil? hinted) (some? a) (identical? idx :aevt)
+                                             (identical? :bound (:kind (nth specs 0))))
+                                    (eid-window tuples (long (:idx (nth specs 0))) (long a)))]
+                     (joined? (range-db db :aevt (nth win 0) (nth win 1)) (window-key win)))
+                   (seeks!)))
                 nil)
 
               :else (seeks!))))))
