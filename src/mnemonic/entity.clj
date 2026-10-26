@@ -7,8 +7,9 @@
             [mnemonic.tx :as tx])
   (:import (clojure.lang Associative IFn IHashEq ILookup IPersistentCollection MapEntry
                          Seqable Util)
+           (java.util ArrayList)
            (mnemonic.codec IKeyBuf)
-           (mnemonic.datom Datom IDatomView)
+           (mnemonic.datom IDatomView)
            (mnemonic.db Base)
            (mnemonic.schema Attr)))
 
@@ -31,13 +32,6 @@
     (.putLong ^IKeyBuf b e)
     (.toBytes ^IKeyBuf b)))
 
-(defn first-datom
-  "The first asserted datom of `index` under the encoded `prefix`, read through `db`; nil
-  when there is none. The cursor is always closed."
-  [db index ^bytes prefix]
-  (reduce (fn [_ ^Datom d] (when (.-added d) (reduced d)))
-          nil (index/datoms-iterable db index prefix)))
-
 (defn first-value
   "The value of the first asserted datom of `index` under `prefix`, decoded in place from
   the cursor (no Datom is built); `::no-datom` when there is none."
@@ -46,43 +40,39 @@
                       (fn [_ ^IDatomView d] (if (.isAdded d) (reduced (.value d)) ::no-datom))
                       ::no-datom))
 
-(defn datoms-by-prefix
-  "Vector of the asserted datoms of `index` under the encoded `prefix`, read through
-  `db`; nil when there are none. At most `limit` (a number or nil) are read. The cursor
-  is always closed."
-  [db index ^bytes prefix limit]
-  (let [limit (when limit (long limit))]
-    (when-not (and limit (<= limit 0))
-      (not-empty
-       (reduce (fn [acc ^Datom d]
-                 (if (.-added d)
-                   (let [acc (conj acc d)]
-                     (if (and limit (>= (count acc) limit)) (reduced acc) acc))
-                   acc))
-               [] (index/datoms-iterable db index prefix))))))
+(defn values-by-prefix
+  "ArrayList of the values (with `e?`, the entity ids) of the asserted datoms of `index`
+  under the encoded `prefix`, decoded in place from the cursor (no Datom is built); nil
+  when there are none. At most `limit` (a number or nil) are read. The cursor is closed
+  on return, so a caller that reads more for each value (a nested pull) holds no cursor
+  open while it does."
+  [db index ^bytes prefix limit e?]
+  (let [limit (if limit (long limit) Long/MAX_VALUE)]
+    (when (pos? limit)
+      (let [out (ArrayList.)]
+        (index/reduce-views (index/datoms-iterable db index prefix)
+                            (fn [_ ^IDatomView d]
+                              (when (.isAdded d)
+                                (.add out (if e? (.eid d) (.value d)))
+                                (when (>= (.size out) limit) (reduced nil))))
+                            nil)
+        (when-not (.isEmpty out) out)))))
 
-(defn datoms-seq
-  "Vector of the asserted datoms of `index` whose leading components are `components`,
-  read through `db` (so as-of, since, history and filtered dbs all work); nil when
-  there are none. At most `limit` datoms are read when `limit` is given. The cursor is
-  always closed."
-  ([db index components] (datoms-seq db index components nil))
-  ([db index components limit]
-   (datoms-by-prefix db index (codec/encode-prefix index components) limit)))
-
-(defn keep-attr-groups
-  "Vector of the non-nil results of `(f attr-id start end)` for every maximal run
-  [start, end) of datoms in the vector `ds` that share an attribute."
-  [ds f]
-  (let [n (count ds)]
-    (loop [i 0 out (transient [])]
-      (if (< i n)
-        (let [a (.-a ^Datom (nth ds i))
-              j (loop [j (inc i)]
-                  (if (and (< j n) (== a (.-a ^Datom (nth ds j)))) (recur (inc j)) j))
-              r (f a i j)]
-          (recur (long j) (if (nil? r) out (conj! out r))))
-        (persistent! out)))))
+(defn attr-values
+  "[attrs values]: two ArrayLists, the attribute id and the value of every asserted datom
+  of entity `eid` in EAVT order (so grouped by attribute), decoded in place. The cursor
+  is closed on return."
+  [db ^long eid]
+  (let [as (ArrayList.)
+        vs (ArrayList.)]
+    (index/reduce-views (index/datoms-iterable db :eavt (e-prefix eid))
+                        (fn [_ ^IDatomView d]
+                          (when (.isAdded d)
+                            (.add as (.attr d))
+                            (.add vs (.value d)))
+                          nil)
+                        nil)
+    [as vs]))
 
 (defn not-a-keyword
   "The error Datomic raises for a non-keyword where a keyword is required."
@@ -161,11 +151,6 @@
   [db sch eid]
   (or (get (:ids sch) eid)
       (new-entity db eid)))
-
-(defn- datom-value [db sch ^Attr attr ^Datom d]
-  (if (= :db.type/ref (:value-type attr))
-    (ref-value db sch (long (.-v d)))
-    (.-v d)))
 
 (defn- view-value
   "Value of the (flyweight) datom view `d` of `attr`, as seen through an entity."
@@ -261,7 +246,7 @@
 (defn- unsupported-write []
   (throw (UnsupportedOperationException. "Entities are read-only")))
 
-(declare entity-seq)
+(declare entity-seq ensure-all!)
 
 (definterface IEntityKeys
   (keySet []))
@@ -305,7 +290,7 @@
   (assoc [_ _ _] (unsupported-write))
 
   IPersistentCollection
-  (count [this] (count (entity-seq this)))
+  (count [this] (count (ensure-all! this)))
   (cons [_ _] (unsupported-write))
   (empty [_] (unsupported-write))
   (equiv [this o] (.equals this o))
@@ -314,7 +299,7 @@
   (seq [this] (seq (entity-seq this)))
 
   IEntityKeys
-  (keySet [this] (into #{} (map first) (entity-seq this)))
+  (keySet [this] (into #{} (map first) (ensure-all! this)))
 
   IHashEq
   (hasheq [this] (.hashCode this))
@@ -324,7 +309,8 @@
     (and (instance? Entity o)
          (let [^Entity o o]
            (and (== eid (.-eid o)) (same-db? db (.-db o))))))
-  (hashCode [_] (hash [eid (index/-basis-t db)]))
+  ;; equal entities have equal ids and basis-t (same-db?); no vector per hash
+  (hashCode [_] (unchecked-int (+ (* 31 (Long/hashCode eid)) (Long/hashCode (long (index/-basis-t db))))))
   (toString [this] (with-out-str (print-method this *out*))))
 
 (defn- ensure-all!

@@ -346,7 +346,13 @@
     (when-not closed?
       (set! closed? (boolean true))
       (.close c))
-    nil))
+    nil)
+  ;; `pred` (user code) is always handed a Datom; consumers of the kept entries get views
+  IViewCursor
+  (view [_] (view-of c))
+  IKeyView
+  (keyBuf [_] (key-buf c))
+  (keyLen [_] (key-len c)))
 
 (defn filter-cursor
   "Cursor over `c` keeping only entries whose Datom satisfies `pred`."

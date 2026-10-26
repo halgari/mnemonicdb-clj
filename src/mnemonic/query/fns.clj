@@ -3,13 +3,13 @@
   the db-aware built-ins (get-else, get-some, missing?). Also entity / value resolution
   shared with the engine."
   (:require [clojure.string :as str]
-            [mnemonic.codec :as codec]
+            [mnemonic.entity :as entity]
             [mnemonic.index :as index]
             [mnemonic.tx :as tx])
   (:import (clojure.lang Reflector Var)
            (java.util Arrays)
            (java.util.concurrent ConcurrentHashMap)
-           (mnemonic.datom Datom)
+           (mnemonic.datom IDatomView)
            (mnemonic.schema Attr)))
 
 (set! *warn-on-reflection* true)
@@ -57,11 +57,18 @@
     (normalize-value v)))
 
 (defn- first-value
-  "Value of the first current datom of [e a], or ::none."
+  "Value of the first current datom of [e a], or ::none (decoded in place; no Datom)."
   [db ^long e ^long a]
-  (reduce (fn [_ d] (reduced (.-v ^Datom d)))
-          ::none
-          (index/datoms-iterable db :eavt (codec/encode-prefix :eavt [e a]))))
+  (index/reduce-views (index/datoms-iterable db :eavt (entity/ea-prefix e a))
+                      (fn [_ ^IDatomView d] (reduced (.value d)))
+                      ::none))
+
+(defn- has-datom?
+  "Whether [e a] has a current datom (nothing is decoded)."
+  [db ^long e ^long a]
+  (index/reduce-views (index/datoms-iterable db :eavt (entity/ea-prefix e a))
+                      (fn [_ _] (reduced true))
+                      false))
 
 (defn- attr-of [db a]
   (tx/resolve-attr (index/-schema db) a))
@@ -92,13 +99,18 @@
   (let [sch (index/-schema db)
         aid (if (keyword? a) (get (:idents sch) a) (when (integer? a) (long a)))]
     (or (nil? aid)
-        (identical? ::none (first-value db (resolve-eid db e) aid)))))
+        (not (has-datom? db (resolve-eid db e) aid)))))
 
 (defn- differ?
   "True when the first half of the arguments differs from the second half."
   [& args]
-  (let [n (quot (count args) 2)]
-    (not= (take n args) (drop n args))))
+  (let [v (vec args)
+        n (quot (count v) 2)]
+    (loop [i 0]
+      (cond
+        (== i n) (not (== (count v) (* 2 n)))   ; an odd extra argument differs from nothing
+        (= (nth v i) (nth v (+ i n))) (recur (inc i))
+        :else true))))
 
 (defmacro ^:private both-long? [a b] `(and (instance? Long ~a) (instance? Long ~b)))
 

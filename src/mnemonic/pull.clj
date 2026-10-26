@@ -16,9 +16,9 @@
             [mnemonic.index :as index]
             [mnemonic.schema :as schema]
             [mnemonic.tx :as tx])
-  (:import (java.util.concurrent ConcurrentHashMap)
+  (:import (java.util ArrayList)
+           (java.util.concurrent ConcurrentHashMap)
            (java.util.concurrent.atomic AtomicLong)
-           (mnemonic.datom Datom)
            (mnemonic.schema Attr)))
 
 (set! *warn-on-reflection* true)
@@ -247,25 +247,32 @@
                  (assoc empty-state :comp (conj (:comp st) parent eid)))
     {:db/id eid}))
 
-(defn- recursion-child
-  "Child `c` of recursive attribute `spec` of node `eid`. A revisited node (already
-  expanded along this path) is pulled in revisit mode: its recursive children are not
-  expanded. Past the depth limit, or in revisit mode, a child is rendered as {:db/id c}
-  when the pattern pulls :db/id and dropped otherwise."
-  [db sch eid c ast st ^AttrSpec spec]
-  (let [depth (:depth (:recur spec))
-        remaining (when depth (get (:depths st) (:rid spec) depth))]
-    (if (or (:revisit st) (and remaining (<= (long remaining) 0)))
-      (when (:id? ast) {:db/id c})
-      (pull-entity db sch c ast
-                   (cond-> (update st :seen conj eid)
-                     remaining (assoc-in [:depths (:rid spec)] (dec (long remaining))))))))
+(defn- child-state
+  "The state the children of `spec` on node `eid` are pulled with: `st`, except for a
+  recursive spec, where a revisited node (already expanded along this path) or one past
+  the depth limit gets ::leaf (its children are not expanded), and any other gets `st`
+  with `eid` seen and the depth counted down. The same for every child, so computed
+  once per attribute."
+  [eid st ^AttrSpec spec]
+  (if-not (:recur spec)
+    st
+    (let [depth (:depth (:recur spec))
+          remaining (when depth (get (:depths st) (:rid spec) depth))]
+      (if (or (:revisit st) (and remaining (<= (long remaining) 0)))
+        ::leaf
+        (cond-> (update st :seen conj eid)
+          remaining (assoc-in [:depths (:rid spec)] (dec (long remaining))))))))
 
 (defn- child-value
-  "The pulled value of target `c` of a ref (or, for sub-patterns, any) attribute of `eid`."
-  [db sch eid ^Attr attr c ast st ^AttrSpec spec]
+  "The pulled value of target `c` of a ref (or, for sub-patterns, any) attribute of `eid`;
+  `cst` is `(child-state eid st spec)`. A recursive child at a ::leaf is rendered as
+  {:db/id c} when the pattern pulls :db/id and dropped otherwise."
+  [db sch eid ^Attr attr c ast st cst ^AttrSpec spec]
   (cond
-    (:recur spec) (when (integer? c) (recursion-child db sch eid (long c) ast st spec))
+    (:recur spec) (when (integer? c)
+                    (if (identical? cst ::leaf)
+                      (when (:id? ast) {:db/id (long c)})
+                      (pull-entity db sch (long c) ast cst)))
     (:sub spec) (cond
                   (integer? c) (pull-entity db sch (long c) (:sub spec) st)
                   (string? c) (throw (entity/not-a-keyword c))
@@ -275,14 +282,14 @@
     :else c))
 
 (defn- collect-children
-  "Vector of the non-nil `(child-value ... (getter d) ...)` over the datoms `ds`, or nil
-  when empty."
-  [db sch eid ^Attr attr ds ast st ^AttrSpec spec e?]
-  (let [n (count ds)]
+  "Vector of the non-nil `child-value`s of the values (or entity ids) `vs`, or nil when
+  empty. `vs` was read before this runs, so nested pulls hold no cursor of ours open."
+  [db sch eid ^Attr attr ^ArrayList vs ast st ^AttrSpec spec]
+  (let [n (.size vs)
+        cst (child-state eid st spec)]
     (loop [i 0 out (transient [])]
       (if (< i n)
-        (let [^Datom d (nth ds i)
-              r (child-value db sch eid attr (if e? (.-e d) (.-v d)) ast st spec)]
+        (let [r (child-value db sch eid attr (.get vs i) ast st cst spec)]
           (recur (inc i) (if (nil? r) out (conj! out r))))
         (let [out (persistent! out)]
           (when (pos? (count out)) out))))))
@@ -299,16 +306,16 @@
           (when (ref-attr? attr)
             (if (:component? attr)
               ;; component: only the first datom is read
-              (when-let [ds (entity/datoms-by-prefix db :vaet prefix 1)]
-                (first (collect-children db sch eid attr ds ast st spec true)))
-              (when-let [ds (entity/datoms-by-prefix db :vaet prefix limit)]
-                (collect-children db sch eid attr ds ast st spec true))))
+              (when-let [vs (entity/values-by-prefix db :vaet prefix 1 true)]
+                (first (collect-children db sch eid attr vs ast st spec)))
+              (when-let [vs (entity/values-by-prefix db :vaet prefix limit true)]
+                (collect-children db sch eid attr vs ast st spec))))
           (if many?
-            (when-let [ds (entity/datoms-by-prefix db :eavt prefix limit)]
-              (collect-children db sch eid attr ds ast st spec false))
+            (when-let [vs (entity/values-by-prefix db :eavt prefix limit false)]
+              (collect-children db sch eid attr vs ast st spec))
             (let [v (entity/first-value db :eavt prefix)]
               (when-not (identical? v ::entity/no-datom)
-                (child-value db sch eid attr v ast st spec)))))))))
+                (child-value db sch eid attr v ast st (child-state eid st spec) spec)))))))))
 
 (defn- spec-value [db sch eid ast st ^AttrSpec spec]
   (let [raw (spec-raw db sch eid ast st spec)
@@ -317,45 +324,47 @@
       (:default spec)
       v)))
 
-(defn- wildcard-entries
-  "[key value] for every attribute of `eid` not overridden by an explicit spec."
-  [db sch eid override st]
-  (let [ds (entity/datoms-by-prefix db :eavt (entity/e-prefix eid) nil)]
-    (entity/keep-attr-groups
-     ds
-     (fn [a i j]
-       (let [^Attr attr (get (:attrs sch) a)]
-         (when (and attr (not (contains? override (:ident attr))))
-           (let [value (fn [^Datom d] (if (ref-attr? attr)
-                                        (default-ref-value db sch attr eid (long (.-v d)) st)
-                                        (.-v d)))
-                 i (long i)
-                 j (long j)]
-             [(:ident attr)
-              (if (= :db.cardinality/many (:cardinality attr))
-                (let [end (min j (+ i (long default-limit)))]
-                  (loop [k i out (transient [])]
-                    (if (< k end)
-                      (recur (inc k) (conj! out (value (nth ds k))))
-                      (persistent! out))))
-                (value (nth ds i)))])))))))
+(defn- wildcard-into!
+  "The transient map `m` with every attribute of `eid` not overridden by an explicit spec.
+  The entity's datoms are read first; components expand after the cursor is closed."
+  [m db sch eid override st]
+  (let [[^ArrayList as ^ArrayList vs] (entity/attr-values db eid)
+        n (.size as)]
+    (loop [i 0 m m]
+      (if (< i n)
+        (let [a (long (.get as i))
+              j (loop [j (inc i)]
+                  (if (and (< j n) (== a (long (.get as j)))) (recur (inc j)) j))
+              ^Attr attr (get (:attrs sch) a)]
+          (recur (long j)
+                 (if (and attr (not (contains? override (:ident attr))))
+                   (let [ref? (ref-attr? attr)
+                         value (fn [x] (if ref? (default-ref-value db sch attr eid (long x) st) x))]
+                     (assoc! m (:ident attr)
+                             (if (= :db.cardinality/many (:cardinality attr))
+                               (let [end (min (long j) (+ i (long default-limit)))]
+                                 (loop [k i out (transient [])]
+                                   (if (< k end)
+                                     (recur (inc k) (conj! out (value (.get vs k))))
+                                     (persistent! out))))
+                               (value (.get vs i)))))
+                   m)))
+        m))))
 
 (defn- pull-entity
   "Map for `eid` under `ast`, or nil when it has no content."
   [db sch eid ^PullPattern ast st]
   (let [st (if (and (not (:revisit st)) (contains? (:seen st) eid)) (assoc st :revisit true) st)
-        m (if (:id? ast) {:db/id eid} {})
-        m (if (:wildcard? ast)
-            (reduce (fn [acc [k v]] (assoc acc k v)) m (wildcard-entries db sch eid (:override ast) st))
-            m)
+        m (transient (if (:id? ast) {:db/id eid} {}))
+        m (if (:wildcard? ast) (wildcard-into! m db sch eid (:override ast) st) m)
         m (reduce (fn [acc ^AttrSpec spec]
                     (let [k (:key spec)]
                       (if (contains? acc k)
                         acc
                         (let [v (spec-value db sch eid ast st spec)]
-                          (if (nil? v) acc (assoc acc k v))))))
+                          (if (nil? v) acc (assoc! acc k v))))))
                   m (:attrs ast))]
-    (when (seq m) m)))
+    (when (pos? (count m)) (persistent! m))))
 
 (defn- check-not-history [db]
   (when (index/-history? db)

@@ -65,7 +65,10 @@
                    (do (aset box 0 (next-entry it)) (recur))
                    2)
         :else
-        (let [c (codec/compare-bytes (.key inner) (.getKey oe))]
+        (let [^bytes ok (.getKey oe)
+              ;; inner's key compared in place (no copy per entry)
+              c (Arrays/compareUnsigned (index/key-buf inner) 0 (unchecked-int (index/key-len inner))
+                                        ok 0 (alength ok))]
           (cond
             (neg? c) 1
             (zero? c) (do (.advance inner) (recur))
@@ -107,7 +110,25 @@
       (set! closed? (boolean true))
       (set! src 0)
       (.close inner))
-    nil))
+    nil)
+  ;; inner entries pass their views and key buffer through; overlay entries are Datoms
+  mnemonic.index.IViewCursor
+  (view [this]
+    (case src
+      1 (index/view-of inner)
+      2 (.datom this)
+      nil))
+  mnemonic.index.IKeyView
+  (keyBuf [_]
+    (case src
+      1 (index/key-buf inner)
+      2 (.getKey ^Map$Entry (aget box 0))
+      nil))
+  (keyLen [_]
+    (case src
+      1 (index/key-len inner)
+      2 (alength ^bytes (.getKey ^Map$Entry (aget box 0)))
+      0)))
 
 (defn- overlay-cursor
   [^ICursor inner ^TreeMap tm idx hist? ^bytes start ^bytes prefix]
@@ -252,7 +273,13 @@
     (when-not closed?
       (set! closed? (boolean true))
       (.close c))
-    nil))
+    nil)
+  ;; flyweight views and the key buffer pass through (read only while valid)
+  mnemonic.index.IViewCursor
+  (view [_] (index/view-of c))
+  mnemonic.index.IKeyView
+  (keyBuf [_] (index/key-buf c))
+  (keyLen [_] (index/key-len c)))
 
 (defn- visible-cursor
   "Entries visible in a non-history view with since < tx <= as-of: current entries by

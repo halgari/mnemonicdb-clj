@@ -12,7 +12,7 @@
            (java.nio ByteBuffer)
            (java.util ArrayList Arrays Date LinkedHashMap UUID)
            (java.util.concurrent.atomic AtomicLong)
-           (mnemonic.datom Datom)
+           (mnemonic.datom Datom IDatomView)
            (mnemonic.schema Attr)))
 
 (set! *warn-on-reflection* true)
@@ -108,10 +108,45 @@
 (defn same-value? [a b]
   (Arrays/equals ^bytes (codec/value->bytes a) ^bytes (codec/value->bytes b)))
 
+(defn- first-eid
+  "Entity id of the first datom of `idx` under the encoded `prefix`, or nil (decoded in
+  place; no Datom is built)."
+  [db idx ^bytes prefix]
+  (index/reduce-views (index/datoms-iterable db idx prefix)
+                      (fn [_ ^IDatomView d] (reduced (.eid d)))
+                      nil))
+
+(defn- first-view-value
+  "Value of the first datom of `idx` under the encoded `prefix`, or `nf` (decoded in
+  place; no Datom is built)."
+  [db idx ^bytes prefix nf]
+  (index/reduce-views (index/datoms-iterable db idx prefix)
+                      (fn [_ ^IDatomView d] (reduced (.value d)))
+                      nf))
+
+(defn- exists?
+  "Whether `idx` has a datom under the encoded `prefix` (nothing is decoded)."
+  [db idx ^bytes prefix]
+  (index/reduce-views (index/datoms-iterable db idx prefix)
+                      (fn [_ _] (reduced true))
+                      false))
+
+(defn first-value-of
+  "Value of the first datom of `idx` whose key starts with `comps`, or `nf` (decoded in
+  place; no Datom is built)."
+  [db idx comps nf]
+  (first-view-value db idx (codec/encode-prefix idx comps) nf))
+
+(defn reduce-views-of
+  "Reduces flyweight views of the datoms of `idx` whose key starts with `comps` with `f`
+  (a view is valid only during its call to `f`; copy out what is kept)."
+  [db idx comps f init]
+  (index/reduce-views (index/datoms-iterable db idx (codec/encode-prefix idx comps)) f init))
+
 (defn- lookup-eid
   "Entity holding value `v` of attribute `aid` in `db` (via AVET), or nil."
   [db aid v]
-  (some-> (first (datoms-of db :avet [aid v])) :e))
+  (first-eid db :avet (codec/encode-prefix :avet [aid v])))
 
 ;; ------------------------------------------------------------------ encoded-value keys
 
@@ -151,19 +186,22 @@
   ^bytes [^long a ^bytes vb]
   (codec/encode-prefix-av-vb a vb))
 
-(defn- datoms-of-prefix [db idx ^bytes prefix]
-  (into [] (index/datoms-iterable db idx prefix)))
-
 (defn- avet-holders
-  "Current datoms holding value `vb` (encoded) of attribute `aid` in the tx's db-before, cached
-  for the transaction (shared by upsert resolution and the uniqueness check)."
-  [ctx ^long aid ^bytes vb]
+  "Ids (a long[]) of the entities holding value `vb` (encoded) of attribute `aid` in the
+  tx's db-before, read from AVET views (no Datom is built) and cached for the
+  transaction (shared by upsert resolution and the uniqueness check)."
+  ^longs [ctx ^long aid ^bytes vb]
   (let [^java.util.HashMap cache (:lookup-cache ctx)
         k (k3 aid 0 vb)]
     (or (.get cache k)
-        (let [r (datoms-of-prefix (:db ctx) :avet (prefix-av aid vb))]
-          (.put cache k r)
-          r))))
+        (let [l (ArrayList. 1)]
+          (index/reduce-views (index/datoms-iterable (:db ctx) :avet (prefix-av aid vb))
+                              (fn [_ ^IDatomView d] (.add l (.eid d)) nil)
+                              nil)
+          (let [r (long-array (.size l))]
+            (dotimes [i (.size l)] (aset r i (long (.get l i))))
+            (.put cache k r)
+            r)))))
 
 ;; ------------------------------------------------------------------ attribute and value resolution
 
@@ -485,7 +523,7 @@
         (let [pid (cond (integer? part) (long part)
                         (keyword? part) (get (:idents (:schema ctx)) part)
                         :else nil)]
-          (if (and pid (seq (datoms-of (:db ctx) :eavt [part-db a-install-partition pid])))
+          (if (and pid (exists? (:db ctx) :eavt (codec/encode-prefix :eavt [part-db a-install-partition pid])))
             (do (when cache (swap! cache assoc part pid))
                 pid)
             (fail :db.error/not-a-db-id (str "Invalid db/id: " (pr-str part)) {:part part}))))))
@@ -550,7 +588,8 @@
               vb (when-not (tmp? v) (codec/value->bytes v))
               _ (when vb (.put id-vb op vb))
               ;; a tempid used as the (ref) identity value matches only the same tempid
-              ex (when vb (some-> ^Datom (first (avet-holders ctx (:id attr) vb)) .-e))
+              ex (when vb (let [^longs hs (avet-holders ctx (:id attr) vb)]
+                            (when (pos? (alength hs)) (aget hs 0))))
               k (if vb (k3 (:id attr) 0 vb) [(:id attr) [::tmp (find-root @ptr v)]])]
           (cond
             ex (let [t (loop [t e] (let [n (get @ptr t)] (if (tmp? n) (recur n) t)))]
@@ -642,8 +681,8 @@
   "Millis of the latest tx instant in `db` (0 when none)."
   ^long [db]
   (let [basis (index/-basis-t db)
-        d (first (datoms-of db :eavt [(codec/t->tx basis) a-tx-instant]))]
-    (if d (instant-ms ^Date (:v d)) 0)))
+        v (first-view-value db :eavt (prefix-ea+v (codec/t->tx basis) a-tx-instant no-bytes) nil)]
+    (if v (instant-ms ^Date v) 0)))
 
 (defn- ref-attr? [schema aid]
   (= :db.type/ref (:value-type (get (:attrs schema) aid))))
@@ -729,10 +768,16 @@
                           {:d1 (datom-vec schema d1) :d2 (datom-vec schema d2)}))
         ;; entities allocated by this very tx have no datoms in db-before: skip the reads
         existing-of (fn [^long e aid] (if (fresh-entity? ctx db-eids e) [] (datoms-of db :eavt [e aid])))
-        ;; the current datom [e a v] (exact key lookup; never scans the other values)
+        ;; whether [e a v] is current (exact key lookup; never scans the other values)
+        has-value? (fn [^long e ^long aid ^bytes vb]
+                     (and (not (fresh-entity? ctx db-eids e))
+                          (exists? db :eavt (prefix-ea+v e aid vb))))
+        ;; the current datom [e a v], kept (so materialized) when it is retracted
         existing-value (fn [^long e ^long aid ^bytes vb]
                          (when-not (fresh-entity? ctx db-eids e)
-                           (first (datoms-of-prefix db :eavt (prefix-ea+v e aid vb)))))
+                           (index/reduce-views (index/datoms-iterable db :eavt (prefix-ea+v e aid vb))
+                                               (fn [_ ^IDatomView d] (reduced (.toDatom d)))
+                                               nil)))
         ;; expand :retract-attr against db-before
         ops (into []
                   (mapcat (fn [[kind e ^Attr attr v :as op]]
@@ -782,13 +827,15 @@
               ^Attr attr (.-attr i)
               ^bytes vb (.-vb i)]
           (if (= :db.cardinality/one (:cardinality attr))
-            ;; card-one: [e a] holds at most one current value, which a new value replaces
-            (let [cur (existing-of (.-e d) (.-a d))
-                  curb (mapv (fn [^Datom c] (codec/value->bytes (.-v c))) cur)]
-              (when-not (some (fn [^bytes b] (Arrays/equals b vb)) curb)
-                (dotimes [j (count cur)] (retract! (nth cur j) (nth curb j)))
+            ;; card-one: [e a] holds at most one current value, which a new value replaces;
+            ;; an unchanged value is found by its exact key, without reading the others
+            (when-not (has-value? (.-e d) (.-a d) vb)
+              (let [cur (existing-of (.-e d) (.-a d))]
+                (dotimes [j (count cur)]
+                  (let [^Datom c (nth cur j)]
+                    (retract! c (codec/value->bytes (.-v c)))))
                 (.add asserted d)))
-            (when-not (existing-value (.-e d) (.-a d) vb)
+            (when-not (has-value? (.-e d) (.-a d) vb)
               (.add asserted d)))))
       (doseq [^Datom r (vals rets)]
         (let [vb (dinfo-vb dinfo r)]
@@ -822,16 +869,18 @@
             :let [^DInfo i (.get dinfo d)
                   ^Attr attr (when i (.-attr i))]
             :when (:unique attr)]
-      (let [^bytes vb (.-vb i)]
-        (doseq [^Datom h (avet-holders ctx (.-a d) vb)]
-          (when (and (not= (.-e h) (.-e d))
-                     ;; a holder found by this value's prefix has this value's encoding
-                     (not (contains? retracted-keys (k3 (.-e h) (.-a h) vb))))
-            (fail :db.error/unique-conflict
-                  (str "Unique conflict: " (:ident attr) ", value: " (.-v d) " already held by: "
-                       (.-e h) " asserted for: " (.-e d))
-                  :cognitect.anomalies/conflict
-                  {:attribute (:ident attr) :value (.-v d) :held-by (.-e h) :asserted-for (.-e d)})))))))
+      (let [^bytes vb (.-vb i)
+            ^longs hs (avet-holders ctx (.-a d) vb)]
+        (dotimes [x (alength hs)]
+          (let [h (aget hs x)]
+            (when (and (not (== h (.-e d)))
+                       ;; a holder found by this value's prefix has this value's encoding
+                       (not (contains? retracted-keys (k3 h (.-a d) vb))))
+              (fail :db.error/unique-conflict
+                    (str "Unique conflict: " (:ident attr) ", value: " (.-v d) " already held by: "
+                         h " asserted for: " (.-e d))
+                    :cognitect.anomalies/conflict
+                    {:attribute (:ident attr) :value (.-v d) :held-by h :asserted-for (.-e d)}))))))))
 
 (defn- check-tuple-install!
   "Validates the tuple specification (:db/tupleAttrs, :db/tupleType, :db/tupleTypes) of
@@ -885,14 +934,14 @@
         _ (check-tuple-install! ctx asserts new-attr-es)
         auto (vec (for [e new-attr-es
                         :when (and (not (contains? explicit-installs e))
-                                   (empty? (datoms-of db :eavt [part-db a-install-attribute e])))]
+                                   (not (exists? db :eavt (codec/encode-prefix :eavt [part-db a-install-attribute e]))))]
                     (datom/datom part-db a-install-attribute e tx true)))
         installs (into explicit-installs (map #(.-v ^Datom %)) auto)
         has-attr? (fn [e aid]
                     (or (some (fn [^Datom d] (and (== (.-e d) e) (== (.-a d) aid))) asserts)
-                        (seq (datoms-of db :eavt [e aid]))))
+                        (exists? db :eavt (codec/encode-prefix :eavt [e aid]))))
         alters (vec (for [e alter-eids
-                          :when (empty? (datoms-of db :eavt [part-db a-alter-attribute e]))]
+                          :when (not (exists? db :eavt (codec/encode-prefix :eavt [part-db a-alter-attribute e])))]
                       (datom/datom part-db a-alter-attribute e tx true)))]
     (doseq [e installs]
       (when-not (and (has-attr? e a-value-type) (has-attr? e a-cardinality))
@@ -924,13 +973,30 @@
   explicit :db.alter/attribute (derived by the transactor) and composite tuples
   (maintained by the transactor)."
   [ops]
-  (reduce (fn [acc [kind e ^Attr attr v :as op]]
-            (cond
-              (== (:id attr) a-ensure) (cond-> acc (= kind :add) (update :ensures conj [e v]))
-              (== (:id attr) a-alter-attribute) acc
-              (:tuple-attrs attr) (update acc :dropped conj e)
-              :else (update acc :ops conj op)))
-          {:ops [] :ensures [] :dropped #{}} ops))
+  (let [n (count ops)]
+    (loop [i 0 kept (transient []) ensures (transient []) dropped (transient #{})]
+      (if (< i n)
+        (let [[kind e ^Attr attr v :as op] (nth ops i)
+              aid (long (:id attr))]
+          (cond
+            (== aid a-ensure) (recur (inc i) kept (if (= kind :add) (conj! ensures [e v]) ensures) dropped)
+            (== aid a-alter-attribute) (recur (inc i) kept ensures dropped)
+            (:tuple-attrs attr) (recur (inc i) kept ensures (conj! dropped e))
+            :else (recur (inc i) (conj! kept op) ensures dropped)))
+        {:ops (persistent! kept) :ensures (persistent! ensures) :dropped (persistent! dropped)}))))
+
+(defn- merge-changes
+  "The `compute-datoms` result of two op sets that touch disjoint attributes."
+  [r1 r2]
+  (let [^java.util.IdentityHashMap dinfo (:dinfo r1)
+        rk (java.util.HashSet. ^java.util.Collection (:retracted-keys r1))]
+    (.putAll dinfo ^java.util.Map (:dinfo r2))
+    (.addAll rk ^java.util.Collection (:retracted-keys r2))
+    {:asserts (into (:asserts r1) (:asserts r2))
+     :adds (into (:adds r1) (:adds r2))
+     :retracts (into (:retracts r1) (:retracts r2))
+     :retracted-keys rk
+     :dinfo dinfo}))
 
 ;; ------------------------------------------------------------------ composite tuples
 
@@ -960,34 +1026,60 @@
 (defn- composite-ops
   "Ops maintaining composite tuples after `res` (the effective changes of `ops`). Returns
   {:ops [changes] :checks [[:add e attr tuple] every non-empty computed tuple]}."
-  [ctx ops res]
+  [ctx ops res db-eids]
   (let [{:keys [db schema]} ctx
         cidx (composite-index schema)]
     (if (empty? cidx)
       {:ops [] :checks []}
       (let [touched (LinkedHashMap.)
-            asserted (into {} (map (fn [^Datom d] [[(.-e d) (.-a d)] d])) (:asserts res))
+            ;; [e a] -> its asserted datom (card-one components hold one value)
+            asserted (java.util.HashMap.)
+            _ (doseq [^Datom d (:asserts res)]
+                (.put asserted (k3 (.-e d) (.-a d) no-bytes) d))
             retracted-keys (:retracted-keys res)
-            final-datom (fn [e aid]
-                          (or (get asserted [e aid])
-                              (first (remove (fn [^Datom c] (contains? retracted-keys (k3 e aid (codec/value->bytes (.-v c)))))
-                                             (datoms-of db :eavt [e aid])))))]
+            ;; the component's value after the tx, or nil; an entity this tx created has no
+            ;; datoms in db-before, so only the tx's own asserts are looked at
+            final-value (fn [^long e ^long aid]
+                          (if-some [^Datom d (.get asserted (k3 e aid no-bytes))]
+                            (.-v d)
+                            (when-not (fresh-entity? ctx db-eids e)
+                              (index/reduce-views
+                               (index/datoms-iterable db :eavt (prefix-ea+v e aid no-bytes))
+                               (fn [_ ^IDatomView c]
+                                 (let [v (.value c)]
+                                   (if (contains? retracted-keys (k3 e aid (codec/value->bytes v)))
+                                     nil
+                                     (reduced v))))
+                               nil))))
+            ;; component attribute ids of each composite, resolved once
+            comp-ids (java.util.IdentityHashMap.)
+            comp-ids-of (fn [^Attr c]
+                          (or (.get comp-ids c)
+                              (let [ids (long-array (map #(or (get (:idents schema) %) -1) (:tuple-attrs c)))]
+                                (.put comp-ids c ids)
+                                ids)))
+            out-ops (ArrayList.)
+            out-checks (ArrayList.)]
         (doseq [[_ e ^Attr attr] ops, ^Attr c (get cidx (:id attr))]
-          (.putIfAbsent touched [e (:id c)] c))
-        (reduce (fn [acc [[e caid] ^Attr c]]
-                  (let [vals (mapv (fn [kw] (when-some [^Datom d (final-datom e (get (:idents schema) kw))]
-                                              (.-v d)))
-                                   (:tuple-attrs c))
-                        new (when (some some? vals) vals)
-                        ^Datom old (first (datoms-of db :eavt [e caid]))]
-                    (cond-> acc
-                      new (update :checks conj [:add e c new])
-                      (and old (or (nil? new) (not (same-value? (.-v old) new))))
-                      (update :ops conj [:retract e c (.-v old)])
-                      (and new (or (nil? old) (not (same-value? (.-v old) new))))
-                      (update :ops conj [:add e c new]))))
-                {:ops [] :checks []}
-                (map (fn [[k v]] [k v]) touched))))))
+          (.putIfAbsent touched (k3 e (:id c) no-bytes) [e c]))
+        (doseq [[e ^Attr c] (.values touched)]
+          (let [e (long e)
+                ^longs ids (comp-ids-of c)
+                n (alength ids)
+                vals (loop [i 0 out (transient [])]
+                       (if (< i n)
+                         (let [aid (aget ids i)]
+                           (recur (inc i) (conj! out (when-not (neg? aid) (final-value e aid)))))
+                         (persistent! out)))
+                new (when (some some? vals) vals)
+                old (when-not (fresh-entity? ctx db-eids e)
+                      (first-view-value db :eavt (prefix-ea+v e (:id c) no-bytes) nil))]
+            (when new (.add out-checks [:add e c new]))
+            (when (and (some? old) (or (nil? new) (not (same-value? old new))))
+              (.add out-ops [:retract e c old]))
+            (when (and new (or (nil? old) (not (same-value? old new))))
+              (.add out-ops [:add e c new]))))
+        {:ops (vec out-ops) :checks (vec out-checks)}))))
 
 ;; ------------------------------------------------------------------ attribute predicates
 
@@ -1138,7 +1230,13 @@
   (key [this] (when (.valid this) (aget ks i)))
   (datom [this] (when (.valid this) (aget ds i)))
   (retractTx [_] -1)
-  (close [_] nil))
+  (close [_] nil)
+  ;; entries are Datoms already; merges compare their keys without a copy
+  mnemonic.index.IViewCursor
+  (view [_] (aget ds i))
+  mnemonic.index.IKeyView
+  (keyBuf [_] (aget ks i))
+  (keyLen [_] (alength ^bytes (aget ks i))))
 
 (defn- dkey [idx ^Datom d]
   (ByteBuffer/wrap (codec/encode-key idx (.-e d) (.-a d) (.-v d) (.-tx d))))
@@ -1239,8 +1337,10 @@
         {:keys [ops tempids n-shared n-db db-eids]} (resolve-tempids ctx ops)
         {:keys [ops ensures dropped]} (split-ops ops)
         res1 (compute-datoms ctx ops db-eids)
-        {syn :ops checks :checks} (composite-ops ctx ops res1)
-        res (if (seq syn) (compute-datoms ctx (into ops syn) db-eids) res1)
+        {syn :ops checks :checks} (composite-ops ctx ops res1 db-eids)
+        ;; the composite tuple ops touch only composite attributes, which `split-ops` took
+        ;; out of `ops`, so their changes are computed alone and added to `res1`
+        res (if (seq syn) (merge-changes res1 (compute-datoms ctx syn db-eids)) res1)
         {:keys [asserts adds retracts retracted-keys dinfo]} res
         all-ops (into ops syn)
         _ (check-boot-datoms! schema retracts)

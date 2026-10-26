@@ -9,7 +9,7 @@
             [mnemonic.tx :as tx])
   (:import (java.util ArrayList HashSet LinkedHashMap)
            (java.util.concurrent ConcurrentHashMap)
-           (mnemonic.datom Datom)
+           (mnemonic.datom Datom IDatomView)
            (mnemonic.schema Attr)))
 
 (set! *warn-on-reflection* true)
@@ -152,16 +152,17 @@
                                      (str "Unable to resolve entity: " (pr-str e) " in datom "
                                           (pr-str [e a ov]))
                                      {:entity e :datom [e a ov]})))
-            cur (first (tx/datoms-of db :eavt [eid (:id attr)]))
+            cur (tx/first-value-of db :eavt [eid (:id attr)] ::none)
+            none? (identical? cur ::none)
             matches? (if (nil? ov)
-                       (nil? cur)
-                       (and cur
+                       none?
+                       (and (not none?)
                             (if (= :db.type/ref (:value-type attr))
-                              (and (integer? ov) (== (long ov) (long (:v cur))))
-                              (try (tx/same-value? (tx/coerce-value attr ov) (:v cur))
+                              (and (integer? ov) (== (long ov) (long cur)))
+                              (try (tx/same-value? (tx/coerce-value attr ov) cur)
                                    (catch clojure.lang.ExceptionInfo _ false)))))]
         (when-not matches?
-          (let [actual (:v cur)]
+          (let [actual (when-not none? cur)]
             (throw (tx/error :db.error/cas-failed (str "Compare failed: " ov " " actual)
                              :cognitect.anomalies/conflict
                              {:e e :a a :v-old ov :v actual :datomic/cancelled true}))))
@@ -176,17 +177,25 @@
         out (LinkedHashMap.)
         seen (HashSet.)
         ident-of (fn [aid] (or (get ids aid) aid))
-        add! (fn [^Datom d] (.putIfAbsent out [(.-e d) (.-a d) (tx/vkey (.-v d))]
-                                          [:db/retract (.-e d) (ident-of (.-a d)) (.-v d)]))
+        add! (fn [^IDatomView d]
+               (let [e (.eid d) a (.attr d) v (.value d)]
+                 (.putIfAbsent out [e a (tx/vkey v)] [:db/retract e (ident-of a) v])))
+        ;; an entity's datoms are read first, then its components are visited (so no
+        ;; cursor stays open across the recursion)
         visit (fn visit [^long eid]
                 (when (.add seen eid)
-                  (doseq [^Datom d (tx/datoms-of db :eavt [eid])]
-                    (add! d)
-                    (let [^Attr attr (get (:attrs schema) (.-a d))]
-                      (when (and attr (:component? attr) (= :db.type/ref (:value-type attr)))
-                        (visit (long (.-v d))))))
-                  (doseq [^Datom d (tx/datoms-of db :vaet [eid])]
-                    (add! d))))]
+                  (let [^ArrayList kids
+                        (tx/reduce-views-of
+                         db :eavt [eid]
+                         (fn [^ArrayList kids ^IDatomView d]
+                           (add! d)
+                           (let [^Attr attr (get (:attrs schema) (.attr d))]
+                             (when (and attr (:component? attr) (= :db.type/ref (:value-type attr)))
+                               (.add kids (.valueLong d))))
+                           kids)
+                         (ArrayList.))]
+                    (tx/reduce-views-of db :vaet [eid] (fn [_ d] (add! d) nil) nil)
+                    (dotimes [i (.size kids)] (visit (long (.get kids i)))))))]
     (when-some [eid (entid-or-nil db e)]
       (visit eid))
     (vec (.values out))))
@@ -201,10 +210,9 @@
   "The callable for entity `eid` (built-in or stored :db/fn), or nil."
   [db ^long eid]
   (or (get builtin-fns eid)
-      (when-some [d (first (tx/datoms-of db :eavt [eid 52]))]
-        (let [v (:v d)]
-          (when (string? v)
-            (cached-fn v #(stored->fn v)))))))
+      (let [v (tx/first-value-of db :eavt [eid 52] nil)]
+        (when (string? v)
+          (cached-fn v #(stored->fn v))))))
 
 (defn- lookup-callable
   "[:fn f], [:unresolved] (unknown ident/symbol) or [:not-fn id]."
