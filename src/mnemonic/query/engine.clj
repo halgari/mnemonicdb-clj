@@ -716,8 +716,11 @@
           (when (instance? Long x)
             (let [e (long x)]
               (recur (inc i) (min lo e) (max hi e)))))
-        [(codec/encode-prefix :aevt [a lo])
-         (prefix-successor (codec/encode-prefix :aevt [a hi]))]))))
+        ;; only for dense ids (entities written together): scattered ids span most of the
+        ;; attribute anyway, and its unbounded scan goes through the segment cache
+        (when (<= (- hi lo) (* 4 n))
+          [(codec/encode-prefix :aevt [a lo])
+           (prefix-successor (codec/encode-prefix :aevt [a hi]))])))))
 
 (defn- window-key
   "range-sizes key of an AEVT window [start stop]."

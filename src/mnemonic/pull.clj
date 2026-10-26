@@ -355,16 +355,23 @@
   "Map for `eid` under `ast`, or nil when it has no content."
   [db sch eid ^PullPattern ast st]
   (let [st (if (and (not (:revisit st)) (contains? (:seen st) eid)) (assoc st :revisit true) st)
-        m (transient (if (:id? ast) {:db/id eid} {}))
-        m (if (:wildcard? ast) (wildcard-into! m db sch eid (:override ast) st) m)
-        m (reduce (fn [acc ^AttrSpec spec]
-                    (let [k (:key spec)]
-                      (if (contains? acc k)
-                        acc
-                        (let [v (spec-value db sch eid ast st spec)]
-                          (if (nil? v) acc (assoc! acc k v))))))
-                  m (:attrs ast))]
-    (when (pos? (count m)) (persistent! m))))
+        m0 (if (:id? ast) {:db/id eid} {})
+        add-specs (fn [m add]
+                    (reduce (fn [acc ^AttrSpec spec]
+                              (let [k (:key spec)]
+                                (if (contains? acc k)
+                                  acc
+                                  (let [v (spec-value db sch eid ast st spec)]
+                                    (if (nil? v) acc (add acc k v))))))
+                            m (:attrs ast)))]
+    ;; a transient pays off for a wildcard or many attributes; a few assocs are cheaper
+    (if (or (:wildcard? ast) (> (count (:attrs ast)) 8))
+      (let [t (transient m0)
+            t (if (:wildcard? ast) (wildcard-into! t db sch eid (:override ast) st) t)
+            m (add-specs t assoc!)]
+        (when (pos? (count m)) (persistent! m)))
+      (let [m (add-specs m0 assoc)]
+        (when (pos? (count m)) m)))))
 
 (defn- check-not-history [db]
   (when (index/-history? db)
