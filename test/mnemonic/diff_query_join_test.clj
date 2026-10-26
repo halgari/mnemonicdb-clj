@@ -63,6 +63,12 @@
    '[:find ?e ?g :in $ [[?i ?g]] :where [?e :j/id ?i] [?e :j/grp ?g]]
    ;; unknown bound values
    '[:find ?e :in $ [?v ...] :where [?e :j/name ?v]]
+   ;; a contiguous run of entities joined on (an AEVT window about the relation's size,
+   ;; scanned instead of the attribute's whole range), card-one and card-many
+   '[:find ?e ?n ?t :where [?e :j/id ?i] [(< ?i 400)] [?e :j/name ?n] [?e :j/tag ?t]]
+   '[:find ?e ?s :where [?e :j/id ?i] [(>= ?i 1200)] [(< ?i 1260)] [?e :j/score ?s]]
+   ;; a run plus one far entity: the window is wide, so the join falls back to seeks
+   '[:find ?e ?n :in $ [?k ...] :where [?e :j/id ?k] [?e :j/name ?n]]
    ;; aggregates and :with over a hash join
    '[:find ?g (count ?e) (sum ?s) :where [?e :j/grp ?g] [?e :j/score ?s]]
    '[:find ?g (count ?n) :with ?e :where [?e :j/grp ?g] [?e :j/name ?n]]])
@@ -72,6 +78,7 @@
     (some #{'[?i ...]} q) [(vec (range 0 n-entities 3))]
     (some #{'[[?i ?g]]} q) [(vec (for [i (range 0 n-entities 7)] [i (mod (* i 3) 10)]))]
     (some #{'[?v ...]} q) [(vec (concat (map #(str "nm" %) (range 0 700 3)) ["zzz" 5]))]
+    (some #{'[?k ...]} q) [(vec (concat (range 0 300) [(dec n-entities)]))]
     :else []))
 
 (defn- canon [r]
@@ -101,4 +108,6 @@
       (o/transact-both [cd cm] [[:db/add [:j/id 3] :j/grp 4] [:db/retract [:j/id 4] :j/name "nm4"]
                                 [:db/add [:j/id 5] :j/score 50.5]])
       (check :as-of (d/as-of (d/db cd) t0) (m/as-of (m/db cm) t0))
-      (check :after (d/db cd) (m/db cm)))))
+      (check :after (d/db cd) (m/db cm))
+      (check :since (d/since (d/db cd) t0) (m/since (m/db cm) t0))
+      (check :history (d/history (d/db cd)) (m/history (m/db cm))))))

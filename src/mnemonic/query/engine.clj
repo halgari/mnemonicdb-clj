@@ -19,7 +19,7 @@
            (java.nio ByteBuffer)
            (java.util ArrayList Arrays Collection Date HashMap HashSet LinkedHashMap List RandomAccess UUID WeakHashMap)
            (java.util.concurrent ConcurrentHashMap TimeoutException)
-           (mnemonic.datom Datom)
+           (mnemonic.datom IDatomView)
            (mnemonic.schema Attr)))
 
 (set! *warn-on-reflection* true)
@@ -215,13 +215,17 @@
                      (recur (inc i) (conj specs {:kind :free}) (conj new-syms s) (assoc first-pos s i))))
             (throw (qerror :db.error/invalid-query "Invalid term in data pattern" {:term t}))))))))
 
-(defn- datom-comp [^Datom d ^long pos]
+;; Scans hand clauses flyweight datom views (index/reduce-views): a view is valid only
+;; during the call that receives it, so everything a clause keeps is copied out of it
+;; with `datom-comp`, never the view itself.
+
+(defn- datom-comp [^IDatomView d ^long pos]
   (case pos
-    0 (.-e d)
-    1 (.-a d)
-    2 (.-v d)
-    3 (.-tx d)
-    4 (.-added d)))
+    0 (.eid d)
+    1 (.attr d)
+    2 (.value d)
+    3 (.txid d)
+    4 (.isAdded d)))
 
 (defn- spec-raw [spec ^objects tuple consts-only?]
   (case (:kind spec)
@@ -292,10 +296,10 @@
             tx (if tx? (long tx) 0)]
         (if (and (nil? vbytes) (not tx?) (not added?) (empty? same))
           (constantly true)
-          (fn [^Datom d]
-            (and (or (nil? vbytes) (Arrays/equals ^bytes vbytes (codec/value->bytes (.-v d))))
-                 (or (not tx?) (== tx (.-tx d)))
-                 (or (not added?) (= added (.-added d)))
+          (fn [^IDatomView d]
+            (and (or (nil? vbytes) (Arrays/equals ^bytes vbytes (codec/value->bytes (.value d))))
+                 (or (not tx?) (== tx (.txid d)))
+                 (or (not added?) (= added (.isAdded d)))
                  (every? (fn [[p q]] (= (datom-comp d p) (datom-comp d q))) same))))))))
 
 (defn- scan!
@@ -304,15 +308,15 @@
   `cnt` (a long[1] shared by the scans of one clause)."
   [ctx ^longs cnt db idx prefix pass? f]
   (let [dl? (some? (:deadline ctx))]
-    (reduce (fn [_ d]
-              (when dl?
-                (let [c (aget cnt 0)]
-                  (aset cnt 0 (inc c))
-                  (when (zero? (bit-and c 4095)) (check-deadline! ctx))))
-              (when (or (nil? pass?) (pass? d)) (f d))
-              nil)
-            nil
-            (index/datoms-iterable db idx prefix))))
+    (index/reduce-views (index/datoms-iterable db idx prefix)
+                        (fn [_ d]
+                          (when dl?
+                            (let [c (aget cnt 0)]
+                              (aset cnt 0 (inc c))
+                              (when (zero? (bit-and c 4095)) (check-deadline! ctx))))
+                          (when (or (nil? pass?) (pass? d)) (f d))
+                          nil)
+                        nil)))
 
 (defn- scan-budget!
   "Like `scan!` but gives up once more than `limit` datoms of the range were visited.
@@ -322,25 +326,25 @@
   (let [dl? (some? (:deadline ctx))
         limit (long limit)
         seen (long-array 1)]
-    (if (reduce (fn [_ d]
-                  (when dl?
-                    (let [c (aget cnt 0)]
-                      (aset cnt 0 (inc c))
-                      (when (zero? (bit-and c 4095)) (check-deadline! ctx))))
-                  (let [s (inc (aget seen 0))]
-                    (aset seen 0 s)
-                    (if (> s limit)
-                      (reduced false)
-                      (do (when (or (nil? pass?) (pass? d)) (f d))
-                          true))))
-                true
-                (index/datoms-iterable db idx prefix))
+    (if (index/reduce-views (index/datoms-iterable db idx prefix)
+                            (fn [_ d]
+                              (when dl?
+                                (let [c (aget cnt 0)]
+                                  (aset cnt 0 (inc c))
+                                  (when (zero? (bit-and c 4095)) (check-deadline! ctx))))
+                              (let [s (inc (aget seen 0))]
+                                (aset seen 0 s)
+                                (if (> s limit)
+                                  (reduced false)
+                                  (do (when (or (nil? pass?) (pass? d)) (f d))
+                                      true))))
+                            true)
       (aget seen 0)
       (- (inc limit)))))
 
 (defn- new-values
   "Object[] of the free-variable values taken from datom `d`."
-  ^objects [^Datom d ^ints new-pos]
+  ^objects [^IDatomView d ^ints new-pos]
   (let [n (alength new-pos)
         r (object-array n)]
     (dotimes [i n]
@@ -452,21 +456,30 @@
           (aset r i (unchecked-byte (inc (bit-and 0xFF (aget r i)))))
           r)))))
 
+;; compares the cursor's key in place (no copy per entry) and passes flyweight views on
 (deftype StopCursor [^mnemonic.index.ICursor c ^bytes stop]
   mnemonic.index.ICursor
-  (valid [_] (and (.valid c) (or (nil? stop) (neg? (Arrays/compareUnsigned ^bytes (.key c) stop)))))
+  (valid [_] (and (.valid c)
+                  (or (nil? stop)
+                      (neg? (Arrays/compareUnsigned (index/key-buf c) 0 (unchecked-int (index/key-len c))
+                                                    stop 0 (alength stop))))))
   (advance [_] (.advance c))
   (key [_] (.key c))
   (datom [_] (.datom c))
   (retractTx [_] (.retractTx c))
-  (close [_] (.close c)))
+  (close [_] (.close c))
+  mnemonic.index.IViewCursor
+  (view [_] (index/view-of c))
+  mnemonic.index.IKeyView
+  (keyBuf [_] (index/key-buf c))
+  (keyLen [_] (index/key-len c)))
 
 (defn- range-db
-  "A db view whose reads are the AVET entries of `db` from `start` up to (excluding)
+  "A db view whose reads are the `idx` entries of `db` from `start` up to (excluding)
   `stop`; everything else is delegated to `db`."
-  [db ^bytes start ^bytes stop]
+  [db idx ^bytes start ^bytes stop]
   (reify index/IDb
-    (-view [_ _ _] (->StopCursor (index/-seek-view db :avet start) stop))
+    (-view [_ _ _] (->StopCursor (index/-seek-view db idx start) stop))
     (-seek-view [_ index s] (index/-seek-view db index s))
     (-seek-current [_ index p] (index/-seek-current db index p))
     (-seek-history [_ index p] (index/-seek-history db index p))
@@ -504,7 +517,7 @@
                 lo (if (and dbl? (some? lo)) (double-edge lo true) lo)
                 hi (if (and dbl? (some? hi)) (double-edge hi false) hi)
                 hi (if nan-passes? nil hi)]
-            (range-db db
+            (range-db db :avet
                       (codec/encode-prefix :avet (if (nil? lo) [a] [a lo]))
                       (prefix-successor (codec/encode-prefix :avet (if (nil? hi) [a] [a hi]))))))))))
 
@@ -522,9 +535,9 @@
   "Join key of a datom at the (sorted) bound positions `bound-pos`."
   [bound-pos]
   (if (== 1 (count bound-pos))
-    (let [p (long (first bound-pos))] (fn [^Datom d] (datom-comp d p)))
+    (let [p (long (first bound-pos))] (fn [^IDatomView d] (datom-comp d p)))
     (let [ps (long-array bound-pos)]
-      (fn [^Datom d]
+      (fn [^IDatomView d]
         (let [ks (object-array (alength ps))]
           (dotimes [i (alength ps)] (aset ks i (datom-comp d (aget ps i))))
           (Arrays/asList ks))))))
@@ -533,7 +546,7 @@
   "Datom predicate for the repeated-variable constraints `same`, nil when there are none."
   [same]
   (when (seq same)
-    (fn [^Datom d] (every? (fn [[p q]] (= (datom-comp d p) (datom-comp d q))) same))))
+    (fn [^IDatomView d] (every? (fn [[p q]] (= (datom-comp d p) (datom-comp d q))) same))))
 
 (defn- unconstrained? [kind]
   (or (identical? kind :free) (identical? kind :blank) (identical? kind :same)))
@@ -672,6 +685,33 @@
     (System/arraycopy prefix 0 b 1 (alength prefix))
     (ByteBuffer/wrap b)))
 
+(defn- eid-window
+  "[start stop] of the AEVT entries of attribute `a` whose entity is between the smallest
+  and the largest id at column `col` of `tuples`; nil when a value there is not a plain
+  long id (an ident or lookup ref: the unbounded scan resolves those)."
+  [^ArrayList tuples ^long col ^long a]
+  (let [n (.size tuples)]
+    (loop [i 0 lo Long/MAX_VALUE hi Long/MIN_VALUE]
+      (if (< i n)
+        (let [x (aget ^objects (.get tuples i) col)]
+          (when (instance? Long x)
+            (let [e (long x)]
+              (recur (inc i) (min lo e) (max hi e)))))
+        [(codec/encode-prefix :aevt [a lo])
+         (prefix-successor (codec/encode-prefix :aevt [a hi]))]))))
+
+(defn- window-key
+  "range-sizes key of an AEVT window [start stop]."
+  [[^bytes start ^bytes stop]]
+  (let [sl (alength start)
+        tl (if stop (alength stop) 0)
+        b (byte-array (+ 2 sl tl))]
+    (aset b 0 (unchecked-byte 4))
+    (aset b 1 (unchecked-byte sl))
+    (System/arraycopy start 0 b 2 sl)
+    (when stop (System/arraycopy stop 0 b (+ 2 sl) tl))
+    (ByteBuffer/wrap b)))
+
 (defn- exec-db-pattern [ctx db rel plan terms hints]
   (let [{:keys [specs new-syms new-pos bound-pos same]} plan
         ^ArrayList tuples (:tuples rel)
@@ -679,7 +719,7 @@
         n (.size tuples)
         no-new? (empty? new-pos)
         np (int-array new-pos)
-        emit! (fn [^objects t ^Datom d]
+        emit! (fn [^objects t ^IDatomView d]
                 (.add out (if no-new? t (extend-tuple t (new-values d np)))))
         result {:vars (into (:vars rel) new-syms) :tuples out}]
     (when (pos? n)
@@ -705,19 +745,19 @@
                           (let [^ArrayList rows
                                 (or (.get cache k)
                                     (let [rows (ArrayList.)]
-                                      (seek t (fn [^Datom d]
+                                      (seek t (fn [^IDatomView d]
                                                 (.add rows (if no-new? no-extra (new-values d np)))))
                                       (.put cache k rows)
                                       rows))]
                             (dotimes [i (.size rows)]
                               (.add out (if no-new? t (extend-tuple t (.get rows i))))))
-                          (seek t (fn [^Datom d] (emit! t d))))))))]
+                          (seek t (fn [^IDatomView d] (emit! t d))))))))]
             (cond
               ;; no variable from the relation is involved: one scan, then a product
               (empty? bound-pos)
               (when-let [[idx prefix pass? a] (scan-const)]
                 (scan! ctx cnt (or (range-plan db rel specs hints a) db) idx prefix pass?
-                       (fn [^Datom d]
+                       (fn [^IDatomView d]
                          (check-deadline! ctx)
                          (each-tuple [t tuples ctx] (emit! t d)))))
 
@@ -725,10 +765,17 @@
               ;; once and hash join, unless the range is much larger than the relation
               (and (>= n hash-join-min-tuples) (identical? :const (:kind (nth specs 1))))
               (if-let [[idx prefix pass? a] (scan-const)]
-                (let [rdb (range-plan db rel specs hints a)
+                (let [hinted (range-plan db rel specs hints a)
+                      ;; entity bound by the relation: scan only the AEVT window from its
+                      ;; smallest to its largest id (one transaction's entities are
+                      ;; contiguous, so the window is often about the relation's size)
+                      win (when (and (nil? hinted) (some? a) (identical? idx :aevt)
+                                     (identical? :bound (:kind (nth specs 0))))
+                            (eid-window tuples (long (:idx (nth specs 0))) (long a)))
+                      rdb (or hinted (when win (range-db db :aevt (nth win 0) (nth win 1))))
                       limit (* hash-join-scan-factor n)
-                      sizes (when-not rdb (range-sizes db))
-                      skey (when sizes (range-key idx prefix))
+                      sizes (when (or (nil? rdb) win) (range-sizes db))
+                      skey (when sizes (if win (window-key win) (range-key idx prefix)))
                       known (when sizes (.get sizes skey))]
                   (if (and known (> (Math/abs (long known)) limit))
                     (seeks!)
@@ -739,7 +786,7 @@
                                                  (let [g (ArrayList.)] (.put groups k g) g))]
                             (.add g t))))
                       (let [r (long (scan-budget! ctx cnt (or rdb db) idx prefix pass?
-                                                  (fn [^Datom d]
+                                                  (fn [^IDatomView d]
                                                     (when-let [^ArrayList g (.get groups (datom-key d))]
                                                       (dotimes [i (.size g)] (emit! (.get g i) d))))
                                                   limit))]
