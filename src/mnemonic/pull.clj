@@ -16,9 +16,11 @@
             [mnemonic.index :as index]
             [mnemonic.schema :as schema]
             [mnemonic.tx :as tx])
-  (:import (java.util ArrayList)
+  (:import (java.lang.ref Reference)
+           (java.util ArrayList Arrays HashMap)
            (java.util.concurrent ConcurrentHashMap)
            (java.util.concurrent.atomic AtomicLong)
+           (mnemonic.datom IDatomView)
            (mnemonic.schema Attr)))
 
 (set! *warn-on-reflection* true)
@@ -281,12 +283,85 @@
     (ref-attr? attr) (default-ref-value db sch attr eid (long c) st)
     :else c))
 
+(def ^:private prefetch-min
+  "Fewer entities than this are read one at a time (through the segment cache)."
+  64)
+
+(defn- prefetch
+  "Every asserted datom of each entity of `ids` (entity ids), read in one EAVT range scan
+  from the smallest id to the largest, as a HashMap eid -> [attrs values] (the shape of
+  `entity/attr-values`, in EAVT order). nil when there are fewer than `prefetch-min` or
+  the ids are not dense (they span more than 4x their count): then reading each entity
+  on its own is cheaper."
+  [db ^java.util.Collection ids]
+  (let [n (.size ids)]
+    (when (>= n (long prefetch-min))
+      (let [it (.iterator ids)
+            [lo hi] (loop [lo Long/MAX_VALUE hi Long/MIN_VALUE]
+                      (if (.hasNext it)
+                        (let [e (long (.next it))] (recur (min lo e) (max hi e)))
+                        [lo hi]))
+            lo (long lo)
+            hi (long hi)]
+        (when (<= (- hi lo) (* 4 n))
+          (let [out (HashMap.)
+                _ (doseq [e ids] (.put out e [(ArrayList.) (ArrayList.)]))
+                ^bytes stop (entity/e-prefix (inc hi))
+                ^mnemonic.index.ICursor c (index/-seek-view db :eavt (entity/e-prefix lo))]
+            (try
+              (loop []
+                (when (and (.valid c)
+                           (neg? (Arrays/compareUnsigned (index/key-buf c) 0 (unchecked-int (index/key-len c))
+                                                         stop 0 (alength stop))))
+                  (let [^IDatomView d (index/view-of c)]
+                    (when (.isAdded d)
+                      (when-let [[^ArrayList as ^ArrayList vs] (.get out (.eid d))]
+                        (.add as (.attr d))
+                        (.add vs (.value d)))))
+                  (.advance c)
+                  (recur)))
+              (finally
+                (.close c)
+                (Reference/reachabilityFence db)))
+            out))))))
+
+(defn- pre-values
+  "ArrayList of the first `limit` (nil: all) values of attribute `aid` in a prefetched
+  entity, or nil when it has none (as `entity/values-by-prefix`)."
+  [[^ArrayList as ^ArrayList vs] ^long aid limit]
+  (let [limit (if limit (long limit) Long/MAX_VALUE)
+        n (.size as)]
+    (when (pos? limit)
+      (let [out (ArrayList.)]
+        (loop [i 0]
+          (when (and (< i n) (< (.size out) limit))
+            (when (== aid (long (.get as i))) (.add out (.get vs i)))
+            (recur (inc i))))
+        (when-not (.isEmpty out) out)))))
+
+(defn- pre-first
+  "The first value of attribute `aid` in a prefetched entity, or ::entity/no-datom (as
+  `entity/first-value`)."
+  [[^ArrayList as ^ArrayList vs] ^long aid]
+  (let [n (.size as)]
+    (loop [i 0]
+      (cond
+        (== i n) ::entity/no-datom
+        (== aid (long (.get as i))) (.get vs i)
+        :else (recur (inc i))))))
+
 (defn- collect-children
   "Vector of the non-nil `child-value`s of the values (or entity ids) `vs`, or nil when
-  empty. `vs` was read before this runs, so nested pulls hold no cursor of ours open."
+  empty. `vs` was read before this runs, so nested pulls hold no cursor of ours open.
+  Many dense ref targets pulled through a sub-pattern are read in one range scan first
+  (`prefetch`), handed to their pulls in the state as :pre."
   [db sch eid ^Attr attr ^ArrayList vs ast st ^AttrSpec spec]
   (let [n (.size vs)
-        cst (child-state eid st spec)]
+        cst (child-state eid st spec)
+        st (if-let [pre (when (and (:sub spec) (not (:recur spec)) (ref-attr? attr))
+                          (prefetch db vs))]
+             (assoc st :pre pre)
+             st)]
     (loop [i 0 out (transient [])]
       (if (< i n)
         (let [r (child-value db sch eid attr (.get vs i) ast st cst spec)]
@@ -295,8 +370,9 @@
           (when (pos? (count out)) out))))))
 
 (defn- spec-raw
-  "Value of `spec` for `eid` before :xform/:default, or nil when absent."
-  [db sch eid ast st ^AttrSpec spec]
+  "Value of `spec` for `eid` before :xform/:default, or nil when absent. `entry` is the
+  entity's prefetched datoms (`prefetch`), or nil to read them."
+  [db sch eid ast st entry ^AttrSpec spec]
   (let [^Attr attr (schema/attr sch (:attr spec))]
     (when attr
       (let [many? (= :db.cardinality/many (:cardinality attr))
@@ -311,14 +387,18 @@
               (when-let [vs (entity/values-by-prefix db :vaet prefix limit true)]
                 (collect-children db sch eid attr vs ast st spec))))
           (if many?
-            (when-let [vs (entity/values-by-prefix db :eavt prefix limit false)]
+            (when-let [vs (if entry
+                            (pre-values entry (long (:id attr)) limit)
+                            (entity/values-by-prefix db :eavt prefix limit false))]
               (collect-children db sch eid attr vs ast st spec))
-            (let [v (entity/first-value db :eavt prefix)]
+            (let [v (if entry
+                      (pre-first entry (long (:id attr)))
+                      (entity/first-value db :eavt prefix))]
               (when-not (identical? v ::entity/no-datom)
                 (child-value db sch eid attr v ast st (child-state eid st spec) spec)))))))))
 
-(defn- spec-value [db sch eid ast st ^AttrSpec spec]
-  (let [raw (spec-raw db sch eid ast st spec)
+(defn- spec-value [db sch eid ast st entry ^AttrSpec spec]
+  (let [raw (spec-raw db sch eid ast st entry spec)
         v (if-let [xf (:xform spec)] (xf raw) raw)]
     (if (and (nil? v) (some? (:default spec)))
       (:default spec)
@@ -327,8 +407,8 @@
 (defn- wildcard-into!
   "The transient map `m` with every attribute of `eid` not overridden by an explicit spec.
   The entity's datoms are read first; components expand after the cursor is closed."
-  [m db sch eid override st]
-  (let [[^ArrayList as ^ArrayList vs] (entity/attr-values db eid)
+  [m db sch eid override st entry]
+  (let [[^ArrayList as ^ArrayList vs] (or entry (entity/attr-values db eid))
         n (.size as)]
     (loop [i 0 m m]
       (if (< i n)
@@ -355,19 +435,21 @@
   "Map for `eid` under `ast`, or nil when it has no content."
   [db sch eid ^PullPattern ast st]
   (let [st (if (and (not (:revisit st)) (contains? (:seen st) eid)) (assoc st :revisit true) st)
+        ;; this entity's datoms, when its parent prefetched them
+        entry (when-let [^HashMap pre (:pre st)] (.get pre eid))
         m0 (if (:id? ast) {:db/id eid} {})
         add-specs (fn [m add]
                     (reduce (fn [acc ^AttrSpec spec]
                               (let [k (:key spec)]
                                 (if (contains? acc k)
                                   acc
-                                  (let [v (spec-value db sch eid ast st spec)]
+                                  (let [v (spec-value db sch eid ast st entry spec)]
                                     (if (nil? v) acc (add acc k v))))))
                             m (:attrs ast)))]
     ;; a transient pays off for a wildcard or many attributes; a few assocs are cheaper
     (if (or (:wildcard? ast) (> (count (:attrs ast)) 8))
       (let [t (transient m0)
-            t (if (:wildcard? ast) (wildcard-into! t db sch eid (:override ast) st) t)
+            t (if (:wildcard? ast) (wildcard-into! t db sch eid (:override ast) st entry) t)
             m (add-specs t assoc!)]
         (when (pos? (count m)) (persistent! m)))
       (let [m (add-specs m0 assoc)]
@@ -377,15 +459,19 @@
   (when (index/-history? db)
     (throw (IllegalStateException. "Can't pull from history"))))
 
-(defn pull-from-ast
-  "Pulls `eid` (a long, or anything `entity/resolve-eid` accepts) from `db` under a
-  parsed pattern. For use by the query engine."
-  [db ast eid]
+(defn- pull-from-ast*
+  [db ast eid st]
   (let [ast (parse-pattern ast)
         e (entity/resolve-eid db eid)]
     (if (nil? e)
       (when (and (nil? eid) (:id? ast)) {:db/id nil})
-      (pull-entity db (index/-schema db) e ast empty-state))))
+      (pull-entity db (index/-schema db) e ast st))))
+
+(defn pull-from-ast
+  "Pulls `eid` (a long, or anything `entity/resolve-eid` accepts) from `db` under a
+  parsed pattern. For use by the query engine."
+  [db ast eid]
+  (pull-from-ast* db ast eid empty-state))
 
 (defn pull
   "Pulls `eid` (id, ident or lookup ref) from `db` using `pattern`."
@@ -398,5 +484,8 @@
   "Pulls each of `eids`; a vector of results (nil for entities with no content)."
   [db pattern eids]
   (check-not-history db)
-  (let [ast (parse-pattern pattern)]
-    (mapv #(pull-from-ast db ast %) eids)))
+  (let [ast (parse-pattern pattern)
+        ;; many dense ids are read in one range scan first (see `prefetch`)
+        ids (into [] (keep #(when (integer? %) (long %))) eids)
+        st (if-let [pre (prefetch db ids)] (assoc empty-state :pre pre) empty-state)]
+    (mapv #(pull-from-ast* db ast % st) eids)))
