@@ -12,7 +12,8 @@
   call at a time, until nothing changes. Calls inside `not` start their own evaluation."
   (:require [mnemonic.query.engine :as e]
             [mnemonic.query.fns :as fns])
-  (:import (java.util ArrayList HashMap HashSet IdentityHashMap LinkedHashSet)))
+  (:import (clojure.lang IFn LazilyPersistentVector)
+           (java.util ArrayList HashMap HashSet IdentityHashMap LinkedHashSet List)))
 
 (set! *warn-on-reflection* true)
 
@@ -24,8 +25,8 @@
   "Relation of the distinct tuples of `rel` restricted to `syms` (which must be bound)."
   [ctx rel syms]
   (let [vidx (e/var-index rel)
-        cols (mapv #(long (vidx %)) syms)
-        n (count cols)
+        ^ints cols (int-array (map vidx syms))
+        n (alength cols)
         ^ArrayList tuples (:tuples rel)
         seen (HashSet.)
         out (ArrayList.)]
@@ -33,12 +34,24 @@
       (when (zero? (bit-and i 4095)) (e/check-deadline! ctx))
       (let [^objects t (.get tuples i)
             r (object-array n)]
-        (dotimes [j n] (aset r j (aget t (long (nth cols j)))))
-        (when (.add seen (vec r)) (.add out r))))
+        (dotimes [j n] (aset r j (aget t (aget cols j))))
+        ;; the key vector shares the tuple's array (tuples are never written once built)
+        (when (.add seen (LazilyPersistentVector/createOwning r)) (.add out r))))
     {:vars (vec syms) :tuples out}))
 
-(defn- key-of [^objects t cols]
-  (mapv #(aget t (long %)) cols))
+(defn- cols-of
+  "Column indexes (an int[]) for `key-of`."
+  ^ints [cols]
+  (int-array cols))
+
+(defn- key-of
+  "Vector of the values of tuple `t` at the columns `cols` (an int[]); equal to (and
+  hashing as) the vector `mapv` would build, without the closure or the copy."
+  [^objects t ^ints cols]
+  (let [n (alength cols)
+        r (object-array n)]
+    (dotimes [j n] (aset r j (aget t (aget cols j))))
+    (LazilyPersistentVector/createOwning r)))
 
 (defn- insufficient [syms clause]
   (qerror :db.error/insufficient-binding
@@ -60,11 +73,13 @@
           ;; rule calls under negation are evaluated to completion on their own
           res (e/run-clauses (-> ctx (dissoc ::session ::delta) (assoc ::depth depth)) sub body)
           ridx (e/var-index res)
-          rcols (mapv ridx vars)
           matched (HashSet.)
           ^ArrayList rtuples (:tuples res)
-          _ (dotimes [i (.size rtuples)] (.add matched (key-of (.get rtuples i) rcols)))
-          cols (mapv vidx vars)
+          ;; built only when there are results (as before, an unbound var fails only then)
+          _ (when (pos? (.size rtuples))
+              (let [rcols (cols-of (map ridx vars))]
+                (dotimes [i (.size rtuples)] (.add matched (key-of (.get rtuples i) rcols)))))
+          cols (cols-of (map vidx vars))
           out (ArrayList.)
           ^ArrayList tuples (:tuples rel)]
       (dotimes [i (.size tuples)]
@@ -91,15 +106,15 @@
             ridx (e/var-index res)
             _ (when-let [missing (seq (remove #(contains? ridx %) fresh))]
                 (throw (insufficient missing clause)))
-            bcols (mapv ridx bound)
-            fcols (mapv ridx fresh)
+            bcols (cols-of (map ridx bound))
+            fcols (cols-of (map ridx fresh))
             ^ArrayList rtuples (:tuples res)]
         (dotimes [i (.size rtuples)]
           (when (zero? (bit-and i 4095)) (e/check-deadline! ctx))
           (let [^objects t (.get rtuples i)]
             (.add results [(key-of t bcols) (key-of t fcols)])))))
     (let [groups (HashMap.)
-          bcols (mapv vidx bound)]
+          bcols (cols-of (map vidx bound))]
       (doseq [[k f] results]
         (let [^ArrayList l (or (.get groups k)
                                (let [l (ArrayList.)] (.put groups k l) l))]
@@ -129,6 +144,7 @@
     (or (.get cs k)
         (let [c {:name name :mask mask :src src-val
                  :pos (vec (keep-indexed (fn [i b] (when b i)) mask))
+                 :posa (int-array (keep-indexed (fn [i b] (when b i)) mask))
                  :demand (HashSet.) :dpend (ArrayList.) :dd (ArrayList.)
                  :ans (HashSet.) :aidx (HashMap.) :apend (ArrayList.) :da (ArrayList.)}]
           (.put cs k c)
@@ -138,8 +154,14 @@
   (when (.add ^HashSet (:demand c) v)
     (.add ^ArrayList (:dpend c) v)))
 
-(defn- bound-key [c ans]
-  (mapv #(nth ans %) (:pos c)))
+(defn- bound-key
+  "The bound-argument values of answer `ans` (a vector) for class `c`, as a vector."
+  [c ans]
+  (let [^ints pos (:posa c)
+        n (alength pos)
+        r (object-array n)]
+    (dotimes [i n] (aset r i (nth ans (aget pos i))))
+    (LazilyPersistentVector/createOwning r)))
 
 (defn- add-answer! [c ans]
   (when (.add ^HashSet (:ans c) ans)
@@ -185,30 +207,40 @@
                    (assoc-in [:sources '$] (:src c)))
           res (e/run-clauses ctx' seed-rel body)
           ridx (e/var-index res)
-          cols (mapv (fn [h]
-                       (or (ridx h)
-                           (throw (qerror :db.error/insufficient-binding
-                                          (str "Rule head variable " h " is not bound by the rule body")
-                                          {:variables #{h}}))))
-                     head)
+          cols (cols-of (map (fn [h]
+                               (or (ridx h)
+                                   (throw (qerror :db.error/insufficient-binding
+                                                  (str "Rule head variable " h " is not bound by the rule body")
+                                                  {:variables #{h}}))))
+                             head))
           ^ArrayList rtuples (:tuples res)]
       (dotimes [i (.size rtuples)]
         (when (zero? (bit-and i 4095)) (e/check-deadline! ctx))
         (add-answer! c (key-of (.get rtuples i) cols))))))
 
-(defn- has-delta? [session rule-name]
-  (some (fn [c] (and (= rule-name (:name c)) (pos? (.size ^ArrayList (:da c)))))
-        (.values ^HashMap (:classes session))))
-
-(defn- eval-class! [ctx session c]
-  (let [dd (vec (:dd c))]
+(defn- eval-class!
+  "One round for class `c`. `delta-rules`: the names of the rules some class of which has
+  new answers this round (a class's delta only changes at `snapshot!`)."
+  [ctx session c delta-rules]
+  (let [dd (vec (:dd c))
+        ^HashSet demand (:demand c)
+        ;; the demand as a vector, rebuilt only when it has grown (calls in rule bodies
+        ;; add to it during the round)
+        dvec (volatile! nil)
+        dsize (volatile! -1)
+        demand-vec (fn []
+                     (let [s (.size demand)]
+                       (when-not (== s (long @dsize))
+                         (vreset! dvec (vec demand))
+                         (vreset! dsize s))
+                       @dvec))]
     (doseq [d (get (:rules ctx) (:name c))]
       (when (seq dd)
         (eval-def! ctx session c d dd nil))
-      (when (pos? (.size ^HashSet (:demand c)))
+      (when (pos? (.size demand))
         (doseq [site (collect-sites (:body d))]
-          (when (has-delta? session (:name site))
-            (eval-def! ctx session c d (vec (:demand c)) {:clause site})))))))
+          (when (contains? delta-rules (:name site))
+            (eval-def! ctx session c d (demand-vec) {:clause site})))))))
 
 (defn- fixpoint! [ctx session]
   (loop []
@@ -216,7 +248,9 @@
     (let [cs (vec (.values ^HashMap (:classes session)))]
       (doseq [c cs] (snapshot! c))
       (when (some #(or (pos? (.size ^ArrayList (:dd %))) (pos? (.size ^ArrayList (:da %)))) cs)
-        (doseq [c cs] (eval-class! ctx session c))
+        ;; classes created during the round start with no delta, so this set holds
+        (let [delta-rules (into #{} (keep #(when (pos? (.size ^ArrayList (:da %))) (:name %))) cs)]
+          (doseq [c cs] (eval-class! ctx session c delta-rules)))
         (recur)))))
 
 ;; ------------------------------------------------------------------ rule calls
@@ -271,7 +305,12 @@
                             (fn [_] val)
                             (fn [^objects t] (aget t (long idx)))))
                         bound-plans)
-          key-of-tuple (fn [t] (mapv #(% t) getters))
+          ^objects garr (object-array getters)
+          ng (alength garr)
+          key-of-tuple (fn [t]
+                         (let [r (object-array ng)]
+                           (dotimes [i ng] (aset r i (.invoke ^IFn (aget garr i) t)))
+                           (LazilyPersistentVector/createOwning r)))
           top? (nil? (::session ctx))
           session (or (::session ctx) (new-session))
           ctx (assoc ctx ::session session)
@@ -282,21 +321,43 @@
         (add-demand! c (key-of-tuple (.get tuples i))))
       (when top? (fixpoint! ctx session))
       (let [delta (::delta ctx)
-            delta-index (when (and delta (identical? (:clause delta) clause))
-                          (group-by #(bound-key c %) (vec ^ArrayList (:da c))))
-            ^HashMap aidx (:aidx c)
-            lookup (if delta-index
-                     (fn [k] (get delta-index k))
-                     (fn [k] (.get aidx k)))
+            ;; the delta's answers by bound key (an index like :aidx, for this call only)
+            ^HashMap delta-index (when (and delta (identical? (:clause delta) clause))
+                                   (let [m (HashMap.)
+                                         ^ArrayList da (:da c)]
+                                     (dotimes [i (.size da)]
+                                       (let [ans (.get da i)
+                                             k (bound-key c ans)
+                                             ^ArrayList l (or (.get m k) (let [l (ArrayList.)] (.put m k l) l))]
+                                         (.add l ans)))
+                                     m))
+            ^HashMap aidx (or delta-index (:aidx c))
             free (filterv #(= :free (:kind (nth plan %))) (range (count plan)))
             new-syms (mapv #(:sym (nth plan %)) free)
-            same (vec (keep-indexed (fn [i p] (when (= :same (:kind p)) [i (:pos p)])) plan))]
+            same (vec (keep-indexed (fn [i p] (when (= :same (:kind p)) [i (:pos p)])) plan))
+            ^ints fa (int-array free)
+            nf (alength fa)
+            ^ints si (int-array (map first same))
+            ^ints sj (int-array (map second same))
+            nsm (alength si)
+            ;; answers are distinct head tuples sharing the lookup's bound values, and a
+            ;; :same position repeats a free one: only blank positions can make two answers
+            ;; project to the same row
+            dedupe? (boolean (some #(= :blank (:kind %)) plan))]
         (e/extend-rel
          ctx rel new-syms
          (fn [t]
-           (let [seen (HashSet.)]
-             (keep (fn [ans]
-                     (when (every? (fn [[i j]] (= (nth ans i) (nth ans j))) same)
-                       (let [vals (mapv #(nth ans %) free)]
-                         (when (.add seen vals) (object-array vals)))))
-                   (lookup (key-of-tuple t))))))))))
+           (when-let [^List as (.get aidx (key-of-tuple t))]
+             (let [m (.size as)
+                   out (ArrayList. m)
+                   seen (when dedupe? (HashSet.))]
+               (dotimes [x m]
+                 (let [ans (.get as x)]
+                   (when (loop [k 0]
+                           (or (== k nsm)
+                               (and (= (nth ans (aget si k)) (nth ans (aget sj k))) (recur (inc k)))))
+                     (let [r (object-array nf)]
+                       (dotimes [k nf] (aset r k (nth ans (aget fa k))))
+                       (when (or (not dedupe?) (.add ^HashSet seen (LazilyPersistentVector/createOwning r)))
+                         (.add out r))))))
+               out))))))))

@@ -26,7 +26,8 @@
 (defn- variance ^double [vs]
   (let [n (count vs)
         mean (/ (double (reduce + vs)) n)]
-    (/ (double (reduce + (map (fn [x] (let [d (- (double x) mean)] (* d d))) vs))) n)))
+    ;; same left-to-right sum as before, without a lazy seq of the squares
+    (/ (double (reduce (fn [acc x] (let [d (- (double x) mean)] (+ (double acc) (* d d)))) 0.0 vs)) n)))
 
 (defn- extreme [cmp vs]
   (reduce (fn [a b] (if (neg? (cmp b a)) b a)) vs))

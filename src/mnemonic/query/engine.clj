@@ -15,7 +15,7 @@
             [mnemonic.query.aggregates :as aggregates]
             [mnemonic.query.fns :as fns]
             [mnemonic.query.parser :as parser])
-  (:import (clojure.lang LazilyPersistentVector)
+  (:import (clojure.lang ArraySeq IFn LazilyPersistentVector PersistentArrayMap)
            (java.nio ByteBuffer)
            (java.util ArrayList Arrays Collection Date HashMap HashSet LinkedHashMap List RandomAccess UUID WeakHashMap)
            (java.util.concurrent ConcurrentHashMap TimeoutException)
@@ -285,6 +285,20 @@
       (try [idx (codec/encode-prefix idx comps) covered?]
            (catch clojure.lang.ExceptionInfo _ nil)))))
 
+(defn- same-pass
+  "Datom predicate for the repeated-variable constraints `same` ([pos pos] pairs), nil
+  when there are none."
+  [same]
+  (when (seq same)
+    (let [^ints ps (int-array (map first same))
+          ^ints qs (int-array (map second same))
+          n (alength ps)]
+      (fn [^IDatomView d]
+        (loop [i 0]
+          (or (== i n)
+              (and (= (datom-comp d (aget ps i)) (datom-comp d (aget qs i)))
+                   (recur (inc i)))))))))
+
 (defn- datom-filter
   "Predicate over datoms for the constraints not covered by the index prefix."
   [[_ _ v tx added] covered? same]
@@ -296,11 +310,12 @@
             tx (if tx? (long tx) 0)]
         (if (and (nil? vbytes) (not tx?) (not added?) (empty? same))
           (constantly true)
-          (fn [^IDatomView d]
-            (and (or (nil? vbytes) (Arrays/equals ^bytes vbytes (codec/value->bytes (.value d))))
-                 (or (not tx?) (== tx (.txid d)))
-                 (or (not added?) (= added (.isAdded d)))
-                 (every? (fn [[p q]] (= (datom-comp d p) (datom-comp d q))) same))))))))
+          (let [sp (same-pass same)]
+            (fn [^IDatomView d]
+              (and (or (nil? vbytes) (Arrays/equals ^bytes vbytes (codec/value->bytes (.value d))))
+                   (or (not tx?) (== tx (.txid d)))
+                   (or (not added?) (= added (.isAdded d)))
+                   (or (nil? sp) (sp d))))))))))
 
 (defn- scan!
   "Calls `(f datom)` for every datom of `db` in the index range that passes `pass?`
@@ -418,25 +433,30 @@
                               [op b])))
                  hints)]
     (when (seq hs)
-      (let [n (.size tuples)]
+      ;; per hint, resolved once: the tuple column (-1 = constant), the constant, and
+      ;; whether it bounds from below / above; per tuple, a loop into a reused [lo hi]
+      (let [m (count hs)
+            ^ints hidx (int-array (map (fn [[_ b]] (if (contains? b :idx) (:idx b) -1)) hs))
+            ^objects hval (object-array (map (fn [[_ b]] (:val b)) hs))
+            ^booleans lo? (boolean-array (map (fn [[op _]] (contains? #{:gt :ge :eq} op)) hs))
+            ^booleans hi? (boolean-array (map (fn [[op _]] (contains? #{:lt :le :eq} op)) hs))
+            lh (object-array 2)
+            n (.size tuples)]
         (loop [ti 0 hull-lo nil hull-hi nil lo-open? false hi-open? false]
           (if (< ti n)
             (let [^objects t (.get tuples ti)
-                  r (reduce
-                     (fn [[lo hi] [op b]]
-                       (let [bv (if (contains? b :idx) (aget t (long (:idx b))) (:val b))]
-                         (if-not (range-vt-ok? vt bv)
-                           (reduced nil)
-                           (let [lo (if (contains? #{:gt :ge :eq} op)
-                                      (if (or (nil? lo) (pos? (compare bv lo))) bv lo)
-                                      lo)
-                                 hi (if (contains? #{:lt :le :eq} op)
-                                      (if (or (nil? hi) (neg? (compare bv hi))) bv hi)
-                                      hi)]
-                             [lo hi]))))
-                     [nil nil] hs)]
-              (when r
-                (let [[lo hi] r]
+                  ok? (loop [k 0 lo nil hi nil]
+                        (if (< k m)
+                          (let [i (aget hidx k)
+                                bv (if (neg? i) (aget hval k) (aget t i))]
+                            (if-not (range-vt-ok? vt bv)
+                              false
+                              (recur (inc k)
+                                     (if (and (aget lo? k) (or (nil? lo) (pos? (compare bv lo)))) bv lo)
+                                     (if (and (aget hi? k) (or (nil? hi) (neg? (compare bv hi)))) bv hi))))
+                          (do (aset lh 0 lo) (aset lh 1 hi) true)))]
+              (when ok?
+                (let [lo (aget lh 0) hi (aget lh 1)]
                   (recur (inc ti)
                          (cond lo-open? nil (nil? lo) nil (nil? hull-lo) lo (neg? (compare lo hull-lo)) lo :else hull-lo)
                          (cond hi-open? nil (nil? hi) nil (nil? hull-hi) hi (pos? (compare hi hull-hi)) hi :else hull-hi)
@@ -542,12 +562,6 @@
           (dotimes [i (alength ps)] (aset ks i (datom-comp d (aget ps i))))
           (Arrays/asList ks))))))
 
-(defn- same-pass
-  "Datom predicate for the repeated-variable constraints `same`, nil when there are none."
-  [same]
-  (when (seq same)
-    (fn [^IDatomView d] (every? (fn [[p q]] (= (datom-comp d p) (datom-comp d q))) same))))
-
 (defn- unconstrained? [kind]
   (or (identical? kind :free) (identical? kind :blank) (identical? kind :same)))
 
@@ -637,9 +651,14 @@
 (defn- generic-access
   [ctx ^longs cnt db specs terms bound-pos same]
   (let [bp (vec bound-pos)
-        keyf (if (== 1 (count bp))
-               (let [p (long (first bp))] (fn [full] (nth full p)))
-               (fn [full] (Arrays/asList (to-array (map #(nth full %) bp)))))]
+        ^ints bpa (int-array bp)
+        nbp (alength bpa)
+        keyf (if (== 1 nbp)
+               (let [p (aget bpa 0)] (fn [full] (nth full p)))
+               (fn [full]
+                 (let [ks (object-array nbp)]
+                   (dotimes [i nbp] (aset ks i (nth full (aget bpa i))))
+                   (Arrays/asList ks))))]
     {:scan-const (fn []
                    (when-let [res (resolve-pattern db specs (object-array 0) true)]
                      (when-let [[idx prefix covered?] (scan-plan res terms)]
@@ -732,33 +751,37 @@
                 ;; a seek per tuple, once per distinct bound key
                 (fn []
                   (let [cache (HashMap.)
-                        bidx (mapv #(long (:idx (nth specs %))) bound-pos)
-                        single? (== 1 (count bidx))
-                        b0 (long (first bidx))]
-                    (each-tuple [t tuples ctx]
-                      (let [k (if single?
-                                (aget t b0)
-                                (let [ks (object-array (count bidx))]
-                                  (dotimes [i (count bidx)] (aset ks i (aget t (long (nth bidx i)))))
-                                  (Arrays/asList ks)))]
-                        (if (if single? (cache-key? k) (every? cache-key? (.toArray ^List k)))
-                          (let [^ArrayList rows
-                                (or (.get cache k)
-                                    (let [rows (ArrayList.)]
-                                      (seek t (fn [^IDatomView d]
-                                                (.add rows (if no-new? no-extra (new-values d np)))))
-                                      (.put cache k rows)
-                                      rows))]
-                            (dotimes [i (.size rows)]
-                              (.add out (if no-new? t (extend-tuple t (.get rows i))))))
-                          (seek t (fn [^IDatomView d] (emit! t d))))))))]
+                        ^ints bidx (int-array (map #(:idx (nth specs %)) bound-pos))
+                        nb (alength bidx)
+                        single? (== 1 nb)
+                        b0 (aget bidx 0)]
+                    (letfn [(cached! [k ^objects t]
+                              (let [^ArrayList rows
+                                    (or (.get cache k)
+                                        (let [rows (ArrayList.)]
+                                          (seek t (fn [^IDatomView d]
+                                                    (.add rows (if no-new? no-extra (new-values d np)))))
+                                          (.put cache k rows)
+                                          rows))]
+                                (dotimes [i (.size rows)]
+                                  (.add out (if no-new? t (extend-tuple t (.get rows i)))))))
+                            (direct! [^objects t]
+                              (seek t (fn [^IDatomView d] (emit! t d))))]
+                      (each-tuple [t tuples ctx]
+                        (if single?
+                          (let [k (aget t b0)]
+                            (if (cache-key? k) (cached! k t) (direct! t)))
+                          (let [ks (object-array nb)]
+                            (dotimes [i nb] (aset ks i (aget t (aget bidx i))))
+                            (if (loop [i 0] (or (== i nb) (and (cache-key? (aget ks i)) (recur (inc i)))))
+                              (cached! (Arrays/asList ks) t)
+                              (direct! t))))))))]
             (cond
               ;; no variable from the relation is involved: one scan, then a product
               (empty? bound-pos)
               (when-let [[idx prefix pass? a] (scan-const)]
                 (scan! ctx cnt (or (range-plan db rel specs hints a) db) idx prefix pass?
                        (fn [^IDatomView d]
-                         (check-deadline! ctx)
                          (each-tuple [t tuples ctx] (emit! t d)))))
 
               ;; constant attribute, enough tuples: scan the constant part of the pattern
@@ -807,24 +830,56 @@
         out (ArrayList.)
         no-new? (empty? new-pos)
         groups (HashMap.)
-        const-specs (vec (keep-indexed (fn [p s] (when (= :const (:kind s)) [p (:val s)])) specs))]
+        ;; per clause: positions as int arrays, so the per-tuple / per-row work is loops
+        nb (count bound-pos)
+        ^ints bpos (int-array bound-pos)
+        ^ints bidx (int-array (map #(:idx (nth specs %)) bound-pos))
+        consts (vec (keep-indexed (fn [p s] (when (= :const (:kind s)) [p (:val s)])) specs))
+        nc (count consts)
+        ^ints cpos (int-array (map first consts))
+        ^objects cval (object-array (map second consts))
+        nsame (count same)
+        ^ints sp (int-array (map first same))
+        ^ints sq (int-array (map second same))
+        nn (count new-pos)
+        ^ints npos (int-array new-pos)
+        ;; join key: the one normalized bound value, else a vector of them
+        tkey (fn [^objects t]
+               (if (== nb 1)
+                 (fns/normalize-value (aget t (aget bidx 0)))
+                 (let [k (object-array nb)]
+                   (dotimes [i nb] (aset k i (fns/normalize-value (aget t (aget bidx i)))))
+                   (LazilyPersistentVector/createOwning k))))
+        rkey (fn [row]
+               (if (== nb 1)
+                 (fns/normalize-value (nth row (aget bpos 0)))
+                 (let [k (object-array nb)]
+                   (dotimes [i nb] (aset k i (fns/normalize-value (nth row (aget bpos i)))))
+                   (LazilyPersistentVector/createOwning k))))]
     (each-tuple [t tuples ctx]
-      (let [k (mapv #(fns/normalize-value (aget t (long (:idx (nth specs %))))) bound-pos)
+      (let [k (tkey t)
             ^ArrayList g (or (.get groups k) (let [g (ArrayList.)] (.put groups k g) g))]
         (.add g t)))
     (when-not (.isEmpty groups)
-      (doseq [row (seq coll)]
-        (check-deadline! ctx)
-        (when (and (every? (fn [[p c]] (= c (nth row p))) const-specs)
-                   (every? (fn [[p q]] (= (nth row p) (nth row q))) same))
-          (when-let [^ArrayList g (.get groups (mapv #(fns/normalize-value (nth row %)) bound-pos))]
-            (let [extra (when-not no-new?
-                          (let [e (object-array (count new-pos))]
-                            (dotimes [i (count new-pos)] (aset e i (nth row (nth new-pos i))))
-                            e))]
-              (dotimes [i (.size g)]
-                (let [^objects t (.get g i)]
-                  (.add out (if no-new? t (extend-tuple t extra))))))))))
+      (let [cnt (long-array 1)]
+        (doseq [row0 (seq coll)]
+          (let [c (aget cnt 0)]
+            (aset cnt 0 (inc c))
+            (when (zero? (bit-and c 4095)) (check-deadline! ctx)))
+          ;; nth is O(1) from here on (a list or seq row is copied once)
+          (let [row (if (instance? RandomAccess row0) row0 (vec row0))]
+            (when (and (loop [i 0]
+                         (or (== i nc) (and (= (aget cval i) (nth row (aget cpos i))) (recur (inc i)))))
+                       (loop [i 0]
+                         (or (== i nsame) (and (= (nth row (aget sp i)) (nth row (aget sq i))) (recur (inc i))))))
+              (when-let [^ArrayList g (.get groups (rkey row))]
+                (let [extra (when-not no-new?
+                              (let [e (object-array nn)]
+                                (dotimes [i nn] (aset e i (nth row (aget npos i))))
+                                e))]
+                  (dotimes [i (.size g)]
+                    (let [^objects t (.get g i)]
+                      (.add out (if no-new? t (extend-tuple t extra))))))))))))
     {:vars (into (:vars rel) new-syms) :tuples out}))
 
 ;; ------------------------------------------------------------------ clause execution
@@ -907,7 +962,14 @@
       1 (fn [t] ((getf t) (g0 t)))
       2 (fn [t] ((getf t) (g0 t) (g1 t)))
       3 (fn [t] ((getf t) (g0 t) (g1 t) (g2 t)))
-      (fn [t] (apply (getf t) (map #(% t) gs))))))
+      4 (let [g3 (nth gs 3)] (fn [t] ((getf t) (g0 t) (g1 t) (g2 t) (g3 t))))
+      5 (let [g3 (nth gs 3) g4 (nth gs 4)] (fn [t] ((getf t) (g0 t) (g1 t) (g2 t) (g3 t) (g4 t))))
+      ;; more arguments: one array per call, no lazy seq
+      (let [^objects ga (object-array gs)]
+        (fn [t]
+          (let [a (object-array n)]
+            (dotimes [i n] (aset a i (.invoke ^IFn (aget ga i) t)))
+            (.applyTo ^IFn (getf t) (ArraySeq/create a))))))))
 
 (defmethod execute-clause :pred [ctx rel clause]
   (let [call (fn-caller ctx rel clause)
@@ -923,8 +985,24 @@
 
 (defmethod execute-clause :fn [ctx rel {:keys [binding] :as clause}]
   (let [call (fn-caller ctx rel clause)]
-    (extend-rel ctx rel (binding-syms binding)
-                (fn [t] (binding-rows binding (call t) false)))))
+    (if (= :scalar (:bind binding))
+      ;; [(f ...) ?x], the common case: one value per tuple, no row arrays or vectors
+      (let [sym (:sym binding)
+            j (get (var-index rel) sym)
+            out (ArrayList.)]
+        (each-tuple [t (:tuples rel) ctx]
+          (let [v (call t)]
+            (when (some? v)
+              (if j
+                (when (= v (aget t (long j))) (.add out t))
+                (let [n (alength t)
+                      r (object-array (inc n))]
+                  (System/arraycopy t 0 r 0 n)
+                  (aset r n v)
+                  (.add out r))))))
+        {:vars (if j (:vars rel) (conj (:vars rel) sym)) :tuples out})
+      (extend-rel ctx rel (binding-syms binding)
+                  (fn [t] (binding-rows binding (call t) false))))))
 
 (defn- deferrable? [clause]
   (contains? #{:pred :fn :rule :not :not-join :or-join} (:clause clause)))
@@ -1151,18 +1229,22 @@
                                     (.put groups k c)
                                     c))]
             (dotimes [i nagg] (.add ^ArrayList (aget cols i) (aget all (+ nk i))))))))
-    (let [out (ArrayList.)]
+    (let [out (ArrayList.)
+          ne (count elems)
+          ;; per element, resolved once: aggregate or plain
+          ^booleans agg? (boolean-array (map #(= :agg (:type %)) elems))
+          ^objects aggf (object-array aggs)]
       (doseq [[k ^objects cols] groups]
         (check-deadline! ctx)
-        (let [row (object-array (count elems))]
+        (let [row (object-array ne)]
           (loop [i 0 ki 0 ai 0]
-            (when (< i (count elems))
-              (if (= :agg (:type (nth elems i)))
-                (do (aset row i ((nth aggs ai) (vec (aget cols ai))))
+            (when (< i ne)
+              (if (aget agg? i)
+                (do (aset row i (.invoke ^IFn (aget aggf ai) (vec (aget cols ai))))
                     (recur (inc i) ki (inc ai)))
                 (do (aset row i (nth k ki))
                     (recur (inc i) (inc ki) ai)))))
-          (.add out (vec row))))
+          (.add out (LazilyPersistentVector/createOwning row))))
       (vec out))))
 
 (defn- lazy-map
@@ -1198,18 +1280,37 @@
                  (distinct-rows ctx rel (mapv #(find-element-fn ctx rel %) elems) wfs)))
         ;; aggregate rows carry results in place; pull finishing applies to pull elements
         pulled (if pull?
-                 (fn [row] (vec (map-indexed (fn [i v] (if-let [f (nth finishers i)] (f v) v)) row)))
+                 (let [^objects fa (object-array finishers)
+                       nf (alength fa)]
+                   (fn [row]
+                     (let [out (object-array nf)]
+                       (dotimes [i nf]
+                         (let [v (nth row i)
+                               f (aget fa i)]
+                           (aset out i (if f (f v) v))))
+                       (LazilyPersistentVector/createOwning out))))
                  identity)
         to-map (when return-map
-                 (let [ks (mapv #(key-fn % (:type return-map)) (:names return-map))]
-                   (fn [row] (zipmap ks row))))
+                 (let [ks (mapv #(key-fn % (:type return-map)) (:names return-map))
+                       nk (count ks)
+                       ^objects ka (object-array ks)]
+                   (if (and (<= nk 8) (== nk (count (set ks))))
+                     ;; few distinct keys: an array map built straight from the row
+                     (fn [row]
+                       (let [kvs (object-array (* 2 nk))]
+                         (dotimes [i nk]
+                           (aset kvs (* 2 i) (aget ka i))
+                           (aset kvs (inc (* 2 i)) (nth row i)))
+                         (PersistentArrayMap. kvs)))
+                     (fn [row] (zipmap ks row)))))
+        first-of (fn [row] (nth row 0))
         spec (:spec find)]
     (if lazy?
       (case spec
         :find-rel (when (seq rows) (lazy-map (if to-map (comp to-map pulled) pulled) rows))
-        :find-coll (when (seq rows) (lazy-map (comp first pulled) rows))
+        :find-coll (when (seq rows) (lazy-map (comp first-of pulled) rows))
         :find-scalar (when-let [row (first rows)]
-                       (let [v (first (pulled row))]
+                       (let [v (first-of (pulled row))]
                          (cond
                            (nil? v) nil
                            (or (coll? v) (instance? Collection v) (string? v)) (seq v)
@@ -1222,10 +1323,13 @@
         :find-rel (cond
                     to-map (mapv (comp to-map pulled) rows)
                     plain-set? rows
-                    (or agg? pull? (seq wfs)) (mapv pulled rows)
+                    pull? (mapv pulled rows)
+                    (or agg? (seq wfs)) rows   ; already a vector of row vectors
                     :else (HashSet. ^Collection rows))
-        :find-coll (mapv (comp first pulled) rows)
-        :find-scalar (some-> (first rows) pulled first)
+        :find-coll (if pull?
+                     (mapv (comp first-of pulled) rows)
+                     (mapv first-of rows))
+        :find-scalar (some-> (first rows) pulled first-of)
         :find-tuple (when-let [row (first rows)]
                       (let [r (pulled row)] (if to-map (to-map r) r)))))))
 

@@ -14,9 +14,9 @@
             [mnemonic.segcache :as segcache]
             [mnemonic.tx :as tx]
             [mnemonic.tx-fns :as tx-fns])
-  (:import (java.util UUID)
+  (:import (java.util ArrayList Arrays UUID)
            (java.util.concurrent CompletableFuture)
-           (mnemonic.datom Datom)
+           (mnemonic.datom Datom IDatomView)
            (mnemonic.index ICursor IKeyView IViewCursor)
            (mnemonic.schema Attr)))
 
@@ -379,21 +379,33 @@
           attr-prefix (codec/encode-prefix index [aid])
           start-key (codec/encode-prefix-numeric index comps)
           in-attr (fn [^Datom d] (== aid (.-a d)))
-          ds (if reverse
-               (let [stop (codec/prefix-end start-key)]
-                 (->> (seq (index/datoms-iterable (view-db db* index/-view) index attr-prefix))
-                      (take-while (fn [^Datom d]
-                                    (or (nil? stop)
-                                        (neg? (codec/compare-bytes
-                                               (codec/encode-key index (.-e d) (.-a d) (.-v d) (.-tx d))
-                                               stop)))))
-                      vec
-                      rseq))
-               (take-while in-attr
-                           (seq (index/datoms-iterable (view-db db* index/-seek-view) index start-key))))
           ast (pullns/parse-pattern selector)
-          eid-of (if (= index :avet) (fn [^Datom d] (.-e d)) (fn [^Datom d] (.-v d)))]
-      (map #(pullns/pull-from-ast db* ast (eid-of %)) ds))))
+          avet? (= index :avet)]
+      (if reverse
+        ;; the ids up to the end of `start`, read from views with the key compared in place,
+        ;; then pulled newest-first
+        (let [^bytes stop (codec/prefix-end start-key)
+              vdb (view-db db* index/-view)
+              ^mnemonic.index.ICursor c (index/-view vdb index attr-prefix)
+              ids (ArrayList.)]
+          (try
+            (loop []
+              (when (and (.valid c)
+                         (or (nil? stop)
+                             (neg? (Arrays/compareUnsigned (index/key-buf c) 0 (unchecked-int (index/key-len c))
+                                                           stop 0 (alength stop)))))
+                (let [^IDatomView v (index/view-of c)]
+                  (.add ids (if avet? (.eid v) (.valueLong v))))
+                (.advance c)
+                (recur)))
+            (finally
+              (.close c)
+              (java.lang.ref.Reference/reachabilityFence vdb)))
+          (map #(pullns/pull-from-ast db* ast %) (rseq (vec ids))))
+        (let [eid-of (if avet? (fn [^Datom d] (.-e d)) (fn [^Datom d] (.-v d)))]
+          (map #(pullns/pull-from-ast db* ast (eid-of %))
+               (take-while in-attr
+                           (seq (index/datoms-iterable (view-db db* index/-seek-view) index start-key)))))))))
 
 (defn q [query & inputs] (apply query*/q query inputs))
 (defn query [query-map] (query*/query query-map))
