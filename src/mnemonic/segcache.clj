@@ -396,6 +396,10 @@
 
 (defn scan-budget ^long [^Cache c] (.-budget ^Pool (.-scan c)))
 (defn point-budget ^long [^Cache c] (.-budget ^Pool (.-point c)))
+(defn point-weight
+  "Estimated bytes the point pool holds now."
+  ^long [^Cache c]
+  (.get ^AtomicLong (.-weight ^Gen (.get ^AtomicReference (.-gen ^Pool (.-point c))))))
 
 (defn big-scan?
   "True when the attribute scan of hash `h` was found larger than half the scan budget

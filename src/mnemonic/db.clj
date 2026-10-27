@@ -303,9 +303,8 @@
   "IFastReduce/scanEntities for a Base: the scan of a pull's many children. Each entity
   of `ids` read whole is cached like a point-granule fill (doorkeeper, cap, stamp read
   after the snapshot), so a later read of it is a hit instead of another scan. `fill`
-  holds the bytes the reading pull may still add to the cache (-1: not set yet, half the
-  point pool): a pull larger than the cache would evict its own entries, so past that it
-  only scans."
+  holds the bytes the reading pull may still add to the cache (-1: not set yet): past it
+  the pull only scans."
   [store snap ^IReader rd lo hi ^java.util.Set ids f ^longs fill]
   (let [^Cache c (.-segcache ^Store store)]
     (if (or (nil? c) (neg? (.epoch rd)) (sc/bypass?))
@@ -314,7 +313,12 @@
             hi (long hi)
             pool (sc/point-pool c)
             cap (sc/point-cap c)
-            _ (when (neg? (aget fill 0)) (aset fill 0 (quot (sc/point-budget c) 2)))
+            _ (when (neg? (aget fill 0))
+                ;; the pool's free room, but a sixteenth of it when it is full: a pull larger
+                ;; than the cache keeps what is cached and scans the rest, and does not evict
+                ;; it wholesale on every read
+                (let [b (sc/point-budget c)]
+                  (aset fill 0 (min (quot b 2) (max (- b (sc/point-weight c)) (quot b 16))))))
             ^ICursor cur (index/seek-cursor (open-raw store snap :eavt nil) (e-key lo) :eavt false)
             ;; the entity being read: its granule key, and its keys while it is cached
             ge (long-array [Long/MIN_VALUE])
