@@ -394,7 +394,7 @@
   "Adds to `out` the datoms `fwd` names of each entity of `ids`, read in one EAVT range
   scan from the smallest id to the largest, when they are dense (span at most 4x their
   count); else leaves them to be read one at a time."
-  [db ^java.util.Collection ids ^longs fwd ^HashMap out]
+  [db ^java.util.Collection ids ^longs fwd ^HashMap out ^longs fill]
   (let [n (.size ids)
         it (.iterator ids)
         [lo hi] (loop [lo Long/MAX_VALUE hi Long/MIN_VALUE]
@@ -417,7 +417,7 @@
           ;; a db with a segment cache fills it as it scans, so the next read is a hit
           (when (or (not (instance? IFastReduce db))
                     (identical? index/miss
-                                (.scanEntities ^IFastReduce db lo hi (java.util.HashSet. (.keySet scanned)) add!)))
+                                (.scanEntities ^IFastReduce db lo hi (java.util.HashSet. (.keySet scanned)) add! fill)))
             (let [^bytes stop (entity/e-prefix (inc hi))
                   ^mnemonic.index.ICursor c (index/-seek-view db :eavt (entity/e-prefix lo))]
               (try
@@ -438,8 +438,9 @@
   ones, in one EAVT range scan (an entity missing from the map is read on its own). nil
   when there are fewer than `prefetch-min` ids or the pattern reads nothing of the
   entities themselves."
-  [db ^java.util.Collection ids ^Compiled cp]
+  [db ^java.util.Collection ids ^Compiled cp fill]
   (let [n (.size ids)
+        fill (or fill (long-array [-1]))
         ^longs fwd (when-not (.-wild? cp) (.-fwd cp))]
     (when (and (>= n (long prefetch-min)) (or (nil? fwd) (pos? (alength fwd))))
       (let [out (HashMap.)
@@ -449,7 +450,7 @@
             (.put out e en)
             (.add missed e)))
         (when (>= (.size missed) (long prefetch-min))
-          (scan-entries! db missed fwd out))
+          (scan-entries! db missed fwd out fill))
         out))))
 
 (defn- pre-values
@@ -492,7 +493,7 @@
         cst (child-state eid st spec)
         sub (:sub spec)
         st (if-let [pre (when (and sub (not (:recur spec)) (ref-attr? attr))
-                          (prefetch db vs (compiled sub sch)))]
+                          (prefetch db vs (compiled sub sch) (:fill st)))]
              (assoc st :pre pre :pre-ast sub)
              st)]
     (loop [i 0 out (transient [])]
@@ -610,7 +611,9 @@
 (defn- pull-from-ast*
   [db ast eid st]
   (let [ast (parse-pattern ast)
-        e (entity/resolve-eid db eid)]
+        e (entity/resolve-eid db eid)
+        ;; what this pull may still add to the segment cache (see mnemonic.db/scan-entities)
+        st (if (:fill st) st (assoc st :fill (long-array [-1])))]
     (if (nil? e)
       (when (and (nil? eid) (:id? ast)) {:db/id nil})
       (pull-entity db (index/-schema db) e ast st))))
@@ -635,7 +638,9 @@
   (let [ast (parse-pattern pattern)
         ;; many dense ids are read in one range scan first (see `prefetch`)
         ids (into [] (keep #(when (integer? %) (long %))) eids)
-        st (if-let [pre (prefetch db ids (compiled ast (index/-schema db)))]
-             (assoc empty-state :pre pre :pre-ast ast)
-             empty-state)]
+        fill (long-array [-1])
+        st0 (assoc empty-state :fill fill)
+        st (if-let [pre (prefetch db ids (compiled ast (index/-schema db)) fill)]
+             (assoc st0 :pre pre :pre-ast ast)
+             st0)]
     (mapv #(pull-from-ast* db ast % st) eids)))

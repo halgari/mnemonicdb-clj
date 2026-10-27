@@ -395,6 +395,7 @@
 (defn chunk-cap ^long [^Cache c] (.-chunk-cap c))
 
 (defn scan-budget ^long [^Cache c] (.-budget ^Pool (.-scan c)))
+(defn point-budget ^long [^Cache c] (.-budget ^Pool (.-point c)))
 
 (defn big-scan?
   "True when the attribute scan of hash `h` was found larger than half the scan budget

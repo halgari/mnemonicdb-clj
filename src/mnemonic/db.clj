@@ -302,8 +302,11 @@
 (defn- scan-entities
   "IFastReduce/scanEntities for a Base: the scan of a pull's many children. Each entity
   of `ids` read whole is cached like a point-granule fill (doorkeeper, cap, stamp read
-  after the snapshot), so a later read of it is a hit instead of another scan."
-  [store snap ^IReader rd lo hi ^java.util.Set ids f]
+  after the snapshot), so a later read of it is a hit instead of another scan. `fill`
+  holds the bytes the reading pull may still add to the cache (-1: not set yet, half the
+  point pool): a pull larger than the cache would evict its own entries, so past that it
+  only scans."
+  [store snap ^IReader rd lo hi ^java.util.Set ids f ^longs fill]
   (let [^Cache c (.-segcache ^Store store)]
     (if (or (nil? c) (neg? (.epoch rd)) (sc/bypass?))
       index/miss
@@ -311,6 +314,7 @@
             hi (long hi)
             pool (sc/point-pool c)
             cap (sc/point-cap c)
+            _ (when (neg? (aget fill 0)) (aset fill 0 (quot (sc/point-budget c) 2)))
             ^ICursor cur (index/seek-cursor (open-raw store snap :eavt nil) (e-key lo) :eavt false)
             ;; the entity being read: its granule key, and its keys while it is cached
             ge (long-array [Long/MIN_VALUE])
@@ -323,7 +327,8 @@
                              ka (.toArray l)]
                          (if (> (alength ka) cap)
                            (sc/store! c pool k rd w nil nil true false)
-                           (sc/store! c pool k rd w ka nil false (index/mutable-keys? 0 ka)))))
+                           (let [s (sc/store! c pool k rd w ka nil false (index/mutable-keys? 0 ka))]
+                             (aset fill 0 (- (aget fill 0) (if s (sc/seg-weight-of s) (* 130 (alength ka)))))))))
                      (aset kl 0 nil))]
         (try
           (loop []
@@ -338,7 +343,7 @@
                     (when (.contains ids e)
                       (let [k (sc/gkey 1 (e-key e) 8)]
                         (aset gk 0 k)
-                        (when (sc/admit? c (sc/gkey-hash k))
+                        (when (and (pos? (aget fill 0)) (sc/admit? c (sc/gkey-hash k)))
                           (aset kl 0 (ArrayList.))))))
                   (when (.contains ids e)
                     (f (index/view-of cur))
@@ -358,8 +363,8 @@
   mnemonic.index.IFastReduce
   (fastReduce [this idx prefix f init]
     (fast-reduce store snap this idx prefix f init))
-  (scanEntities [this lo hi ids f]
-    (scan-entities store snap this lo hi ids f))
+  (scanEntities [this lo hi ids f fill]
+    (scan-entities store snap this lo hi ids f fill))
   index/IDb
   (-seek-current [this idx prefix]
     (cached-cursor store snap this idx idx false prefix))

@@ -413,10 +413,11 @@
   (fastReduce [index ^bytes prefix f init]
     "Like reduce-views over (-view db index prefix), straight from a cached segment (no
     cursor); `miss` when that isn't possible, for the caller to read the usual way.")
-  (scanEntities [^long lo ^long hi ^java.util.Set ids f]
+  (scanEntities [^long lo ^long hi ^java.util.Set ids f ^longs fill]
     "Walks the EAVT entries of entities `lo`..`hi` in one range scan, calling (f view) for
     those of the entities in `ids` (Longs) and caching the segments of those entities
-    as the cache's own reads would; `miss` when the db has no cache to fill."))
+    as the cache's own reads would, while `fill` (the bytes the caller may still add; -1:
+    not set) lasts; `miss` when the db has no cache to fill."))
 
 (defn reduce-views
   "Reduce `coll` (a `datoms-iterable`, or any reducible of Datoms) with `f`, which receives
