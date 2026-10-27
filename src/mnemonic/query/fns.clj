@@ -26,9 +26,7 @@
 
 ;; ------------------------------------------------------------------ entity / value resolution
 
-(defn resolve-eid
-  "Entity id for a long, ident keyword or lookup ref. Throws when it does not resolve."
-  ^long [db x]
+(defn- resolve-eid-slow ^long [db x]
   (let [sch (index/-schema db)]
     (cond
       (integer? x) (long x)
@@ -38,6 +36,14 @@
                                  (str "Cannot interpret as a keyword: " x ", no leading :")
                                  {:value x}))
       :else (throw (cannot-resolve x)))))
+
+(defn resolve-eid
+  "Entity id for a long, ident keyword or lookup ref. Throws when it does not resolve."
+  ^long [db x]
+  ;; a plain id (most tuples) needs no schema
+  (if (instance? Long x)
+    (.longValue ^Long x)
+    (resolve-eid-slow db x)))
 
 (defn normalize-value
   "Canonical form of a value used for matching when the attribute is not known."

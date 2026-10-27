@@ -64,6 +64,55 @@
     (let [v (ns-resolve (the-ns 'clojure.core) sym)]
       (if (and v (fn? @v)) @v (throw (invalid-aggregate sym))))))
 
+;; ------------------------------------------------------------------ streaming
+
+;; The built-ins that fold their values one at a time: a group keeps an accumulator
+;; instead of the list of its values. Each folds in the order the values come with the
+;; same operations as its function above (`reduce` with the first value as the start),
+;; so results, and the errors bad values raise, are the same.
+
+(definterface IAcc
+  (add [v])
+  (result []))
+
+(deftype CountAcc [^:unsynchronized-mutable ^long n]
+  IAcc
+  (add [_ _] (set! n (inc n)) nil)
+  (result [_] (int n)))
+
+(deftype SumAcc [^:unsynchronized-mutable s ^:unsynchronized-mutable ^long n]
+  IAcc
+  (add [_ v] (set! s (if (zero? n) v (+ s v))) (set! n (inc n)) nil)
+  (result [_] s))
+
+(deftype AvgAcc [^:unsynchronized-mutable s ^:unsynchronized-mutable ^long n]
+  IAcc
+  (add [_ v] (set! s (if (zero? n) v (+ s v))) (set! n (inc n)) nil)
+  (result [_] (/ (double s) n)))
+
+;; `lo?`: keeps the smallest (min), else the largest (max), first one on ties
+(deftype ExtremeAcc [^boolean lo? ^:unsynchronized-mutable x ^:unsynchronized-mutable ^boolean any]
+  IAcc
+  (add [_ v]
+    (if any
+      (when (neg? (if lo? (compare v x) (compare x v))) (set! x v))
+      (do (set! x v) (set! any (boolean true))))
+    nil)
+  (result [_] x))
+
+(defn accumulator
+  "A no-argument function making a fresh accumulator (IAcc) for the parsed aggregate
+  element `elem` when it is a built-in that can fold its values one at a time, else nil."
+  [{:keys [agg args]}]
+  (when (== 1 (count args))
+    (case agg
+      count #(CountAcc. 0)
+      sum #(SumAcc. nil 0)
+      avg #(AvgAcc. nil 0)
+      min #(ExtremeAcc. true nil false)
+      max #(ExtremeAcc. false nil false)
+      nil)))
+
 (defn resolve-agg
   "A function of the vector of values for the parsed aggregate element `elem`
   ({:type :agg :agg sym :args [terms]}). Throws for unknown aggregates and bad arities."

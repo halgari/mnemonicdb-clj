@@ -14,12 +14,15 @@
             [mnemonic.pull :as pull]
             [mnemonic.query.aggregates :as aggregates]
             [mnemonic.query.fns :as fns]
+            [mnemonic.query.longmap :as longmap]
             [mnemonic.query.parser :as parser])
   (:import (clojure.lang ArraySeq IFn LazilyPersistentVector PersistentArrayMap)
            (java.nio ByteBuffer)
            (java.util ArrayList Arrays Collection Date HashMap HashSet LinkedHashMap List RandomAccess UUID WeakHashMap)
            (java.util.concurrent ConcurrentHashMap TimeoutException)
            (mnemonic.datom IDatomView)
+           (mnemonic.query.aggregates IAcc)
+           (mnemonic.query.longmap ILongGroups)
            (mnemonic.schema Attr)))
 
 (set! *warn-on-reflection* true)
@@ -366,6 +369,18 @@
       (aset r i (datom-comp d (aget new-pos i))))
     r))
 
+(defn- extend-with
+  "`t` with the free-variable values of datom `d` appended (one array, as
+  `(extend-tuple t (new-values d new-pos))` without the intermediate one)."
+  ^objects [^objects t ^IDatomView d ^ints new-pos]
+  (let [n (alength t)
+        m (alength new-pos)
+        r (object-array (+ n m))]
+    (System/arraycopy t 0 r 0 n)
+    (dotimes [i m]
+      (aset r (+ n i) (datom-comp d (aget new-pos i))))
+    r))
+
 ;; ---- AVET range pushdown
 
 (def ^:private no-extra (object-array 0))
@@ -642,6 +657,8 @@
           {:scan-const (fn []
                          (when-let [p (prefix-fn empty-t true)]
                            [(idx-of true) p pass? a]))
+           ;; the key is the entity alone: a hash join can key on primitive ids
+           :e-key (when (and bound-e? (not bound-v?)) e-of)
            :key-fn (if (or bound-e? bound-v?) key-fn (fn [_] nil))
            :datom-key (datom-key-fn bound-pos)
            :seek (fn [^objects t f]
@@ -742,13 +759,13 @@
         no-new? (empty? new-pos)
         np (int-array new-pos)
         emit! (fn [^objects t ^IDatomView d]
-                (.add out (if no-new? t (extend-tuple t (new-values d np)))))
+                (.add out (if no-new? t (extend-with t d np))))
         result {:vars (into (:vars rel) new-syms) :tuples out}]
     (when (pos? n)
       (let [cnt (long-array 1)
             fast (fast-access ctx cnt db specs bound-pos same)]
         (when-not (identical? fast ::no-match)
-          (let [{:keys [scan-const key-fn datom-key seek]}
+          (let [{:keys [scan-const key-fn datom-key seek e-key]}
                 (or fast (generic-access ctx cnt db specs terms bound-pos same))
                 seeks!
                 ;; a seek per tuple, once per distinct bound key
@@ -794,18 +811,30 @@
                 (let [hinted (range-plan db rel specs hints a)
                       limit (* hash-join-scan-factor n)
                       sizes (range-sizes db)
-                      groups (HashMap.)
-                      ;; the relation by join key, built only when a scan is actually tried
+                      ;; the relation by join key, built only when a scan is actually tried:
+                      ;; by primitive entity id when that is the whole key, else by value
+                      ^ILongGroups lgroups (when e-key (longmap/long-groups n))
+                      ^HashMap groups (when-not e-key (HashMap.))
+                      grouped? (volatile! false)
                       group! (fn []
-                               (when (.isEmpty groups)
-                                 (each-tuple [t tuples ctx]
-                                   (when-let [k (key-fn t)]
-                                     (let [^ArrayList g (or (.get groups k)
-                                                            (let [g (ArrayList.)] (.put groups k g) g))]
-                                       (.add g t))))))
-                      probe (fn [^IDatomView d]
-                              (when-let [^ArrayList g (.get groups (datom-key d))]
-                                (dotimes [i (.size g)] (emit! (.get g i) d))))
+                               (when-not @grouped?
+                                 (vreset! grouped? true)
+                                 (if lgroups
+                                   (let [^clojure.lang.IFn$OL ek e-key]
+                                     (each-tuple [t tuples ctx]
+                                       (.add lgroups (.invokePrim ek t) t)))
+                                   (each-tuple [t tuples ctx]
+                                     (when-let [k (key-fn t)]
+                                       (let [^ArrayList g (or (.get groups k)
+                                                              (let [g (ArrayList.)] (.put groups k g) g))]
+                                         (.add g t)))))))
+                      probe (if lgroups
+                              (fn [^IDatomView d]
+                                (when-let [^ArrayList g (.get lgroups (.eid d))]
+                                  (dotimes [i (.size g)] (emit! (.get g i) d))))
+                              (fn [^IDatomView d]
+                                (when-let [^ArrayList g (.get groups (datom-key d))]
+                                  (dotimes [i (.size g)] (emit! (.get g i) d)))))
                       ;; hash join over `sdb`'s range, given up past `limit` datoms (its size,
                       ;; or that it is too large, learned under `skey` for this db value)
                       joined? (fn [sdb skey]
@@ -1228,23 +1257,32 @@
 (defn- group-rows
   "Raw rows for a :find with aggregates: the relation is projected to the non-aggregate
   elements, the aggregate arguments and :with, de-duplicated, grouped by the non-aggregate
-  elements and each aggregate applied to the values of its group."
-  [ctx rel elems kfs afs wfs aggs]
+  elements and each aggregate applied to the values of its group. An aggregate with an
+  accumulator (`accs`, see `aggregates/accumulator`) folds its group's values as they
+  come instead of collecting them."
+  [ctx rel elems kfs afs wfs aggs accs]
   (let [nk (count kfs)
         allfs (fn-array (concat kfs afs wfs))
         seen (HashSet.)
         groups (LinkedHashMap.)
-        nagg (count afs)]
+        nagg (count afs)
+        ^objects accf (object-array accs)]
     (each-tuple [t (:tuples rel) ctx]
       (let [all (tuple-array allfs t)]
         (when (.add seen (row-key all))
           (let [k (LazilyPersistentVector/createOwning (Arrays/copyOf all (int nk)))
                 ^objects cols (or (.get groups k)
                                   (let [c (object-array nagg)]
-                                    (dotimes [i nagg] (aset c i (ArrayList.)))
+                                    (dotimes [i nagg]
+                                      (aset c i (if-let [mk (aget accf i)] (mk) (ArrayList.))))
                                     (.put groups k c)
                                     c))]
-            (dotimes [i nagg] (.add ^ArrayList (aget cols i) (aget all (+ nk i))))))))
+            (dotimes [i nagg]
+              (let [col (aget cols i)
+                    v (aget all (+ nk i))]
+                (if (aget accf i)
+                  (.add ^IAcc col v)
+                  (.add ^ArrayList col v))))))))
     (let [out (ArrayList.)
           ne (count elems)
           ;; per element, resolved once: aggregate or plain
@@ -1256,7 +1294,9 @@
           (loop [i 0 ki 0 ai 0]
             (when (< i ne)
               (if (aget agg? i)
-                (do (aset row i (.invoke ^IFn (aget aggf ai) (vec (aget cols ai))))
+                (do (aset row i (if (aget accf ai)
+                                  (.result ^IAcc (aget cols ai))
+                                  (.invoke ^IFn (aget aggf ai) (vec (aget cols ai)))))
                     (recur (inc i) ki (inc ai)))
                 (do (aset row i (nth k ki))
                     (recur (inc i) (inc ki) ai)))))
@@ -1290,7 +1330,8 @@
                              (mapv #(find-element-fn ctx rel %) plain)
                              (mapv #(column-fn rel (:sym (peek (:args %)))) aggs)
                              wfs
-                             (mapv aggregates/resolve-agg aggs)))
+                             (mapv aggregates/resolve-agg aggs)
+                             (mapv aggregates/accumulator aggs)))
                (if plain-set?
                  (distinct-row-set ctx rel (mapv #(find-element-fn ctx rel %) elems))
                  (distinct-rows ctx rel (mapv #(find-element-fn ctx rel %) elems) wfs)))
