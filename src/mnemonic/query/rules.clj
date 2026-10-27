@@ -191,11 +191,49 @@
               nil))
           clauses))
 
+(defn- term-vars [terms]
+  (into #{} (keep #(when (= :var (:type %)) (:sym %))) terms))
+
+(defn- ordered-body
+  "`body` of a definition whose variables `bound` are bound on entry, in the order it
+  runs. A data pattern none of whose variables is bound reads its whole attribute (in a
+  recursive rule, every round); when a later rule call shares a variable with it, has a
+  bound argument and can run there, the call runs first, so the pattern then looks its
+  values up. Only the order of the conjunction changes. Reordering stops at the first
+  clause other than a data pattern or rule call (what it binds is not tracked)."
+  [ctx body bound]
+  (loop [out [] cs (vec body) bound (set bound)]
+    (if (empty? cs)
+      out
+      (let [c (nth cs 0)
+            kind (:clause c)]
+        (case kind
+          :data-pattern
+          (let [vs (term-vars (:terms c))
+                j (when (and (seq vs) (not-any? bound vs))
+                    (first (keep-indexed
+                            (fn [i r]
+                              (when (and (= :rule (:clause r))
+                                         (let [as (term-vars (:args r))]
+                                           (and (some bound as) (some vs as)))
+                                         (every? bound (e/clause-needs ctx r)))
+                                i))
+                            cs)))]
+            (if j
+              (let [r (nth cs j)]
+                (recur (conj out r)
+                       (into (subvec cs 0 j) (subvec cs (inc j)))
+                       (into bound (term-vars (:args r)))))
+              (recur (conj out c) (subvec cs 1) (into bound vs))))
+          :rule (recur (conj out c) (subvec cs 1) (into bound (term-vars (:args c))))
+          (into out cs))))))
+
 (defn- eval-def!
   "Evaluates one definition `d` for class `c` seeded with demand tuples `seeds`, adding
   the head tuples found to the answers of `c`."
   [ctx session c d seeds delta]
-  (let [{:keys [head body]} d]
+  (let [{:keys [head]} d
+        body (ordered-body ctx (:body d) (map #(nth head %) (:pos c)))]
     (when (not= (count head) (count (distinct head)))
       (throw (qerror :db.error/unsupported "Rule heads with repeated variables are not supported"
                      {:head head})))

@@ -944,6 +944,11 @@
     :rule (rule-required-syms ctx clause)
     nil))
 
+(defn clause-needs
+  "Variables that must be bound before `clause` can run (for the rules namespace)."
+  [ctx clause]
+  (needs ctx clause))
+
 (defn- clause-ready? [ctx rel clause]
   (let [vidx (var-index rel)]
     (every? #(contains? vidx %) (needs ctx clause))))
