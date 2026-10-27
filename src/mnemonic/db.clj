@@ -259,11 +259,47 @@
                   :else (plain-cursor store snap cf idx hist? prefix))
           (plain-cursor store snap cf idx hist? prefix))))))
 
+(defn- fast-reduce
+  "reduce-views over the entries of `idx` (:eavt or :vaet) under `prefix` (an entity, or
+  an entity and attribute) straight from the cached segment of the entity: no cursor, no
+  iterable. `index/miss` when the segment isn't cached (or is big), so the caller reads
+  the usual way (which fills it)."
+  [store snap ^IReader rd idx ^bytes prefix f init]
+  (let [^Cache c (.-segcache ^Store store)
+        len (alength prefix)
+        cfc (case idx :eavt 1 :vaet 2 0)]
+    (if (or (nil? c) (zero? cfc) (< len 8) (neg? (.epoch rd)) (sc/bypass?))
+      index/miss
+      (let [^Seg s (sc/lookup c (sc/point-pool c) (sc/gkey cfc prefix 8) rd)]
+        (if (or (nil? s) (sc/seg-big? s))
+          index/miss
+          (let [_ (check-open! store snap)
+                ks (sc/seg-keys s)
+                ds (sc/seg-datoms s)
+                mut (sc/seg-mut? s)
+                code (if (== cfc 1) 0 3)
+                n (alength ks)
+                lo (if (== len 8) 0 (index/seg-lower-bound ks prefix))]
+            (loop [i lo acc init]
+              (if (and (< i n)
+                       (or (== len 8)
+                           (let [^bytes k (aget ks i)]
+                             (and (>= (alength k) len) (Arrays/equals k 0 len prefix 0 len)))))
+                (let [d (index/seg-datom code ks ds i)
+                      ret (f acc (if mut (index/detach d) d))]
+                  (if (reduced? ret)
+                    (deref ret)
+                    (recur (inc i) ret)))
+                acc))))))))
+
 ;; ep: the segment cache epoch at snapshot time (-1: this db never uses the cache)
 (deftype Base [store ^Snap snap basis-t schema meta ^Releaser releaser ^long ep]
   IReader
   (basisT [_] (long basis-t))
   (epoch [_] ep)
+  mnemonic.index.IFastReduce
+  (fastReduce [this idx prefix f init]
+    (fast-reduce store snap this idx prefix f init))
   index/IDb
   (-seek-current [this idx prefix]
     (cached-cursor store snap this idx idx false prefix))

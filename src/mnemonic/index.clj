@@ -405,6 +405,15 @@
 (definterface IViewReduce
   (reduceViews [f init] "Like reduce, but `f` receives flyweight IDatomViews (valid only during the call)."))
 
+(def miss
+  "What `IFastReduce/fastReduce` returns when it cannot serve the read."
+  (Object.))
+
+(definterface IFastReduce
+  (fastReduce [index ^bytes prefix f init]
+    "Like reduce-views over (-view db index prefix), straight from a cached segment (no
+    cursor); `miss` when that isn't possible, for the caller to read the usual way."))
+
 (defn reduce-views
   "Reduce `coll` (a `datoms-iterable`, or any reducible of Datoms) with `f`, which receives
   flyweight IDatomViews decoded in place from the cursor buffer: no Datom, key copy or
@@ -431,18 +440,24 @@
         (seq (cursor-seq cur holder db))))
     IViewReduce
     (reduceViews [_ f init]
-      (let [^mnemonic.index.ICursor cur (-view db index prefix)]
-        (try
-          (loop [acc init]
-            (if (.valid cur)
-              (let [ret (f acc (view-of cur))]
-                (if (reduced? ret)
-                  (.deref ^Reduced ret)
-                  (do (.advance cur) (recur ret))))
-              acc))
-          (finally
-            (.close cur)
-            (Reference/reachabilityFence db)))))
+      (let [r (if (instance? IFastReduce db)
+                (try (.fastReduce ^IFastReduce db index prefix f init)
+                     (finally (Reference/reachabilityFence db)))
+                miss)]
+        (if-not (identical? r miss)
+          r
+          (let [^mnemonic.index.ICursor cur (-view db index prefix)]
+            (try
+              (loop [acc init]
+                (if (.valid cur)
+                  (let [ret (f acc (view-of cur))]
+                    (if (reduced? ret)
+                      (.deref ^Reduced ret)
+                      (do (.advance cur) (recur ret))))
+                  acc))
+              (finally
+                (.close cur)
+                (Reference/reachabilityFence db)))))))
     IReduceInit
     (reduce [_ f init]
       (let [^mnemonic.index.ICursor cur (-view db index prefix)]

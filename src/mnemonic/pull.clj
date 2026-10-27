@@ -21,6 +21,7 @@
            (java.util.concurrent ConcurrentHashMap)
            (java.util.concurrent.atomic AtomicLong)
            (mnemonic.datom IDatomView)
+           (mnemonic.index IFastReduce)
            (mnemonic.schema Attr)))
 
 (set! *warn-on-reflection* true)
@@ -369,46 +370,82 @@
   "Fewer entities than this are read one at a time (through the segment cache)."
   64)
 
+(defn- cached-entry
+  "The datoms of `e` whose attribute is in `fwd` (nil: all), when its segment is cached
+  (read straight from it), else nil."
+  [db ^long e ^longs fwd]
+  (when (instance? IFastReduce db)
+    (let [as (ArrayList.)
+          vs (ArrayList.)
+          r (try (.fastReduce ^IFastReduce db :eavt (entity/e-prefix e)
+                              (fn [_ ^IDatomView d]
+                                (when (.isAdded d)
+                                  (let [a (.attr d)]
+                                    (when (wanted? fwd a)
+                                      (.add as a)
+                                      (.add vs (.value d)))))
+                                nil)
+                              nil)
+                 (finally (Reference/reachabilityFence db)))]
+      (when-not (identical? r index/miss)
+        (Entry. as vs)))))
+
+(defn- scan-entries!
+  "Adds to `out` the datoms `fwd` names of each entity of `ids`, read in one EAVT range
+  scan from the smallest id to the largest, when they are dense (span at most 4x their
+  count); else leaves them to be read one at a time."
+  [db ^java.util.Collection ids ^longs fwd ^HashMap out]
+  (let [n (.size ids)
+        it (.iterator ids)
+        [lo hi] (loop [lo Long/MAX_VALUE hi Long/MIN_VALUE]
+                  (if (.hasNext it)
+                    (let [e (long (.next it))] (recur (min lo e) (max hi e)))
+                    [lo hi]))
+        lo (long lo)
+        hi (long hi)]
+    (when (<= (- hi lo) (* 4 n))
+      (let [scanned (HashMap.)
+            _ (doseq [e ids] (.put scanned e (Entry. (ArrayList.) (ArrayList.))))
+            ^bytes stop (entity/e-prefix (inc hi))
+            ^mnemonic.index.ICursor c (index/-seek-view db :eavt (entity/e-prefix lo))]
+        (try
+          (loop []
+            (when (and (.valid c)
+                       (neg? (Arrays/compareUnsigned (index/key-buf c) 0 (unchecked-int (index/key-len c))
+                                                     stop 0 (alength stop))))
+              (let [^IDatomView d (index/view-of c)]
+                (when (.isAdded d)
+                  (let [a (.attr d)]
+                    (when (wanted? fwd a)
+                      (when-let [^Entry en (.get scanned (.eid d))]
+                        (.add ^ArrayList (.-as en) a)
+                        (.add ^ArrayList (.-vs en) (.value d)))))))
+              (.advance c)
+              (recur)))
+          (finally
+            (.close c)
+            (Reference/reachabilityFence db)))
+        (.putAll out scanned)))))
+
 (defn- prefetch
-  "The datoms `cp` reads of each entity of `ids` (entity ids), read in one EAVT range scan
-  from the smallest id to the largest, as a HashMap eid -> Entry. nil when there are fewer
-  than `prefetch-min`, the ids are not dense (they span more than 4x their count), or the
-  pattern reads nothing of the entities themselves: then reading each entity on its own is
-  cheaper."
+  "The datoms `cp` reads of each entity of `ids` (entity ids), as a HashMap eid -> Entry:
+  those whose segment is cached straight from it, and the rest, when there are many dense
+  ones, in one EAVT range scan (an entity missing from the map is read on its own). nil
+  when there are fewer than `prefetch-min` ids or the pattern reads nothing of the
+  entities themselves."
   [db ^java.util.Collection ids ^Compiled cp]
   (let [n (.size ids)
         ^longs fwd (when-not (.-wild? cp) (.-fwd cp))]
     (when (and (>= n (long prefetch-min)) (or (nil? fwd) (pos? (alength fwd))))
-      (let [it (.iterator ids)
-            [lo hi] (loop [lo Long/MAX_VALUE hi Long/MIN_VALUE]
-                      (if (.hasNext it)
-                        (let [e (long (.next it))] (recur (min lo e) (max hi e)))
-                        [lo hi]))
-            lo (long lo)
-            hi (long hi)]
-        (when (<= (- hi lo) (* 4 n))
-          (let [out (HashMap.)
-                _ (doseq [e ids] (.put out e (Entry. (ArrayList.) (ArrayList.))))
-                ^bytes stop (entity/e-prefix (inc hi))
-                ^mnemonic.index.ICursor c (index/-seek-view db :eavt (entity/e-prefix lo))]
-            (try
-              (loop []
-                (when (and (.valid c)
-                           (neg? (Arrays/compareUnsigned (index/key-buf c) 0 (unchecked-int (index/key-len c))
-                                                         stop 0 (alength stop))))
-                  (let [^IDatomView d (index/view-of c)]
-                    (when (.isAdded d)
-                      (let [a (.attr d)]
-                        (when (wanted? fwd a)
-                          (when-let [^Entry en (.get out (.eid d))]
-                            (.add ^ArrayList (.-as en) a)
-                            (.add ^ArrayList (.-vs en) (.value d)))))))
-                  (.advance c)
-                  (recur)))
-              (finally
-                (.close c)
-                (Reference/reachabilityFence db)))
-            out))))))
+      (let [out (HashMap.)
+            missed (ArrayList.)]
+        (doseq [e ids]
+          (if-let [en (cached-entry db (long e) fwd)]
+            (.put out e en)
+            (.add missed e)))
+        (when (>= (.size missed) (long prefetch-min))
+          (scan-entries! db missed fwd out))
+        out))))
 
 (defn- pre-values
   "ArrayList of the first `limit` (nil: all) values of attribute `aid` in a read entity,
