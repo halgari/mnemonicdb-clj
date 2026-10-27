@@ -20,6 +20,7 @@
            (java.nio ByteBuffer)
            (java.util ArrayList Arrays Collection Date HashMap HashSet LinkedHashMap List RandomAccess UUID WeakHashMap)
            (java.util.concurrent ConcurrentHashMap TimeoutException)
+           (java.util.concurrent.atomic AtomicReference)
            (mnemonic.datom IDatomView)
            (mnemonic.query.aggregates IAcc)
            (mnemonic.query.longmap ILongGroups)
@@ -39,9 +40,10 @@
 (defn rel-size ^long [rel] (.size ^ArrayList (:tuples rel)))
 
 (defn var-index
-  "Map of variable symbol -> column index of `rel`."
+  "Map of variable symbol -> column index of `rel` (kept on it as ::vidx by
+  `shape-result`, which asks for it once per find element)."
   [rel]
-  (zipmap (:vars rel) (range)))
+  (or (::vidx rel) (zipmap (:vars rel) (range))))
 
 (defn- extend-tuple
   "`t` with the elements of `extra` appended."
@@ -418,7 +420,9 @@
 (defn- hint-clause
   "Data pattern `c` annotated with the range predicates that follow it."
   [c cs pending]
-  (if (and (= :data-pattern (:clause c)) (= :var (:type (get (:terms c) 2))))
+  (if (and (= :data-pattern (:clause c)) (= :var (:type (get (:terms c) 2)))
+           ;; hints come only from predicates pending or right after the pattern
+           (or (seq pending) (= :pred (:clause (first cs)))))
     (let [hs (range-hints (:sym (get (:terms c) 2))
                           (concat pending (take-while #(= :pred (:clause %)) cs)))]
       (if (seq hs) (assoc c ::range-hints hs) c))
@@ -934,9 +938,23 @@
   (throw (qerror :db.error/unsupported (str "Unsupported clause: " (pr-str (:clause clause)))
                  {:clause clause})))
 
-(defmethod execute-clause :data-pattern [ctx rel {:keys [src terms] hints ::range-hints}]
+(defn- pattern-plan
+  "`(compile-pattern rel-vars terms)` for data pattern `clause`, kept in its plan cell (see
+  parser/with-plan-cells) for the vars it last ran with: a query runs a clause with the
+  same vars every time."
+  [clause rel-vars terms]
+  (if-let [^AtomicReference cell (:mnemonic.query/plan (meta clause))]
+    (let [^objects c (.get cell)]
+      (if (and c (= rel-vars (aget c 0)))
+        (aget c 1)
+        (let [p (compile-pattern rel-vars terms)]
+          (.set cell (object-array [rel-vars p]))
+          p)))
+    (compile-pattern rel-vars terms)))
+
+(defmethod execute-clause :data-pattern [ctx rel {:keys [src terms] hints ::range-hints :as clause}]
   (let [s (source ctx src)
-        plan (compile-pattern (:vars rel) terms)]
+        plan (pattern-plan clause (:vars rel) terms)]
     (if (db? s)
       (exec-db-pattern ctx s rel plan terms hints)
       (exec-coll-pattern ctx s rel plan))))
@@ -1109,6 +1127,19 @@
           (case (:bind b)
             :src (recur (next bs) (next as) (assoc-in ctx [:sources (:sym b)] a) rel)
             :rules (recur (next bs) (next as) (assoc ctx :rules (parse-rules-input a)) rel)
+            :scalar
+            ;; a scalar input over the one input tuple so far: appended to it
+            (if (and (some? a) (== 1 (rel-size rel))
+                     (not (some #(= (:sym b) %) (:vars rel))))
+              (let [^objects t (.get ^ArrayList (:tuples rel) 0)
+                    n (alength t)
+                    e (Arrays/copyOf t (unchecked-int (inc n)))]
+                (aset e n a)
+                (recur (next bs) (next as) ctx
+                       {:vars (conj (:vars rel) (:sym b)) :tuples (doto (ArrayList. 1) (.add e))}))
+              (let [rows (binding-rows b a true)]
+                (recur (next bs) (next as) ctx
+                       (extend-rel ctx rel (binding-syms b) (fn [_] rows)))))
             (let [rows (binding-rows b a true)]
               (recur (next bs) (next as) ctx
                      (extend-rel ctx rel (binding-syms b) (fn [_] rows))))))
@@ -1315,7 +1346,8 @@
   "Projects the final relation per the :find spec, :with and :keys/:syms/:strs. With
   `lazy?` (qseq) the result is a seq whose pulls are realized as it is consumed."
   [ctx ast rel lazy?]
-  (let [{:keys [find with return-map]} ast
+  (let [rel (assoc rel ::vidx (var-index rel))
+        {:keys [find with return-map]} ast
         elems (:elements find)
         agg? (boolean (some #(= :agg (:type %)) elems))
         wfs (mapv #(column-fn rel %) with)
@@ -1332,8 +1364,18 @@
                              wfs
                              (mapv aggregates/resolve-agg aggs)
                              (mapv aggregates/accumulator aggs)))
-               (if plain-set?
+               (cond
+                 ;; a scalar or tuple find is its first row (the first one de-duplication
+                 ;; would keep): no need to de-duplicate the rest
+                 (#{:find-scalar :find-tuple} (:spec find))
+                 (let [^ArrayList ts (:tuples rel)]
+                   (if (.isEmpty ts)
+                     []
+                     [(LazilyPersistentVector/createOwning
+                       (tuple-array (fn-array (mapv #(find-element-fn ctx rel %) elems)) (.get ts 0)))]))
+                 plain-set?
                  (distinct-row-set ctx rel (mapv #(find-element-fn ctx rel %) elems))
+                 :else
                  (distinct-rows ctx rel (mapv #(find-element-fn ctx rel %) elems) wfs)))
         ;; aggregate rows carry results in place; pull finishing applies to pull elements
         pulled (if pull?
@@ -1396,16 +1438,20 @@
   "Runs parsed query `ast` against `args`. `opts`: {:timeout ms, :lazy true}."
   [ast args opts]
   (let [ctx {:deadline (when-let [ms (:timeout opts)]
-                         (+ (System/nanoTime) (* (long ms) 1000000)))}]
-    (check-sources! ast)
-    (doseq [el (:elements (:find ast))]
-      (case (:type el)
-        :agg (aggregates/resolve-agg el)
-        (:var :pull) nil
-        (when-not (contains? (methods find-element-fn) (:type el))
-          (throw (qerror :db.error/unsupported
-                         (str "Find element " (pr-str (:type el)) " is not supported yet")
-                         {:element el})))))
+                         (+ (System/nanoTime) (* (long ms) 1000000)))}
+        ^ConcurrentHashMap plans (:mnemonic.query/plans (meta ast))]
+    ;; checks of the query alone: once per parsed query (they throw every time it fails)
+    (when-not (and plans (.get plans ::checked))
+      (check-sources! ast)
+      (doseq [el (:elements (:find ast))]
+        (case (:type el)
+          :agg (aggregates/resolve-agg el)
+          (:var :pull) nil
+          (when-not (contains? (methods find-element-fn) (:type el))
+            (throw (qerror :db.error/unsupported
+                           (str "Find element " (pr-str (:type el)) " is not supported yet")
+                           {:element el})))))
+      (when plans (.put plans ::checked true)))
     (let [[ctx rel] (bind-inputs ctx ast args)
           rel (run-clauses ctx rel (:where ast))]
       (shape-result ctx ast rel (boolean (:lazy opts))))))

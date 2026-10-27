@@ -7,7 +7,8 @@
   (:require [clojure.edn :as edn]
             [clojure.set :as set]
             [clojure.string :as str])
-  (:import (java.util.concurrent ConcurrentHashMap)))
+  (:import (java.util.concurrent ConcurrentHashMap)
+           (java.util.concurrent.atomic AtomicReference)))
 
 (set! *warn-on-reflection* true)
 
@@ -222,8 +223,22 @@
                                             (:branches c)))
       :and (assoc c :clauses (mapv #(resolve-src % default) (:clauses c))))))
 
+(defn- with-plan-cells
+  "`clauses` with a plan cell (an AtomicReference, in metadata, so the clause compares as
+  before) on every data pattern, nested ones too: the engine keeps the pattern's compiled
+  plan there, and parsed queries and rules are cached, so it is compiled once."
+  [clauses]
+  (mapv (fn [c]
+          (case (:clause c)
+            :data-pattern (vary-meta c assoc :mnemonic.query/plan (AtomicReference.))
+            (:not :not-join) (update c :body with-plan-cells)
+            (:or :or-join) (update c :branches #(mapv with-plan-cells %))
+            :and (update c :clauses with-plan-cells)
+            c))
+        clauses))
+
 (defn- parse-top-clauses [forms where]
-  (mapv #(resolve-src % '$) (parse-clauses forms where)))
+  (with-plan-cells (mapv #(resolve-src % '$) (parse-clauses forms where))))
 
 (defn- parse-clause [form]
   (cond
@@ -452,7 +467,8 @@
                      [{:bind :src :sym '$}])
                :where (parse-top-clauses (get secs :where []) ":where")}]
       (check-query ast)
-      ast)))
+      ;; per-query plans the engine computes once (see mnemonic.query.engine/execute)
+      (vary-meta ast assoc :mnemonic.query/plans (ConcurrentHashMap.)))))
 
 ;; ------------------------------------------------------------------- rules
 
