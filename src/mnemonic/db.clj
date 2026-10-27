@@ -332,7 +332,7 @@
                          (if (> (alength ka) cap)
                            (sc/store! c pool k rd w nil nil true false)
                            (let [s (sc/store! c pool k rd w ka nil false (index/mutable-keys? 0 ka))]
-                             (aset fill 0 (- (aget fill 0) (if s (sc/seg-weight-of s) (* 130 (alength ka)))))))))
+                             (aset fill 0 (max 0 (- (aget fill 0) (if s (sc/seg-weight-of s) (* 130 (alength ka))))))))))
                      (aset kl 0 nil))]
         (try
           (loop []

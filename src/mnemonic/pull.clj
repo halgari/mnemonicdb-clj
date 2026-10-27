@@ -392,18 +392,18 @@
 
 (defn- scan-entries!
   "Adds to `out` the datoms `fwd` names of each entity of `ids`, read in one EAVT range
-  scan from the smallest id to the largest, when they are dense (span at most 4x their
-  count); else leaves them to be read one at a time."
-  [db ^java.util.Collection ids ^longs fwd ^HashMap out ^longs fill]
-  (let [n (.size ids)
-        it (.iterator ids)
+  scan from the smallest id to the largest, when that range is no wider than 4x `n` (the
+  number of entities pulled, of which `ids` are those not cached: the scan then costs
+  about what scanning them all would); else leaves them to be read one at a time."
+  [db ^java.util.Collection ids ^longs fwd ^HashMap out ^longs fill n]
+  (let [it (.iterator ids)
         [lo hi] (loop [lo Long/MAX_VALUE hi Long/MIN_VALUE]
                   (if (.hasNext it)
                     (let [e (long (.next it))] (recur (min lo e) (max hi e)))
                     [lo hi]))
         lo (long lo)
         hi (long hi)]
-    (when (<= (- hi lo) (* 4 n))
+    (when (<= (- hi lo) (* 4 (long n)))
       (let [scanned (HashMap.)
             _ (doseq [e ids] (.put scanned e (Entry. (ArrayList.) (ArrayList.))))
             add! (fn [^IDatomView d]
@@ -450,7 +450,7 @@
             (.put out e en)
             (.add missed e)))
         (when (>= (.size missed) (long prefetch-min))
-          (scan-entries! db missed fwd out fill))
+          (scan-entries! db missed fwd out fill n))
         out))))
 
 (defn- pre-values
