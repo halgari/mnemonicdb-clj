@@ -406,25 +406,30 @@
     (when (<= (- hi lo) (* 4 n))
       (let [scanned (HashMap.)
             _ (doseq [e ids] (.put scanned e (Entry. (ArrayList.) (ArrayList.))))
-            ^bytes stop (entity/e-prefix (inc hi))
-            ^mnemonic.index.ICursor c (index/-seek-view db :eavt (entity/e-prefix lo))]
+            add! (fn [^IDatomView d]
+                   (when (.isAdded d)
+                     (let [a (.attr d)]
+                       (when (wanted? fwd a)
+                         (when-let [^Entry en (.get scanned (.eid d))]
+                           (.add ^ArrayList (.-as en) a)
+                           (.add ^ArrayList (.-vs en) (.value d)))))))]
         (try
-          (loop []
-            (when (and (.valid c)
-                       (neg? (Arrays/compareUnsigned (index/key-buf c) 0 (unchecked-int (index/key-len c))
-                                                     stop 0 (alength stop))))
-              (let [^IDatomView d (index/view-of c)]
-                (when (.isAdded d)
-                  (let [a (.attr d)]
-                    (when (wanted? fwd a)
-                      (when-let [^Entry en (.get scanned (.eid d))]
-                        (.add ^ArrayList (.-as en) a)
-                        (.add ^ArrayList (.-vs en) (.value d)))))))
-              (.advance c)
-              (recur)))
-          (finally
-            (.close c)
-            (Reference/reachabilityFence db)))
+          ;; a db with a segment cache fills it as it scans, so the next read is a hit
+          (when (or (not (instance? IFastReduce db))
+                    (identical? index/miss
+                                (.scanEntities ^IFastReduce db lo hi (java.util.HashSet. (.keySet scanned)) add!)))
+            (let [^bytes stop (entity/e-prefix (inc hi))
+                  ^mnemonic.index.ICursor c (index/-seek-view db :eavt (entity/e-prefix lo))]
+              (try
+                (loop []
+                  (when (and (.valid c)
+                             (neg? (Arrays/compareUnsigned (index/key-buf c) 0 (unchecked-int (index/key-len c))
+                                                           stop 0 (alength stop))))
+                    (add! (index/view-of c))
+                    (.advance c)
+                    (recur)))
+                (finally (.close c)))))
+          (finally (Reference/reachabilityFence db)))
         (.putAll out scanned)))))
 
 (defn- prefetch

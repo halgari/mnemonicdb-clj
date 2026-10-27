@@ -292,6 +292,64 @@
                     (recur (inc i) ret)))
                 acc))))))))
 
+(defn- e-key ^bytes [^long e]
+  (let [x (bit-xor e Long/MIN_VALUE)
+        b (byte-array 8)]
+    (dotimes [i 8]
+      (aset b i (unchecked-byte (unsigned-bit-shift-right x (* 8 (- 7 i))))))
+    b))
+
+(defn- scan-entities
+  "IFastReduce/scanEntities for a Base: the scan of a pull's many children. Each entity
+  of `ids` read whole is cached like a point-granule fill (doorkeeper, cap, stamp read
+  after the snapshot), so a later read of it is a hit instead of another scan."
+  [store snap ^IReader rd lo hi ^java.util.Set ids f]
+  (let [^Cache c (.-segcache ^Store store)]
+    (if (or (nil? c) (neg? (.epoch rd)) (sc/bypass?))
+      index/miss
+      (let [lo (long lo)
+            hi (long hi)
+            pool (sc/point-pool c)
+            cap (sc/point-cap c)
+            ^ICursor cur (index/seek-cursor (open-raw store snap :eavt nil) (e-key lo) :eavt false)
+            ;; the entity being read: its granule key, and its keys while it is cached
+            ge (long-array [Long/MIN_VALUE])
+            gk (object-array 1)
+            kl (object-array 1)
+            flush! (fn []
+                     (when-let [^ArrayList l (aget kl 0)]
+                       (let [^GKey k (aget gk 0)
+                             w (sc/stamp c (sc/gkey-hash k))
+                             ka (.toArray l)]
+                         (if (> (alength ka) cap)
+                           (sc/store! c pool k rd w nil nil true false)
+                           (sc/store! c pool k rd w ka nil false (index/mutable-keys? 0 ka)))))
+                     (aset kl 0 nil))]
+        (try
+          (loop []
+            (when (.valid cur)
+              (let [kb (index/key-buf cur)
+                    klen (index/key-len cur)
+                    e (codec/key-long-at kb 0)]
+                (when (<= e hi)
+                  (when-not (== e (aget ge 0))
+                    (flush!)
+                    (aset ge 0 e)
+                    (when (.contains ids e)
+                      (let [k (sc/gkey 1 (e-key e) 8)]
+                        (aset gk 0 k)
+                        (when (sc/admit? c (sc/gkey-hash k))
+                          (aset kl 0 (ArrayList.))))))
+                  (when (.contains ids e)
+                    (f (index/view-of cur))
+                    (when-let [^ArrayList l (aget kl 0)]
+                      (.add l (Arrays/copyOf ^bytes kb (unchecked-int klen)))))
+                  (.advance cur)
+                  (recur)))))
+          (flush!)
+          true
+          (finally (.close cur)))))))
+
 ;; ep: the segment cache epoch at snapshot time (-1: this db never uses the cache)
 (deftype Base [store ^Snap snap basis-t schema meta ^Releaser releaser ^long ep]
   IReader
@@ -300,6 +358,8 @@
   mnemonic.index.IFastReduce
   (fastReduce [this idx prefix f init]
     (fast-reduce store snap this idx prefix f init))
+  (scanEntities [this lo hi ids f]
+    (scan-entities store snap this lo hi ids f))
   index/IDb
   (-seek-current [this idx prefix]
     (cached-cursor store snap this idx idx false prefix))
